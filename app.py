@@ -980,15 +980,14 @@ def edit_reference_frame(
 
     torch.cuda.set_device(PIC_DEVICE)
     with torch.cuda.device(PIC_DEVICE):
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            result = pic_pipe(
-                image=[image],
-                prompt=instruction,
-                negative_prompt=" ",
-                num_inference_steps=int(steps),
-                true_cfg_scale=float(guidance),
-                generator=torch.Generator(device=PIC_DEVICE).manual_seed(seed),
-            )
+        result = pic_pipe(
+            image=[image],
+            prompt=instruction,
+            negative_prompt=" ",
+            num_inference_steps=int(steps),
+            true_cfg_scale=float(guidance),
+            generator=torch.Generator(device=PIC_DEVICE).manual_seed(seed),
+        )
     edited = result.images[0]
     if edited.size != image.size:
         edited = edited.resize(image.size, Image.LANCZOS)
@@ -2003,18 +2002,17 @@ def infer(
     
     try:
         with torch.cuda.device(PIC_DEVICE):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                image = pic_pipe(
-                    image=pil_images if pil_images else None,
-                    prompt=prompt,
-                    height=height,
-                    width=width,
-                    negative_prompt=negative_prompt,
-                    num_inference_steps=num_inference_steps,
-                    generator=generator,
-                    true_cfg_scale=true_guidance_scale,
-                    num_images_per_prompt=num_images_per_prompt,
-                ).images
+            image = pic_pipe(
+                image=pil_images if pil_images else None,
+                prompt=prompt,
+                height=height,
+                width=width,
+                negative_prompt=negative_prompt,
+                num_inference_steps=num_inference_steps,
+                generator=generator,
+                true_cfg_scale=true_guidance_scale,
+                num_images_per_prompt=num_images_per_prompt,
+            ).images
     finally:
         # Restore original methods
         pic_pipe.encode_prompt = original_encode_prompt
@@ -2305,12 +2303,12 @@ with gr.Blocks(css=css) as demo:
     # Tab 0 = Video Generator (vidgen), Tab 1 = Photo Editor (picgen).
     # -vidgen (default) opens on the Video Generator tab; -picgen opens on the
     # Photo Editor tab.
-    with gr.Tabs(selected=(0 if STARTUP_MODE == "vidgen" else 1)):
+    with gr.Tabs(selected=("vidgen-tab" if STARTUP_MODE == "vidgen" else "picgen-tab")):
 
         # ------------------------------------------------------------------ #
         #  TAB 1 — VIDEO GENERATOR (Qwen relocate -> Wan 2.2 4-step animate)  #
         # ------------------------------------------------------------------ #
-        with gr.Tab("🎬 Video Generator"):
+        with gr.Tab("🎬 Video Generator", id="vidgen-tab"):
             gr.Markdown(model_title())
 
             with gr.Row():
@@ -2577,7 +2575,7 @@ with gr.Blocks(css=css) as demo:
         # ------------------------------------------------------------------ #
         #  TAB 2 — PHOTO EDITOR (picgen)                                      #
         # ------------------------------------------------------------------ #
-        with gr.Tab("🖼️ Photo Editor"):
+        with gr.Tab("🖼️ Photo Editor", id="picgen-tab"):
             with gr.Column(elem_id="col-container"):
 
                 with gr.Row():
@@ -2896,14 +2894,8 @@ if __name__ == "__main__":
         else:
             print("🚀 GRADIO LAUNCHING — Qwen on GPU, picgen ready immediately.")
         demo.queue(default_concurrency_limit=1)
-        demo.launch(
-            server_name="0.0.0.0",
-            server_port=7860,
-            share=False,
-            allowed_paths=[SCRIPT_DIR, str(OUTPUT_DIR)],
-        )
 
-        # Background: load the secondary model to CPU after Gradio is up
+        # Start background loading BEFORE demo.launch (which blocks forever)
         def _bg_load():
             try:
                 time.sleep(2.0)
@@ -2969,4 +2961,10 @@ if __name__ == "__main__":
 
         threading.Thread(target=_bg_load, daemon=True).start()
 
-
+        # Launch Gradio AFTER starting background thread (demo.launch blocks forever)
+        demo.launch(
+            server_name="0.0.0.0",
+            server_port=7860,
+            share=False,
+            allowed_paths=[SCRIPT_DIR, str(OUTPUT_DIR)],
+        )
