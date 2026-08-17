@@ -2207,6 +2207,17 @@ body, .gradio-container { margin: 0 !important; padding: 0 !important; max-width
 #generated-video video { max-height: 320px !important; width: 100% !important; object-fit: contain !important; }
 /* Make picgen prompt textareas manually resizable */
 #col-container textarea { resize: vertical !important; min-height: 60px !important; touch-action: pan-y !important; }
+/* Starter image thumbnail grid */
+.starter-grid { display: flex; flex-wrap: nowrap; gap: 4px; padding: 6px 0; justify-content: center; overflow-x: auto; }
+.starter-thumb { position: relative; display: flex; flex-direction: column; align-items: center; cursor: pointer; border: 2px solid var(--border-color-primary); border-radius: 6px; overflow: visible; transition: all .15s; flex: 0 0 auto; width: calc(10% - 4px); min-width: 40px; max-width: 70px; }
+.starter-thumb:hover { border-color: var(--color-accent); transform: translateY(-2px); box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+.starter-thumb img { width: 100%; aspect-ratio: 1; object-fit: contain; background: var(--background-fill-secondary); border-radius: 4px 4px 0 0; }
+.starter-thumb span { font-size: 10px; font-weight: 600; padding: 2px 0; color: var(--body-text-color); }
+/* Hover/long-press preview — 4x larger, positioned above the thumbnail */
+.starter-thumb .starter-preview { display: none; position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); z-index: 9999; pointer-events: none; padding: 4px; background: var(--background-fill-primary); border: 2px solid var(--color-accent); border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+.starter-thumb .starter-preview img { width: 240px; height: 240px; object-fit: contain; border-radius: 4px; }
+.starter-thumb:hover .starter-preview { display: block; }
+.starter-thumb.touch-active .starter-preview { display: block; }
 """
 
 with gr.Blocks(css=css) as demo:
@@ -2551,8 +2562,42 @@ with gr.Blocks(css=css) as demo:
         with gr.Tab("🖼️ Photo Editor", id="picgen-tab"):
             with gr.Column(elem_id="col-container"):
 
-                with gr.Row():
-                    starter_btns = [gr.Button(str(i), size="sm", min_width=30) for i in range(1, 11)]
+                # Build starter image thumbnails HTML
+                def _build_starter_thumbnails_html():
+                    """Generate HTML for clickable starter image thumbnails with hover preview."""
+                    starters_dir = os.path.join(SCRIPT_DIR, "starters")
+                    html_parts = []
+                    for i in range(1, 11):
+                        img_b64 = None
+                        for ext in ("jpg", "png", "webp"):
+                            path = os.path.join(starters_dir, f"start{i}.{ext}")
+                            if os.path.exists(path):
+                                with open(path, "rb") as f:
+                                    data = f.read()
+                                mime = {"jpg": "jpeg", "png": "png", "webp": "webp"}[ext]
+                                img_b64 = f"data:image/{mime};base64,{base64.b64encode(data).decode()}"
+                                break
+                        if img_b64:
+                            html_parts.append(
+                                f'<div class="starter-thumb" onclick="window.__loadStarter({i})" title="Starter {i}"'
+                                f' ontouchstart="window.__starterTouchStart(this)" ontouchend="window.__starterTouchEnd(this)"'
+                                f' ontouchmove="window.__starterTouchEnd(this)">'
+                                f'<div class="starter-preview"><img src="{img_b64}" /></div>'
+                                f'<img src="{img_b64}" />'
+                                f'<span>{i}</span></div>'
+                            )
+                    if not html_parts:
+                        return ""
+                    return (
+                        '<div class="starter-grid">' + ''.join(html_parts) + '</div>'
+                    )
+
+                _starter_html = _build_starter_thumbnails_html()
+                if _starter_html:
+                    gr.HTML(_starter_html)
+
+                # Hidden components for starter functionality
+                starter_trigger = gr.Number(value=0, visible=False, elem_id="starter-trigger")
 
                 with gr.Row():
                     # Left column: input uploader + controls
@@ -2739,8 +2784,12 @@ with gr.Blocks(css=css) as demo:
 
                 starter_b64_output = gr.Textbox(value="", visible=False, elem_id="starter-b64-output")
 
-                for i, btn in enumerate(starter_btns, start=1):
-                    btn.click(fn=lambda num=i: add_starter_image(num), inputs=[], outputs=[starter_b64_output])
+                # When starter_trigger changes (from JS click), load that starter image
+                starter_trigger.change(
+                    fn=lambda num: add_starter_image(int(num)) if num and int(num) > 0 else "",
+                    inputs=[starter_trigger],
+                    outputs=[starter_b64_output],
+                )
 
                 starter_b64_output.change(
                     fn=None, inputs=[starter_b64_output], outputs=None,
@@ -2776,6 +2825,44 @@ with gr.Blocks(css=css) as demo:
                 )
 
     demo.load(fn=None, js=gallery_js)
+
+    # Starter image click handler — updates the hidden number input to trigger Gradio event
+    starter_click_js = """
+() => {
+    window.__loadStarter = function(num) {
+        const input = document.querySelector('#starter-trigger input');
+        if (input) {
+            const nativeInput = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+            if (nativeInput && nativeInput.set) {
+                nativeInput.set.call(input, '0');
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                setTimeout(() => {
+                    nativeInput.set.call(input, String(num));
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                }, 50);
+            }
+        }
+    };
+    // Mobile long-press preview (2 seconds hold shows preview, release hides it)
+    window.__starterTouchStart = function(el) {
+        el._touchTimer = setTimeout(() => {
+            el.classList.add('touch-active');
+            el._previewing = true;
+        }, 500);
+    };
+    window.__starterTouchEnd = function(el) {
+        clearTimeout(el._touchTimer);
+        el.classList.remove('touch-active');
+        // Only fire click if not previewing (short tap)
+        if (el._previewing) {
+            el._previewing = false;
+        }
+    };
+}
+"""
+    demo.load(fn=None, js=starter_click_js)
 
     # Auto-sync video currentTime to the frame_time_input number box
     video_time_sync_js = """
