@@ -972,14 +972,15 @@ def edit_reference_frame(
 
     torch.cuda.set_device(PIC_DEVICE)
     with torch.cuda.device(PIC_DEVICE):
-        result = pic_pipe(
-            image=[image],
-            prompt=instruction,
-            negative_prompt=" ",
-            num_inference_steps=int(steps),
-            true_cfg_scale=float(guidance),
-            generator=torch.Generator(device=PIC_DEVICE).manual_seed(seed),
-        )
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            result = pic_pipe(
+                image=[image],
+                prompt=instruction,
+                negative_prompt=" ",
+                num_inference_steps=int(steps),
+                true_cfg_scale=float(guidance),
+                generator=torch.Generator(device=PIC_DEVICE).manual_seed(seed),
+            )
     edited = result.images[0]
     if edited.size != image.size:
         edited = edited.resize(image.size, Image.LANCZOS)
@@ -1994,17 +1995,18 @@ def infer(
     
     try:
         with torch.cuda.device(PIC_DEVICE):
-            image = pic_pipe(
-                image=pil_images if pil_images else None,
-                prompt=prompt,
-                height=height,
-                width=width,
-                negative_prompt=negative_prompt,
-                num_inference_steps=num_inference_steps,
-                generator=generator,
-                true_cfg_scale=true_guidance_scale,
-                num_images_per_prompt=num_images_per_prompt,
-            ).images
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                image = pic_pipe(
+                    image=pil_images if pil_images else None,
+                    prompt=prompt,
+                    height=height,
+                    width=width,
+                    negative_prompt=negative_prompt,
+                    num_inference_steps=num_inference_steps,
+                    generator=generator,
+                    true_cfg_scale=true_guidance_scale,
+                    num_images_per_prompt=num_images_per_prompt,
+                ).images
     finally:
         # Restore original methods
         pic_pipe.encode_prompt = original_encode_prompt
