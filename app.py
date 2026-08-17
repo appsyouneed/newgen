@@ -2808,12 +2808,6 @@ with gr.Blocks(css=css) as demo:
                             gr.update(visible=not is_timeline),                 # vid_negative_prompt
                             gr.update(visible=not is_timeline),                 # duration_row
                         )
-                    
-                    scene_mode.change(
-                        fn=_update_scene_visibility,
-                        inputs=[scene_mode],
-                        outputs=[edit_instruction, edit_instruction_info, additional_refs, timeline_section, vid_prompt, vid_negative_prompt, duration_row],
-                    )
 
                     duration_row = gr.Row()
                     with duration_row:
@@ -2834,6 +2828,13 @@ with gr.Blocks(css=css) as demo:
                                 info="Lower = better prompt. Higher = more motion.",
                                 interactive=False,
                             )
+                    
+                    # Connect scene_mode change AFTER duration_row is defined
+                    scene_mode.change(
+                        fn=_update_scene_visibility,
+                        inputs=[scene_mode],
+                        outputs=[edit_instruction, edit_instruction_info, additional_refs, timeline_section, vid_prompt, vid_negative_prompt, duration_row],
+                    )
                     
                     # Enable/disable flow_shift slider based on auto checkbox
                     def update_flow_shift_interactivity(auto_enabled):
