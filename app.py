@@ -272,14 +272,20 @@ for i in range(_gpu_count):
 # Minimum VRAM to hold both models simultaneously (~45GB WAN + ~35GB Qwen)
 _CONCURRENT_THRESHOLD_MB = 80 * 1024  # 80 GB
 
+# Minimum per-GPU VRAM to fit a full model without splitting
+_PER_GPU_FULL_MODEL_MB = 48 * 1024  # 48 GB (WAN needs ~45GB active)
+
 # Determine execution mode
 _force_single = os.environ.get("NEWGEN_FORCE_SINGLE_GPU") == "1"
+_max_single_gpu_vram = max(g["vram_mb"] for g in _gpu_info)
 
 if _force_single or _gpu_count == 1:
     GPU_MODE = "single"
-elif _total_vram_mb >= _CONCURRENT_THRESHOLD_MB:
+elif _gpu_count >= 2 and _max_single_gpu_vram >= _PER_GPU_FULL_MODEL_MB:
+    # Each GPU can hold a full model on its own — pin one model per GPU
     GPU_MODE = "concurrent"
 else:
+    # Multi-GPU but individual cards too small for a full model — split via accelerate
     GPU_MODE = "stacked"
 
 # Device assignments based on mode
@@ -289,7 +295,7 @@ if GPU_MODE == "concurrent":
     PIC_QUEUE_ID = "pic-gpu"
     WAN_QUEUE_ID = "wan-gpu"
 elif GPU_MODE == "stacked":
-    # Stacked: models split across all GPUs — both can run concurrently
+    # Stacked: models split across all GPUs via accelerate balanced device_map
     PIC_DEVICE = "cuda:0"
     WAN_DEVICE = "cuda:0"  # Balanced mode handles device placement internally
     PIC_QUEUE_ID = "pic-gpu"
