@@ -180,25 +180,26 @@ my_prompts_dict = {
 
 ## 🖼️ Starter Images (`starters/`)
 
-The Picgen tab includes up to 4 quick-load buttons (**Start 1** through **Start 4**) that instantly load a reference image into the editor. This is useful for keeping frequently-used subjects (yourself, a partner, a character) one click away.
+The Picgen tab includes 10 quick-load buttons (**1** through **10**) that instantly load a reference image into the editor. This is useful for keeping frequently-used subjects (yourself, a partner, a character) one click away.
 
 ### Setup
 
-Place `.jpg` images in the `starters/` folder with these exact names:
+Place images in the `starters/` folder with these names:
 
 ```
 /root/newgen/starters/
-├── start1.jpg
+├── start1.jpg    (or .png or .webp)
 ├── start2.jpg
-├── start3.jpg
-└── start4.jpg
+├── start3.png
+├── start4.webp
+├── ...
+└── start10.jpg
 ```
 
-- Images should be clear, well-lit reference photos
-- Any resolution works — they're automatically resized for the pipeline
-- Only `.jpg` format is supported
-- You can use 1, 2, 3, or all 4 slots — empty slots are simply ignored
-- Click any **Start** button in the Picgen tab to instantly load that image as input
+- Supports `.jpg`, `.png`, and `.webp` formats (one per slot)
+- Any resolution works — automatically resized for the pipeline
+- You can use any number of the 10 slots — empty slots are simply ignored
+- Click any numbered button in the Picgen tab to instantly load that image as input
 
 ---
 
