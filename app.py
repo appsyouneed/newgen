@@ -3190,6 +3190,7 @@ with gr.Blocks(css=css) as demo:
                             columns=2,
                         )
                         use_output_btn = gr.Button("↗️ Use as input", variant="secondary", size="sm")
+                        use_as_next_seg_btn = gr.Button("📎 Use As Next Segment", variant="secondary", size="sm")
 
                         # Row 1: 4 dropdowns
                         with gr.Row():
@@ -3357,6 +3358,265 @@ with gr.Blocks(css=css) as demo:
                             if (!document.getElementById('keyboard-style')) document.head.appendChild(style);
                         }, 100);
                     }""",
+                )
+
+            # ==================================================================
+            # PROGRESSION MODE — Timeline at bottom of picgen tab
+            # ==================================================================
+            with gr.Accordion("🎬 Progression Mode (Video Timeline)", open=False):
+                gr.Markdown(
+                    "Build a video timeline by adding images and prompts for each segment. "
+                    "Use the editor above to generate images, then click **📎 Use As Next Segment** to add them here. "
+                    "Each segment animates from its image to the next segment's image using the prompt as motion."
+                )
+                
+                # 10 segment slots — each with image, prompt, duration, and move buttons
+                prog_images = []
+                prog_prompts = []
+                prog_durations = []
+                prog_up_btns = []
+                prog_down_btns = []
+                
+                for i in range(1, 11):
+                    with gr.Row():
+                        with gr.Column(scale=0, min_width=50):
+                            up_btn = gr.Button("↑", size="sm", min_width=30)
+                            down_btn = gr.Button("↓", size="sm", min_width=30)
+                        img = gr.Image(
+                            label=f"Seg {i}",
+                            type="filepath",
+                            scale=1,
+                            height=100,
+                        )
+                        prompt = gr.Textbox(
+                            label=f"Motion/Action",
+                            placeholder=f"What happens in segment {i}",
+                            lines=2,
+                            scale=2,
+                        )
+                        dur = gr.Slider(
+                            0.5, 6.0, value=3.5, step=0.5,
+                            label="Sec",
+                            scale=0,
+                            min_width=80,
+                        )
+                    prog_images.append(img)
+                    prog_prompts.append(prompt)
+                    prog_durations.append(dur)
+                    prog_up_btns.append(up_btn)
+                    prog_down_btns.append(down_btn)
+                
+                prog_generate_btn = gr.Button("🎬 Generate Progression Video", variant="primary", size="lg")
+                
+                # --- Reorder handlers (swap segments up/down) ---
+                def _swap_segments(idx_to_move, direction, *all_values):
+                    """Swap two adjacent segments. Returns all values reordered."""
+                    # all_values = 10 images + 10 prompts + 10 durations = 30 values
+                    images = list(all_values[:10])
+                    prompts = list(all_values[10:20])
+                    durations = list(all_values[20:30])
+                    
+                    idx = int(idx_to_move)
+                    target = idx + (-1 if direction == "up" else 1)
+                    
+                    if 0 <= target <= 9:
+                        images[idx], images[target] = images[target], images[idx]
+                        prompts[idx], prompts[target] = prompts[target], prompts[idx]
+                        durations[idx], durations[target] = durations[target], durations[idx]
+                    
+                    return images + prompts + durations
+                
+                all_prog_components = prog_images + prog_prompts + prog_durations
+                
+                for i in range(10):
+                    prog_up_btns[i].click(
+                        fn=lambda *vals, idx=i: _swap_segments(idx, "up", *vals),
+                        inputs=all_prog_components,
+                        outputs=all_prog_components,
+                    )
+                    prog_down_btns[i].click(
+                        fn=lambda *vals, idx=i: _swap_segments(idx, "down", *vals),
+                        inputs=all_prog_components,
+                        outputs=all_prog_components,
+                    )
+                
+                # --- "Use As Next Segment" handler ---
+                def _add_to_next_segment(gallery_images, *current_images):
+                    """Add the first result image to the next empty segment slot."""
+                    if not gallery_images:
+                        raise gr.Error("No images in result gallery.")
+                    
+                    # Get the first image from gallery
+                    first_item = gallery_images[0]
+                    if isinstance(first_item, (list, tuple)):
+                        img_path = first_item[0]
+                    elif isinstance(first_item, dict):
+                        img_path = first_item.get("name") or first_item.get("path")
+                    else:
+                        img_path = first_item
+                    
+                    # Find next empty slot
+                    images_list = list(current_images)
+                    for idx in range(10):
+                        if not images_list[idx]:
+                            images_list[idx] = img_path
+                            print(f"📎 Added image to segment {idx + 1}")
+                            return images_list
+                    
+                    raise gr.Error("All 10 segment slots are full.")
+                
+                use_as_next_seg_btn.click(
+                    fn=_add_to_next_segment,
+                    inputs=[pic_result] + prog_images,
+                    outputs=prog_images,
+                )
+                
+                # --- Generate Progression Video handler ---
+                def _generate_progression(
+                    *all_inputs,
+                    progress=gr.Progress(track_tqdm=True),
+                ):
+                    """
+                    Generate video from progression timeline.
+                    Each segment animates from its image to the next segment's image.
+                    """
+                    # Parse inputs: 10 images + 10 prompts + 10 durations + settings
+                    images = list(all_inputs[:10])
+                    prompts = list(all_inputs[10:20])
+                    durations = list(all_inputs[20:30])
+                    resolution_val, frame_mult, exp_quality = all_inputs[30], all_inputs[31], all_inputs[32]
+                    seed_val, rand_seed = all_inputs[33], all_inputs[34]
+                    audio_cb, audio_prompt = all_inputs[35], all_inputs[36]
+                    neg_prompt = all_inputs[37]
+                    fs_auto, fs_val = all_inputs[38], all_inputs[39]
+                    
+                    # Collect segments that have both an image and a prompt
+                    segments = []
+                    for i in range(10):
+                        img = images[i]
+                        prompt = (prompts[i] or "").strip()
+                        if img and prompt:
+                            dur = float(durations[i]) if durations[i] else 3.5
+                            dur = max(0.5, min(6.0, dur))
+                            segments.append({"image": img, "prompt": prompt, "duration": dur})
+                    
+                    if len(segments) < 1:
+                        raise gr.Error("Need at least 1 segment with both an image and a prompt.")
+                    
+                    # Build the video: animate from each segment's image to the next
+                    if not neg_prompt or not str(neg_prompt).strip():
+                        neg_prompt = default_negative_prompt
+                    
+                    total_duration = sum(s["duration"] for s in segments)
+                    
+                    # Flow shift
+                    if fs_auto:
+                        if total_duration <= 6.0: flow_shift = 6.9
+                        elif total_duration <= 10.0: flow_shift = 5.5
+                        elif total_duration <= 20.0: flow_shift = 4.5
+                        else: flow_shift = 4.0
+                    else:
+                        flow_shift = float(fs_val) if fs_val else WAN_FLOW_SHIFT
+                    
+                    current_seed = random.randint(0, MAX_SEED) if rand_seed else int(seed_val)
+                    started = time.time()
+                    segment_paths = []
+                    
+                    print(f"🎬 Progression: {len(segments)} segments, {total_duration:.1f}s total")
+                    
+                    try:
+                        for seg_idx in range(len(segments)):
+                            seg = segments[seg_idx]
+                            seg_num = seg_idx + 1
+                            
+                            # Load and resize the start frame
+                            start_img = _ensure_pil(seg["image"])
+                            if start_img is None:
+                                raise gr.Error(f"Segment {seg_num}: could not load image.")
+                            start_frame = resize_image_for_wan(start_img, resolution_val)
+                            
+                            # End frame = next segment's image (if exists)
+                            end_frame = None
+                            if seg_idx + 1 < len(segments):
+                                end_img = _ensure_pil(segments[seg_idx + 1]["image"])
+                                if end_img:
+                                    end_frame = resize_and_crop_to_match(end_img, start_frame)
+                            
+                            # Animate
+                            num_frames = get_num_frames(seg["duration"])
+                            seg_seed = current_seed + seg_idx * 100
+                            
+                            print(f"  🎬 Seg {seg_num} ({seg['duration']}s): {seg['prompt'][:50]}...")
+                            
+                            raw_frames = animate_frame(
+                                start_frame, end_frame, seg["prompt"], neg_prompt,
+                                num_frames, seg_seed, flow_shift,
+                            )
+                            
+                            # RIFE
+                            factor = max(1, int(frame_mult) // FIXED_FPS)
+                            if factor > 1:
+                                seg_frames = interpolate_bits(raw_frames, multiplier=factor)
+                            else:
+                                seg_frames = list(raw_frames)
+                            seg_fps = FIXED_FPS * factor
+                            
+                            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                                seg_path = f.name
+                            export_to_video(seg_frames, seg_path, fps=seg_fps, quality=int(exp_quality))
+                            segment_paths.append(seg_path)
+                            print(f"  ✅ Seg {seg_num} done")
+                        
+                        # Stitch
+                        if len(segment_paths) > 1:
+                            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                                final_path = f.name
+                            concatenate_videos(segment_paths, final_path)
+                            for p in segment_paths:
+                                try: os.unlink(p)
+                                except OSError: pass
+                        else:
+                            final_path = segment_paths[0]
+                        
+                        # Audio
+                        if audio_cb and _MMAUDIO_AVAILABLE:
+                            try:
+                                final_path = add_audio_to_video(final_path, audio_prompt, total_duration)
+                            except Exception as e:
+                                print(f"MMAudio error: {e}")
+                        
+                        # Rename
+                        named_path = unique_output_path("vidgen_progression", ".mp4")
+                        try:
+                            shutil.move(final_path, named_path)
+                            final_path = str(named_path)
+                        except Exception:
+                            pass
+                        
+                        print(f"🎬 Progression done in {time.time() - started:.1f}s — {len(segments)} segments")
+                        return final_path
+                    
+                    except gr.Error:
+                        raise
+                    except Exception as e:
+                        for p in segment_paths:
+                            try: os.unlink(p)
+                            except OSError: pass
+                        raise gr.Error(f"Progression generation failed: {e}")
+                
+                # Video output for progression mode
+                prog_video_output = gr.Video(label="Progression Video", interactive=False)
+                
+                prog_generate_btn.click(
+                    fn=_generate_progression,
+                    inputs=all_prog_components + [
+                        resolution, frame_multiplier, export_quality,
+                        seed, randomize_seed, add_audio_cb, audio_prompt_tb,
+                        vid_negative_prompt, flow_shift_auto, flow_shift,
+                    ],
+                    outputs=[prog_video_output],
+                    concurrency_id=WAN_QUEUE_ID,
+                    concurrency_limit=10,
                 )
 
     demo.load(fn=None, js=gallery_js)
