@@ -2638,12 +2638,6 @@ body, .gradio-container { margin: 0 !important; padding: 0 !important; max-width
 #generated-video video { max-height: 320px !important; width: 100% !important; object-fit: contain !important; }
 /* Make picgen prompt textareas manually resizable */
 #col-container textarea { resize: vertical !important; min-height: 60px !important; touch-action: pan-y !important; }
-/* Starter image thumbnail grid */
-.starter-grid { display: flex; flex-wrap: nowrap; gap: 4px; padding: 6px 0; justify-content: center; overflow-x: auto; }
-.starter-thumb { position: relative; display: flex; flex-direction: column; align-items: center; cursor: pointer; border: 2px solid var(--border-color-primary); border-radius: 6px; overflow: hidden; transition: all .15s; flex: 0 0 auto; width: calc(10% - 4px); min-width: 40px; max-width: 70px; }
-.starter-thumb:hover { border-color: var(--color-accent); transform: translateY(-2px); box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
-.starter-thumb img { width: 100%; aspect-ratio: 1; object-fit: contain; background: var(--background-fill-secondary); }
-.starter-thumb span { font-size: 10px; font-weight: 600; padding: 2px 0; color: var(--body-text-color); }
 """
 
 with gr.Blocks(css=css) as demo:
@@ -3111,13 +3105,13 @@ with gr.Blocks(css=css) as demo:
         with gr.Tab("🖼️ Photo Editor", id="picgen-tab"):
             with gr.Column(elem_id="col-container"):
 
-                # Build starter image thumbnails as static HTML
+                # Build starter image thumbnails as static preview
                 def _build_starter_thumbnails_html():
-                    """Generate HTML for starter image thumbnails."""
+                    """Generate HTML preview of starter images — each centered above its button."""
                     starters_dir = os.path.join(SCRIPT_DIR, "starters")
                     html_parts = []
                     for i in range(1, 11):
-                        img_b64 = None
+                        found = False
                         for ext in ("jpg", "png", "webp"):
                             path = os.path.join(starters_dir, f"start{i}.{ext}")
                             if os.path.exists(path):
@@ -3125,24 +3119,23 @@ with gr.Blocks(css=css) as demo:
                                     data = f.read()
                                 mime = {"jpg": "jpeg", "png": "png", "webp": "webp"}[ext]
                                 img_b64 = f"data:image/{mime};base64,{base64.b64encode(data).decode()}"
+                                html_parts.append(
+                                    f'<div style="flex:1;text-align:center;min-width:0;">'
+                                    f'<img src="{img_b64}" style="width:100%;aspect-ratio:1;object-fit:contain;border:1px solid var(--border-color-primary);border-radius:4px;background:var(--background-fill-secondary);" />'
+                                    f'</div>'
+                                )
+                                found = True
                                 break
-                        if img_b64:
-                            html_parts.append(
-                                f'<div class="starter-thumb" data-starter="{i}" title="Starter {i}">'
-                                f'<img src="{img_b64}" />'
-                                f'<span>{i}</span></div>'
-                            )
-                    if not html_parts:
-                        return ""
-                    return '<div class="starter-grid">' + ''.join(html_parts) + '</div>'
+                        if not found:
+                            # Empty placeholder to keep alignment
+                            html_parts.append('<div style="flex:1;min-width:0;"></div>')
+                    return '<div style="display:flex;gap:4px;padding:4px 0;">' + ''.join(html_parts) + '</div>'
 
-                _starter_html = _build_starter_thumbnails_html()
-                if _starter_html:
-                    gr.HTML(_starter_html)
+                gr.HTML(_build_starter_thumbnails_html())
 
-                # Real buttons (hidden visually) — triggered by JS when thumbnails are clicked
-                with gr.Row(visible=False):
-                    starter_btns = [gr.Button(f"s{i}", elem_id=f"starter-btn-{i}") for i in range(1, 11)]
+                # Real clickable buttons (like working version) — perfectly aligned under each image
+                with gr.Row():
+                    starter_btns = [gr.Button(str(i), size="sm", min_width=30) for i in range(1, 11)]
 
                 with gr.Row():
                     # Left column: input uploader + controls
@@ -3367,21 +3360,6 @@ with gr.Blocks(css=css) as demo:
                 )
 
     demo.load(fn=None, js=gallery_js)
-
-    # Starter image click handler — updates the hidden number input to trigger Gradio event
-    starter_click_js = """
-() => {
-    // When thumbnail images are clicked, trigger the corresponding hidden Gradio button
-    document.querySelectorAll('.starter-thumb').forEach(thumb => {
-        thumb.addEventListener('click', () => {
-            const num = thumb.getAttribute('data-starter');
-            const btn = document.querySelector('#starter-btn-' + num + ' button');
-            if (btn) btn.click();
-        });
-    });
-}
-"""
-    demo.load(fn=None, js=starter_click_js)
 
     # Auto-sync video currentTime to the frame_time_input number box
     video_time_sync_js = """
