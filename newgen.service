@@ -1,0 +1,24 @@
+[Unit]
+Description=Newgen Video + Photo Generation Application
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/newgen
+Environment="PYTHONUNBUFFERED=1"
+Environment="HF_HOME=/root/.cache/huggingface"
+Environment="PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+Environment="TMPDIR=/root/newgen/tmp"
+Environment="TEMP=/root/newgen/tmp"
+Environment="TMP=/root/newgen/tmp"
+ExecStartPre=/bin/mkdir -p /root/newgen/tmp
+ExecStartPre=/bin/chmod 1777 /root/newgen/tmp
+ExecStart=/usr/bin/python3 /root/newgen/app.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/root/newgen/newgen.log
+StandardError=append:/root/newgen/newgen.log
+
+[Install]
+WantedBy=multi-user.target
