@@ -21,12 +21,14 @@
 - Image-to-video with prompt-guided motion and scene control
 - Segment chaining for videos up to 10 minutes
 - Adaptive flow shift for optimal prompt following
+- Preset prompt library for quick generation
 - MMAudio integration for automatic sound generation
 
 🖼️ **Photo Editor (Picgen)**
 - Qwen Image Edit 2511 + Rapid AIO NSFW weights
 - Multi-image input with custom edit instructions
 - Preset prompt library for quick generation
+- Starter images for quick reference loading (up to 4 slots)
 - High-quality 4-step inference
 
 ⚡ **Performance Engine**
@@ -87,6 +89,7 @@ python3 app.py -picgen   # Picgen tab loads first (single GPU mode only)
 ├── clear.sh            # Clear generated files
 ├── requirements.txt    # Python dependencies
 ├── qwenimage/          # Custom Qwen pipeline module
+├── starters/           # Quick-load reference images (start1.jpg - start4.jpg)
 ├── outputs/            # Generated images and videos
 │   ├── images/
 │   └── videos/
@@ -130,6 +133,72 @@ bash clear.sh
 └─────────────────────────────────────────────────────┘
 ```
 *TeaCache available but disabled for 4-step models (quality preservation)*
+
+---
+
+## 📝 Prompt Library (`prompts.py`)
+
+The app includes an extensive preset prompt library organized by category for both tabs. Selecting any preset instantly populates the prompt field — no typing needed.
+
+### 🎬 Video Presets (8 categories)
+
+| Category | Description |
+|---|---|
+| **Solo** | Single subject motion and posing |
+| **Couple (Unseen)** | Two subjects, one partially shown |
+| **Couple (Seen)** | Two subjects, both fully visible |
+| **Multiple** | Group scenes with motion |
+| **Multi-Step** | Sequential action prompts |
+| **Environment** | Background/setting changes |
+| **Custom** | Miscellaneous creative prompts |
+| **Multiple (Variants)** | Group scenes with different compositions |
+
+### 🖼️ Photo Presets (7 categories)
+
+| Category | Description |
+|---|---|
+| **Solo** | Single subject edits and poses |
+| **Couple (Man Unseen)** | Paired scenes, one subject implied |
+| **Couple (Man Seen)** | Paired scenes, both visible |
+| **Multiple Women** | Group compositions, subjects only |
+| **Multiple (Man Unseen)** | Group with implied additional subject |
+| **Multiple (Man Seen)** | Group with all subjects visible |
+| **Multi-Step** | Chained sequential edit instructions |
+
+### Customization
+
+Edit `prompts.py` to add your own presets. Each category is a Python dictionary — keys are display names, values are the prompt text:
+
+```python
+my_prompts_dict = {
+    "Preset Name": "your detailed prompt text here",
+    "Another Preset": "another prompt...",
+}
+```
+
+---
+
+## 🖼️ Starter Images (`starters/`)
+
+The Picgen tab includes up to 4 quick-load buttons (**Start 1** through **Start 4**) that instantly load a reference image into the editor. This is useful for keeping frequently-used subjects (yourself, a partner, a character) one click away.
+
+### Setup
+
+Place `.jpg` images in the `starters/` folder with these exact names:
+
+```
+/root/newgen/starters/
+├── start1.jpg
+├── start2.jpg
+├── start3.jpg
+└── start4.jpg
+```
+
+- Images should be clear, well-lit reference photos
+- Any resolution works — they're automatically resized for the pipeline
+- Only `.jpg` format is supported
+- You can use 1, 2, 3, or all 4 slots — empty slots are simply ignored
+- Click any **Start** button in the Picgen tab to instantly load that image as input
 
 ---
 
