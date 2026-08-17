@@ -2741,7 +2741,7 @@ with gr.Blocks(css=css) as demo:
                     )
                     vid_prompt = gr.Textbox(
                         label="Motion & Scene Prompt",
-                        value=default_video_prompt,
+                        value="",
                         lines=4,
                         placeholder=(
                             "Describe the motion, action, lighting and camera. "
@@ -2779,14 +2779,8 @@ with gr.Blocks(css=css) as demo:
                     timeline_section = gr.Column(visible=False)
                     with timeline_section:
                         gr.Markdown(
-                            "**Timeline:** Each segment has its own edit instruction + duration (max 6s). "
-                            "Empty segments are skipped. Each segment edits the previous frame."
-                        )
-                        timeline_motion = gr.Textbox(
-                            label="Motion Prompt (animation style for ALL segments)",
-                            value=default_video_prompt,
-                            lines=2,
-                            placeholder="Camera movement, lighting, motion style",
+                            "**Timeline:** Each segment prompt is used as both the image edit instruction AND the video motion prompt. "
+                            "Empty segments are skipped. Fill in order."
                         )
                         timeline_prompts = []
                         timeline_durations = []
@@ -2809,20 +2803,25 @@ with gr.Blocks(css=css) as demo:
                     
                     # Show/hide sections based on scene_mode
                     def _update_scene_visibility(mode):
+                        is_timeline = (mode == MODE_TIMELINE)
                         return (
                             gr.update(visible=(mode == MODE_CUSTOM)),           # edit_instruction
                             gr.update(visible=(mode == MODE_CUSTOM)),           # edit_instruction_info
-                            gr.update(visible=(mode != MODE_KEEP)),             # additional_refs
-                            gr.update(visible=(mode == MODE_TIMELINE)),         # timeline_section
+                            gr.update(visible=(mode != MODE_KEEP and not is_timeline)),  # additional_refs
+                            gr.update(visible=is_timeline),                     # timeline_section
+                            gr.update(visible=not is_timeline),                 # vid_prompt
+                            gr.update(visible=not is_timeline),                 # vid_negative_prompt
+                            gr.update(visible=not is_timeline),                 # duration_row
                         )
                     
                     scene_mode.change(
                         fn=_update_scene_visibility,
                         inputs=[scene_mode],
-                        outputs=[edit_instruction, edit_instruction_info, additional_refs, timeline_section],
+                        outputs=[edit_instruction, edit_instruction_info, additional_refs, timeline_section, vid_prompt, vid_negative_prompt, duration_row],
                     )
 
-                    with gr.Row():
+                    duration_row = gr.Row()
+                    with duration_row:
                         duration_seconds = gr.Slider(
                             MIN_DURATION, MAX_DURATION, value=3.5, step=0.5,
                             label="Duration (seconds)",
@@ -3006,7 +3005,7 @@ with gr.Blocks(css=css) as demo:
                 ref_image,
                 p1, p2, p3, p4, p5, p6, p7, p8, p9, p10,
                 d1, d2, d3, d4, d5, d6, d7, d8, d9, d10,
-                motion, resolution_val, frame_mult, exp_quality,
+                resolution_val, frame_mult, exp_quality,
                 seed_val, rand_seed, audio_cb, audio_prompt,
                 neg_prompt, e_steps, e_guidance,
                 fs_auto, fs_val, add_refs,
@@ -3027,7 +3026,7 @@ with gr.Blocks(css=css) as demo:
                 prompts_json = json.dumps([s["prompt"] for s in segments])
                 durations_json = json.dumps([s["duration"] for s in segments])
                 return _generate_timeline_with_durations(
-                    ref_image, prompts_json, durations_json, motion,
+                    ref_image, prompts_json, durations_json, None,
                     resolution_val, frame_mult, exp_quality,
                     seed_val, rand_seed, audio_cb, audio_prompt,
                     neg_prompt, e_steps, e_guidance,
@@ -3040,7 +3039,7 @@ with gr.Blocks(css=css) as demo:
                     reference_image,
                     *timeline_prompts,
                     *timeline_durations,
-                    timeline_motion, resolution, frame_multiplier, export_quality,
+                    resolution, frame_multiplier, export_quality,
                     seed, randomize_seed, add_audio_cb, audio_prompt_tb,
                     vid_negative_prompt, edit_steps, edit_guidance,
                     flow_shift_auto, flow_shift, additional_refs,
@@ -3151,7 +3150,7 @@ with gr.Blocks(css=css) as demo:
                     gr.HTML(_starter_html)
 
                 # Hidden components for starter functionality
-                starter_trigger = gr.Number(value=0, visible=False, elem_id="starter-trigger")
+                starter_trigger = gr.Textbox(value="", visible=False, elem_id="starter-trigger")
 
                 with gr.Row():
                     # Left column: input uploader + controls
@@ -3340,7 +3339,7 @@ with gr.Blocks(css=css) as demo:
 
                 # When starter_trigger changes (from JS click), load that starter image
                 starter_trigger.change(
-                    fn=lambda num: add_starter_image(int(num)) if num and int(num) > 0 else "",
+                    fn=lambda val: add_starter_image(int(val.split(":")[0])) if val and ":" in val else "",
                     inputs=[starter_trigger],
                     outputs=[starter_b64_output],
                 )
@@ -3384,22 +3383,23 @@ with gr.Blocks(css=css) as demo:
     starter_click_js = """
 () => {
     window.__loadStarter = function(num) {
-        const input = document.querySelector('#starter-trigger input');
+        const container = document.querySelector('#starter-trigger');
+        if (!container) return;
+        const input = container.querySelector('input') || container.querySelector('textarea');
         if (input) {
-            const nativeInput = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+            const nativeInput = Object.getOwnPropertyDescriptor(
+                input.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value'
+            );
             if (nativeInput && nativeInput.set) {
-                nativeInput.set.call(input, '0');
+                // Use num:timestamp format to guarantee uniqueness on every click
+                const val = num + ':' + Date.now();
+                nativeInput.set.call(input, val);
                 input.dispatchEvent(new Event('input', { bubbles: true }));
                 input.dispatchEvent(new Event('change', { bubbles: true }));
-                setTimeout(() => {
-                    nativeInput.set.call(input, String(num));
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                    input.dispatchEvent(new Event('change', { bubbles: true }));
-                }, 50);
             }
         }
     };
-    // Mobile long-press preview (2 seconds hold shows preview, release hides it)
+    // Mobile long-press preview (hold shows preview, release hides it)
     window.__starterTouchStart = function(el) {
         el._touchTimer = setTimeout(() => {
             el.classList.add('touch-active');
