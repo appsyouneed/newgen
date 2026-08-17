@@ -88,9 +88,9 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 # Suppress torchao import warning from diffusers
 import io as _io
 import contextlib as _ctx
-with _ctx.redirect_stderr(_io.StringIO()):
-    from huggingface_hub import hf_hub_download
-    from torch.nn import functional as F
+
+from huggingface_hub import hf_hub_download
+from torch.nn import functional as F
 from PIL import Image
 from safetensors.torch import load_file
 
@@ -105,14 +105,13 @@ except ImportError:
     pass
 
 import gradio as gr
-with _ctx.redirect_stderr(_io.StringIO()):
-    from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
-    from diffusers.utils.export_utils import export_to_video
+from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
+from diffusers.utils.export_utils import export_to_video
 
-    try:
-        from diffusers import QwenImageEditPlusPipeline
-    except ImportError:
-        from qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
+try:
+    from diffusers import QwenImageEditPlusPipeline
+except ImportError:
+    from qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
