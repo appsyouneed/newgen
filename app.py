@@ -55,7 +55,7 @@ os.environ.update({
     "ABSL_MIN_LOG_LEVEL": "3",
     "GRPC_VERBOSITY": "ERROR",
     "TOKENIZERS_PARALLELISM": "true",
-    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,backend:cudaMallocAsync",
     "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
     "HF_HUB_DISABLE_EXPERIMENTAL_WARNING": "1",
     "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1",
@@ -63,7 +63,6 @@ os.environ.update({
     "HF_HOME": "/root/.cache/huggingface",
     "CUDA_LAUNCH_BLOCKING": "0",
     "OMP_NUM_THREADS": "8",
-    "DIFFUSERS_VERBOSITY": "error",
 })
 
 import cv2
@@ -71,7 +70,7 @@ import numpy as np
 import torch
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision('highest')
 # Do NOT enable cudnn.benchmark — Blackwell GPUs (GB202) fail on conv3d engine search
 torch.backends.cudnn.benchmark = False
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -524,34 +523,16 @@ _SAGE_PATCHED = False  # Only patch once globally
 
 
 def apply_sage_attention(pipe):
-    """Replace SDPA attention with SageAttention for 2-3x kernel speedup."""
-    global _SAGE_PATCHED
-    if not _SAGE_ATTENTION_AVAILABLE:
-        return False
-    if _SAGE_PATCHED:
-        return True  # Already patched globally
-    try:
-        # SageAttention works by globally replacing F.scaled_dot_product_attention.
-        # This is thread-safe because each CUDA stream processes sequentially
-        # and sageattn handles its own dispatch internally.
-        import torch.nn.functional
-        original_sdpa = torch.nn.functional.scaled_dot_product_attention
-        
-        def _sage_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, 
-                       is_causal=False, scale=None, **kwargs):
-            try:
-                return sageattn(query, key, value)
-            except Exception:
-                # Fallback to original SDPA if sageattn fails on this input shape
-                return original_sdpa(query, key, value, attn_mask=attn_mask,
-                                   dropout_p=dropout_p, is_causal=is_causal, scale=scale)
-        
-        torch.nn.functional.scaled_dot_product_attention = _sage_sdpa
-        _SAGE_PATCHED = True
-        return True
-    except Exception as e:
-        print(f"  SageAttention patch failed: {e}")
-        return False
+    """Replace SDPA attention with SageAttention for 2-3x kernel speedup.
+    
+    WARNING: This patches F.scaled_dot_product_attention GLOBALLY.
+    Only call this if you're sure it won't break other models (e.g. Qwen).
+    Currently DISABLED to prevent black images in picgen.
+    """
+    # DISABLED: Global SDPA patching breaks Qwen's text encoder, causing all-black images.
+    # SageAttention only works safely with Wan's transformer architecture.
+    # Until per-model attention patching is implemented, this stays disabled.
+    return False
 
 
 def apply_torch_compile(pipe, mode="reduce-overhead"):
@@ -1433,7 +1414,6 @@ if GPU_MODE == "stacked":
     # Apply optimizations
     print("⚡ Applying inference optimizations...")
     apply_all_optimizations(wan_pipe, "WAN (vidgen)", enable_compile=True, enable_teacache=False)
-    apply_all_optimizations(pic_pipe, "Qwen (picgen)", enable_compile=False, enable_teacache=False)
 
 elif DUAL_GPU:
     # DUAL GPU: Load both models to their dedicated GPUs simultaneously at startup
@@ -1521,7 +1501,6 @@ elif DUAL_GPU:
     # Apply inference optimizations to both pipelines
     print("⚡ Applying inference optimizations...")
     _wan_opt = apply_all_optimizations(wan_pipe, "WAN (vidgen)", enable_compile=True, enable_teacache=False, teacache_thresh=0.05)
-    _pic_opt = apply_all_optimizations(pic_pipe, "Qwen (picgen)", enable_compile=False, enable_teacache=False)
 
 elif STARTUP_MODE == "vidgen":
     print("🚀 VIDGEN DEFAULT: Loading Wan to GPU first for immediate use...")
@@ -1622,10 +1601,6 @@ else:
     qwen_time = time.time() - start_qwen
     print(f"✅ QWEN READY ON GPU in {qwen_time:.1f}s - Picgen functional!")
     _active_model = "pic"
-    
-    # Apply optimizations to Qwen immediately
-    print("⚡ Applying inference optimizations to Qwen...")
-    apply_all_optimizations(pic_pipe, "Qwen (picgen)", enable_compile=False, enable_teacache=False)
 
 _swap_lock = threading.Lock()
 
@@ -2940,8 +2915,6 @@ if __name__ == "__main__":
                     pipe.text_encoder.to("cpu")
                     pipe.vae.to("cpu")
                     pic_pipe = pipe
-                    # Apply optimizations (SageAttention patches don't need GPU, compile deferred to first use)
-                    apply_sage_attention(pic_pipe)
                     print(f"✅ Qwen on CPU in {time.time()-start:.1f}s — tab switching ready!")
                 else:
                     print("📦 Background: Loading Wan to CPU...")
