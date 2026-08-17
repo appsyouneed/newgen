@@ -1830,13 +1830,17 @@ def _cache_prompt_embeds(prompt, negative_prompt, images, num_images_per_prompt,
 
 
 def add_starter_image(starter_num):
-    starter_path = os.path.join(SCRIPT_DIR, f"starters/start{starter_num}.jpg")
-    if not os.path.exists(starter_path):
-        return ""
-    with open(starter_path, "rb") as f:
-        data = f.read()
-    b64 = base64.b64encode(data).decode()
-    return f"data:image/jpeg;base64,{b64}"
+    """Load a starter image (supports .jpg, .png, .webp)."""
+    starters_dir = os.path.join(SCRIPT_DIR, "starters")
+    for ext in ("jpg", "png", "webp"):
+        starter_path = os.path.join(starters_dir, f"start{starter_num}.{ext}")
+        if os.path.exists(starter_path):
+            with open(starter_path, "rb") as f:
+                data = f.read()
+            b64 = base64.b64encode(data).decode()
+            mime = {"jpg": "jpeg", "png": "png", "webp": "webp"}[ext]
+            return f"data:image/{mime};base64,{b64}"
+    return ""
 
 
 def _decode_single_b64(b64_str):
@@ -2548,10 +2552,7 @@ with gr.Blocks(css=css) as demo:
             with gr.Column(elem_id="col-container"):
 
                 with gr.Row():
-                    start1_btn = gr.Button("Start 1", size="sm")
-                    start2_btn = gr.Button("Start 2", size="sm")
-                    start3_btn = gr.Button("Start 3", size="sm")
-                    start4_btn = gr.Button("Start 4", size="sm")
+                    starter_btns = [gr.Button(str(i), size="sm", min_width=30) for i in range(1, 11)]
 
                 with gr.Row():
                     # Left column: input uploader + controls
@@ -2738,10 +2739,8 @@ with gr.Blocks(css=css) as demo:
 
                 starter_b64_output = gr.Textbox(value="", visible=False, elem_id="starter-b64-output")
 
-                start1_btn.click(fn=lambda: add_starter_image(1), inputs=[], outputs=[starter_b64_output])
-                start2_btn.click(fn=lambda: add_starter_image(2), inputs=[], outputs=[starter_b64_output])
-                start3_btn.click(fn=lambda: add_starter_image(3), inputs=[], outputs=[starter_b64_output])
-                start4_btn.click(fn=lambda: add_starter_image(4), inputs=[], outputs=[starter_b64_output])
+                for i, btn in enumerate(starter_btns, start=1):
+                    btn.click(fn=lambda num=i: add_starter_image(num), inputs=[], outputs=[starter_b64_output])
 
                 starter_b64_output.change(
                     fn=None, inputs=[starter_b64_output], outputs=None,
