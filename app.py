@@ -63,6 +63,7 @@ os.environ.update({
     "HF_HOME": "/root/.cache/huggingface",
     "CUDA_LAUNCH_BLOCKING": "0",
     "OMP_NUM_THREADS": "8",
+    "DIFFUSERS_VERBOSITY": "error",
 })
 
 import cv2
@@ -84,8 +85,12 @@ logging.getLogger("absl").setLevel(logging.ERROR)
 logging.getLogger("diffusers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-from huggingface_hub import hf_hub_download
-from torch.nn import functional as F
+# Suppress torchao import warning from diffusers
+import io as _io
+import contextlib as _ctx
+with _ctx.redirect_stderr(_io.StringIO()):
+    from huggingface_hub import hf_hub_download
+    from torch.nn import functional as F
 from PIL import Image
 from safetensors.torch import load_file
 
@@ -100,13 +105,14 @@ except ImportError:
     pass
 
 import gradio as gr
-from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
-from diffusers.utils.export_utils import export_to_video
+with _ctx.redirect_stderr(_io.StringIO()):
+    from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
+    from diffusers.utils.export_utils import export_to_video
 
-try:
-    from diffusers import QwenImageEditPlusPipeline
-except ImportError:
-    from qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
+    try:
+        from diffusers import QwenImageEditPlusPipeline
+    except ImportError:
+        from qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
@@ -260,7 +266,7 @@ _gpu_info = []
 _total_vram_mb = 0
 for i in range(_gpu_count):
     props = torch.cuda.get_device_properties(i)
-    vram_mb = props.total_mem // (1024 * 1024)
+    vram_mb = props.total_memory // (1024 * 1024)
     _gpu_info.append({
         "index": i,
         "name": props.name,
