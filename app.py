@@ -865,7 +865,8 @@ def get_num_frames(duration_seconds: float) -> int:
 MODE_KEEP = "Keep original scene"
 MODE_REPLACE = "Replace background / environment"
 MODE_CUSTOM = "Custom edit instruction"
-SCENE_MODES = [MODE_KEEP, MODE_REPLACE, MODE_CUSTOM]
+MODE_TIMELINE = "Timeline (per-segment prompts)"
+SCENE_MODES = [MODE_KEEP, MODE_REPLACE, MODE_CUSTOM, MODE_TIMELINE]
 
 RELOCATE_INSTRUCTION = (
     "Keep the people exactly as they are — identical faces, facial features, "
@@ -1202,6 +1203,10 @@ def generate_video(
     
     No interpolation by default (frame_multiplier=16 = native 16fps).
     """
+    # If Timeline mode, the user should use the Timeline Generate button instead
+    if scene_mode == MODE_TIMELINE:
+        raise gr.Error("Timeline mode selected — use the '🎬 Generate Timeline Video' button instead.")
+    
     # Gradio can hand back "" instead of None for an untouched optional image
     # component — normalize both reference_image and end_image so a stray
     # empty string never reaches PIL-only code (that's what caused
@@ -1473,6 +1478,10 @@ def generate_timeline_video(
                 if additional_pil:
                     images_for_qwen.extend(additional_pil)
                 
+                # Timeline needs stronger guidance to make visible changes between segments
+                timeline_guidance = max(float(edit_guidance), 3.0)
+                timeline_steps = max(int(edit_steps), 6)
+                
                 activate_pic()
                 torch.cuda.set_device(PIC_DEVICE)
                 with torch.cuda.device(PIC_DEVICE):
@@ -1481,8 +1490,8 @@ def generate_timeline_video(
                             image=images_for_qwen,
                             prompt=seg_prompt,
                             negative_prompt=" ",
-                            num_inference_steps=int(edit_steps),
-                            true_cfg_scale=float(edit_guidance),
+                            num_inference_steps=timeline_steps,
+                            true_cfg_scale=timeline_guidance,
                             generator=torch.Generator(device=PIC_DEVICE).manual_seed(current_seed + seg_idx),
                         )
                 start_frame = result.images[0]
@@ -1571,8 +1580,20 @@ def _generate_timeline_with_durations(
     flow_shift=None, additional_refs=None,
 ):
     """
-    Timeline video with per-segment custom durations.
-    Each segment uses its own duration (max 6s) and Qwen edit prompt.
+    Timeline video generation with the two-phase approach:
+    
+    Phase 1 — Generate keyframe images sequentially with Picgen (Qwen):
+      Image 0 = user's reference photo
+      Image 1 = Qwen edits Image 0 with Segment 1 prompt
+      Image 2 = Qwen edits Image 1 with Segment 2 prompt
+      ...
+    
+    Phase 2 — Generate video between each pair of keyframes with Vidgen (Wan):
+      Video 1 = animate Image 0 → Image 1, motion = Segment 1 prompt
+      Video 2 = animate Image 1 → Image 2, motion = Segment 2 prompt
+      ...
+    
+    Phase 3 — Stitch all segment videos into one final video.
     """
     reference_image = _ensure_pil(reference_image)
     if reference_image is None:
@@ -1584,15 +1605,13 @@ def _generate_timeline_with_durations(
     if not segment_prompts:
         raise gr.Error("No segment prompts provided.")
     
-    if not motion_prompt or not motion_prompt.strip():
-        motion_prompt = default_video_prompt
     if not negative_prompt or not str(negative_prompt).strip():
         negative_prompt = default_negative_prompt
     
     num_segments = len(segment_prompts)
     total_duration = sum(segment_durations)
     
-    # Flow shift based on total duration
+    # Flow shift
     if flow_shift_auto:
         if total_duration <= 6.0:
             flow_shift = 6.9
@@ -1610,7 +1629,6 @@ def _generate_timeline_with_durations(
     
     current_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
     started = time.time()
-    segment_paths = []
     
     # Process additional reference images
     additional_pil = None
@@ -1624,43 +1642,72 @@ def _generate_timeline_with_durations(
     
     try:
         sized = resize_image_for_wan(reference_image, resolution)
-        current_frame = sized
+        
+        # Timeline guidance — strong enough to make visible changes
+        timeline_guidance = max(float(edit_guidance), 3.0)
+        timeline_steps = max(int(edit_steps), 6)
+        
+        # ==================================================================
+        # PHASE 1: Generate all keyframe images with Picgen (Qwen)
+        # ==================================================================
+        print(f"📸 Phase 1: Generating {num_segments} keyframe images...")
+        keyframes = [sized]  # Image 0 = user's input
+        
+        activate_pic()
+        torch.cuda.set_device(PIC_DEVICE)
         
         for seg_idx in range(num_segments):
-            seg_num = seg_idx + 1
             seg_prompt = segment_prompts[seg_idx].strip()
-            seg_duration = float(segment_durations[seg_idx])
-            seg_duration = max(0.5, min(6.0, seg_duration))
+            current_input = keyframes[-1]  # Always edit from the previous keyframe
             
-            # Qwen edits current frame with this segment's prompt
-            print(f"🎬 Seg {seg_num}/{num_segments} ({seg_duration}s): {seg_prompt[:60]}...")
-            
-            images_for_qwen = [current_frame]
+            images_for_qwen = [current_input]
             if additional_pil:
                 images_for_qwen.extend(additional_pil)
             
-            activate_pic()
-            torch.cuda.set_device(PIC_DEVICE)
+            print(f"  📸 Keyframe {seg_idx + 1}: {seg_prompt[:60]}...")
+            
             with torch.cuda.device(PIC_DEVICE):
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     result = pic_pipe(
                         image=images_for_qwen,
                         prompt=seg_prompt,
                         negative_prompt=" ",
-                        num_inference_steps=int(edit_steps),
-                        true_cfg_scale=float(edit_guidance),
+                        num_inference_steps=timeline_steps,
+                        true_cfg_scale=timeline_guidance,
                         generator=torch.Generator(device=PIC_DEVICE).manual_seed(current_seed + seg_idx),
                     )
-            start_frame = result.images[0]
-            if start_frame.size != current_frame.size:
-                start_frame = start_frame.resize(current_frame.size, Image.LANCZOS)
+            new_keyframe = result.images[0]
+            if new_keyframe.size != sized.size:
+                new_keyframe = new_keyframe.resize(sized.size, Image.LANCZOS)
             
-            # Animate with Wan at the custom duration for this segment
-            num_frames = get_num_frames(seg_duration)
+            keyframes.append(new_keyframe)
+            print(f"  ✅ Keyframe {seg_idx + 1} generated")
+        
+        print(f"📸 Phase 1 complete: {len(keyframes)} keyframes (including input)")
+        
+        # ==================================================================
+        # PHASE 2: Generate video between each pair of keyframes with Vidgen (Wan)
+        # ==================================================================
+        print(f"🎬 Phase 2: Generating {num_segments} video segments...")
+        segment_paths = []
+        
+        for seg_idx in range(num_segments):
+            seg_num = seg_idx + 1
+            seg_prompt = segment_prompts[seg_idx].strip()
+            seg_duration = float(segment_durations[seg_idx])
+            seg_duration = max(0.5, min(6.0, seg_duration))
             seg_seed = current_seed + seg_idx * 100
             
+            first_frame = keyframes[seg_idx]      # Start image
+            last_frame = keyframes[seg_idx + 1]   # End image (target)
+            
+            print(f"  🎬 Seg {seg_num}/{num_segments} ({seg_duration}s): {seg_prompt[:50]}...")
+            
+            # Wan animates first_frame → last_frame with segment prompt as motion
+            num_frames = get_num_frames(seg_duration)
+            
             raw_frames = animate_frame(
-                start_frame, None, motion_prompt, negative_prompt,
+                first_frame, last_frame, seg_prompt, negative_prompt,
                 num_frames, seg_seed, flow_shift,
             )
             
@@ -1678,18 +1725,15 @@ def _generate_timeline_with_durations(
             segment_paths.append(seg_path)
             
             print(f"  ✅ Seg {seg_num} done ({seg_duration:.1f}s, {len(seg_frames)} frames)")
-            
-            # Last frame becomes input for next segment
-            nxt = _last_frame_of(seg_path)
-            if nxt is not None:
-                current_frame = nxt
-            
-            current_seed = random.randint(0, MAX_SEED)
+        
+        # ==================================================================
+        # PHASE 3: Stitch all videos together
+        # ==================================================================
+        print(f"🎬 Phase 3: Stitching {len(segment_paths)} segments...")
         
         if not segment_paths:
             raise gr.Error("No video segments were produced.")
         
-        # Assemble
         if len(segment_paths) > 1:
             with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
                 final_path = f.name
@@ -2713,9 +2757,8 @@ with gr.Blocks(css=css) as demo:
                         value=MODE_KEEP,
                         label="Scene Handling",
                         info=(
-                            "Keep = photo animated untouched, background and bodies "
-                            "identical. Replace = new environment, subjects preserved. "
-                            "Custom = your own edit instruction."
+                            "Keep = animated untouched. Replace = new environment. "
+                            "Custom = your edit instruction. Timeline = per-segment prompts."
                         ),
                     )
                     edit_instruction = gr.Textbox(
@@ -2732,15 +2775,51 @@ with gr.Blocks(css=css) as demo:
                         visible=False,
                     )
                     
-                    # Show/hide edit_instruction, info, and additional_refs based on scene_mode
+                    # Timeline mode UI — 10 segment slots with custom durations
+                    timeline_section = gr.Column(visible=False)
+                    with timeline_section:
+                        gr.Markdown(
+                            "**Timeline:** Each segment has its own edit instruction + duration (max 6s). "
+                            "Empty segments are skipped. Each segment edits the previous frame."
+                        )
+                        timeline_motion = gr.Textbox(
+                            label="Motion Prompt (animation style for ALL segments)",
+                            value=default_video_prompt,
+                            lines=2,
+                            placeholder="Camera movement, lighting, motion style",
+                        )
+                        timeline_prompts = []
+                        timeline_durations = []
+                        for i in range(1, 11):
+                            with gr.Row():
+                                tb = gr.Textbox(
+                                    label=f"Seg {i}",
+                                    placeholder=f"What happens in segment {i} (leave empty to skip)",
+                                    lines=1,
+                                    scale=4,
+                                )
+                                dur = gr.Slider(
+                                    0.5, 6.0, value=3.5, step=0.5,
+                                    label="Sec",
+                                    scale=1,
+                                )
+                            timeline_prompts.append(tb)
+                            timeline_durations.append(dur)
+                        timeline_generate_btn = gr.Button("🎬 Generate Timeline Video", variant="primary", size="lg")
+                    
+                    # Show/hide sections based on scene_mode
+                    def _update_scene_visibility(mode):
+                        return (
+                            gr.update(visible=(mode == MODE_CUSTOM)),           # edit_instruction
+                            gr.update(visible=(mode == MODE_CUSTOM)),           # edit_instruction_info
+                            gr.update(visible=(mode != MODE_KEEP)),             # additional_refs
+                            gr.update(visible=(mode == MODE_TIMELINE)),         # timeline_section
+                        )
+                    
                     scene_mode.change(
-                        fn=lambda mode: (
-                            gr.update(visible=(mode == MODE_CUSTOM)),
-                            gr.update(visible=(mode == MODE_CUSTOM)),
-                            gr.update(visible=(mode != MODE_KEEP)),
-                        ),
+                        fn=_update_scene_visibility,
                         inputs=[scene_mode],
-                        outputs=[edit_instruction, edit_instruction_info, additional_refs],
+                        outputs=[edit_instruction, edit_instruction_info, additional_refs, timeline_section],
                     )
 
                     with gr.Row():
@@ -2866,8 +2945,6 @@ with gr.Blocks(css=css) as demo:
                     )
             # Hidden file component — populated by generate_btn and used for frame extraction
             video_file = gr.File(visible=False)
-            # Download Frame output — gr.File shows a clickable download link when populated
-            download_file_output = gr.File(label="⬇ Click to Download Frame", visible=True)
 
             with gr.Accordion("Advanced Settings", open=False):
                 with gr.Row():
@@ -2924,97 +3001,54 @@ with gr.Blocks(css=css) as demo:
                 concurrency_limit=10,
             )
 
-            # ==================================================================
-            # TIMELINE MODE — 10 segment slots with custom durations
-            # ==================================================================
-            with gr.Accordion("🎬 Timeline Mode (Per-Segment Prompts)", open=False):
-                gr.Markdown(
-                    "Each segment gets its own edit instruction and duration (max 6s). "
-                    "Fill in segments in order — empty segments are skipped. "
-                    "Flow: reference photo → Qwen edits with Seg 1 prompt → Wan animates → "
-                    "last frame → Qwen edits with Seg 2 prompt → Wan animates → ..."
-                )
-                
-                timeline_motion = gr.Textbox(
-                    label="Motion Prompt (animation style for ALL segments)",
-                    value=default_video_prompt,
-                    lines=2,
-                    placeholder="Camera movement, lighting, motion style — same for all segments",
-                )
-                
-                # 10 segment rows — all visible. Empty prompts are skipped.
-                timeline_prompts = []
-                timeline_durations = []
-                for i in range(1, 11):
-                    with gr.Row():
-                        tb = gr.Textbox(
-                            label=f"Seg {i}",
-                            placeholder=f"What happens in segment {i} (leave empty to skip)",
-                            lines=1,
-                            scale=4,
-                        )
-                        dur = gr.Slider(
-                            0.5, 6.0, value=3.5, step=0.5,
-                            label="Sec",
-                            scale=1,
-                        )
-                    timeline_prompts.append(tb)
-                    timeline_durations.append(dur)
-                
-                timeline_generate_btn = gr.Button("🎬 Generate Timeline Video", variant="primary", size="lg")
-                
-                # Generate handler
-                def _timeline_generate(
-                    ref_image,
-                    p1, p2, p3, p4, p5, p6, p7, p8, p9, p10,
-                    d1, d2, d3, d4, d5, d6, d7, d8, d9, d10,
-                    motion, resolution_val, frame_mult, exp_quality,
+            # Timeline generate handler
+            def _timeline_generate(
+                ref_image,
+                p1, p2, p3, p4, p5, p6, p7, p8, p9, p10,
+                d1, d2, d3, d4, d5, d6, d7, d8, d9, d10,
+                motion, resolution_val, frame_mult, exp_quality,
+                seed_val, rand_seed, audio_cb, audio_prompt,
+                neg_prompt, e_steps, e_guidance,
+                fs_auto, fs_val, add_refs,
+                progress=gr.Progress(track_tqdm=True),
+            ):
+                """Collect filled segments and generate timeline video."""
+                all_prompts = [p1, p2, p3, p4, p5, p6, p7, p8, p9, p10]
+                all_durations = [d1, d2, d3, d4, d5, d6, d7, d8, d9, d10]
+                segments = []
+                for i in range(10):
+                    p = (all_prompts[i] or "").strip()
+                    if p:
+                        d = float(all_durations[i]) if all_durations[i] else 3.5
+                        d = max(0.5, min(6.0, d))
+                        segments.append({"prompt": p, "duration": d})
+                if not segments:
+                    raise gr.Error("Please enter at least one segment prompt.")
+                prompts_json = json.dumps([s["prompt"] for s in segments])
+                durations_json = json.dumps([s["duration"] for s in segments])
+                return _generate_timeline_with_durations(
+                    ref_image, prompts_json, durations_json, motion,
+                    resolution_val, frame_mult, exp_quality,
                     seed_val, rand_seed, audio_cb, audio_prompt,
                     neg_prompt, e_steps, e_guidance,
                     fs_auto, fs_val, add_refs,
-                    progress=gr.Progress(track_tqdm=True),
-                ):
-                    """Collect filled segments and generate timeline video."""
-                    all_prompts = [p1, p2, p3, p4, p5, p6, p7, p8, p9, p10]
-                    all_durations = [d1, d2, d3, d4, d5, d6, d7, d8, d9, d10]
-                    
-                    segments = []
-                    for i in range(10):
-                        p = (all_prompts[i] or "").strip()
-                        if p:
-                            d = float(all_durations[i]) if all_durations[i] else 3.5
-                            d = max(0.5, min(6.0, d))
-                            segments.append({"prompt": p, "duration": d})
-                    
-                    if not segments:
-                        raise gr.Error("Please enter at least one segment prompt.")
-                    
-                    prompts_json = json.dumps([s["prompt"] for s in segments])
-                    durations_json = json.dumps([s["duration"] for s in segments])
-                    
-                    return _generate_timeline_with_durations(
-                        ref_image, prompts_json, durations_json, motion,
-                        resolution_val, frame_mult, exp_quality,
-                        seed_val, rand_seed, audio_cb, audio_prompt,
-                        neg_prompt, e_steps, e_guidance,
-                        fs_auto, fs_val, add_refs,
-                    )
-                
-                timeline_generate_btn.click(
-                    fn=_timeline_generate,
-                    inputs=[
-                        reference_image,
-                        *timeline_prompts,
-                        *timeline_durations,
-                        timeline_motion, resolution, frame_multiplier, export_quality,
-                        seed, randomize_seed, add_audio_cb, audio_prompt_tb,
-                        vid_negative_prompt, edit_steps, edit_guidance,
-                        flow_shift_auto, flow_shift, additional_refs,
-                    ],
-                    outputs=[video_output, video_file],
-                    concurrency_id=WAN_QUEUE_ID,
-                    concurrency_limit=10,
                 )
+
+            timeline_generate_btn.click(
+                fn=_timeline_generate,
+                inputs=[
+                    reference_image,
+                    *timeline_prompts,
+                    *timeline_durations,
+                    timeline_motion, resolution, frame_multiplier, export_quality,
+                    seed, randomize_seed, add_audio_cb, audio_prompt_tb,
+                    vid_negative_prompt, edit_steps, edit_guidance,
+                    flow_shift_auto, flow_shift, additional_refs,
+                ],
+                outputs=[video_output, video_file],
+                concurrency_id=WAN_QUEUE_ID,
+                concurrency_limit=10,
+            )
 
             # Frame extraction functions
             def get_frame_as_file(video_path, timestamp):
@@ -3044,11 +3078,36 @@ with gr.Blocks(css=css) as demo:
                 outputs=[reference_image],
             )
 
-            # Download Frame — reads timestamp from number box, puts frame into gr.File for download
+            # Download Frame — extracts frame then triggers browser download via JS
+            download_frame_output = gr.File(visible=False, elem_id="download-frame-file")
+            
             download_frame_btn.click(
                 fn=get_frame_as_file,
                 inputs=[video_file, frame_time_input],
-                outputs=[download_file_output],
+                outputs=[download_frame_output],
+            ).then(
+                fn=None,
+                inputs=[download_frame_output],
+                outputs=[],
+                js="""(file) => {
+                    if (file && file.url) {
+                        const a = document.createElement('a');
+                        a.href = file.url;
+                        a.download = file.orig_name || 'frame.jpg';
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                    } else if (file) {
+                        // Try Gradio file path format
+                        const url = typeof file === 'string' ? file : file.path || file.name || file;
+                        const a = document.createElement('a');
+                        a.href = '/file=' + url;
+                        a.download = 'frame.jpg';
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                    }
+                }""",
             )
 
         # ------------------------------------------------------------------ #
