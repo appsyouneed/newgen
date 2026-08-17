@@ -620,7 +620,7 @@ print(f"Video model: WAMU v2 — Wan 2.2 I2V Lightning merge (NSFW-capable)")
 FIXED_FPS = 16
 
 # WAMU v2 is distillation-merged, so guidance must stay at 1.0.
-WAN_STEPS = 4
+WAN_STEPS = 3
 WAN_FLOW_SHIFT = 6.9
 WAN_GUIDANCE = 1.0
 
@@ -927,12 +927,16 @@ def edit_reference_frame(
     seed: int,
     steps: int,
     guidance: float,
+    additional_images: list = None,
 ) -> Image.Image:
     """
     Optional stage 1 — Qwen Image Edit prepares the starting frame.
 
     Returns the image untouched in keep-scene mode, so nothing is repainted and
     the original background and bodies survive exactly as shot.
+    
+    When additional_images are provided (Custom/Replace modes), all images are
+    passed to Qwen as multi-reference input for better context.
     """
     if mode == MODE_KEEP:
         print("[1/2] Keep-scene mode — reference frame used as-is.")
@@ -951,11 +955,21 @@ def edit_reference_frame(
     activate_pic()
     print(f"[1/2] Qwen editing frame -> {instruction[:80]}...")
 
+    # Build image list — primary image first, then any additional references
+    images_list = [image]
+    if additional_images:
+        for ref in additional_images:
+            pil_ref = _ensure_pil(ref)
+            if pil_ref is not None:
+                images_list.append(pil_ref)
+        if len(images_list) > 1:
+            print(f"  Multi-reference: {len(images_list)} images provided to Qwen")
+
     torch.cuda.set_device(PIC_DEVICE)
     with torch.cuda.device(PIC_DEVICE):
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             result = pic_pipe(
-                image=[image],
+                image=images_list,
                 prompt=instruction,
                 negative_prompt=" ",
                 num_inference_steps=int(steps),
@@ -1162,6 +1176,7 @@ def generate_video(
     prompt,
     scene_mode,
     edit_instruction="",
+    additional_refs=None,
     end_image=None,
     duration_seconds=3.5,
     resolution="480p",
@@ -1234,10 +1249,23 @@ def generate_video(
         sized = resize_image_for_wan(reference_image, resolution)
         print(f"Resized image to {sized.size} for VAE compatibility")
 
+        # Process additional reference images if provided
+        additional_pil = None
+        if additional_refs and scene_mode != MODE_KEEP:
+            additional_pil = []
+            for ref_file in additional_refs:
+                ref_path = ref_file.name if hasattr(ref_file, 'name') else str(ref_file)
+                pil_ref = _ensure_pil(ref_path)
+                if pil_ref:
+                    additional_pil.append(pil_ref)
+            if additional_pil:
+                print(f"  {len(additional_pil)} additional reference image(s) for Qwen edit")
+
         # ---- Stage 1: optional frame preparation --------------------------
         start_frame = edit_reference_frame(
             sized, scene_mode, prompt, edit_instruction,
             current_seed, edit_steps, edit_guidance,
+            additional_images=additional_pil,
         )
 
         # End-frame conditioning applies to the first segment only.
@@ -2298,9 +2326,15 @@ with gr.Blocks(css=css) as demo:
             with gr.Row():
                 with gr.Column(scale=1):
                     reference_image = gr.Image(
-                        label="Reference Photo",
+                        label="Reference Photo(s)",
                         type="filepath",
                         elem_id="vidgen-reference",
+                    )
+                    additional_refs = gr.File(
+                        label="Additional Reference Images (for Custom/Replace mode)",
+                        file_count="multiple",
+                        file_types=["image"],
+                        visible=False,
                     )
                     vid_prompt = gr.Textbox(
                         label="Motion & Scene Prompt",
@@ -2330,14 +2364,24 @@ with gr.Blocks(css=css) as demo:
                         value="",
                         lines=2,
                         visible=False,
-                        placeholder="Applied verbatim to the frame before animation.",
+                        placeholder="e.g. remove all clothing, keep everything else identical",
+                    )
+                    edit_instruction_info = gr.Markdown(
+                        "**Custom Edit** tells Qwen how to modify the photo *before* animation. "
+                        "Example: `remove all clothing` or `add a red dress`. "
+                        "The Motion Prompt above separately tells WAN how to *animate* the result.",
+                        visible=False,
                     )
                     
-                    # Show/hide edit_instruction based on scene_mode
+                    # Show/hide edit_instruction, info, and additional_refs based on scene_mode
                     scene_mode.change(
-                        fn=lambda mode: gr.update(visible=(mode == MODE_CUSTOM)),
+                        fn=lambda mode: (
+                            gr.update(visible=(mode == MODE_CUSTOM)),
+                            gr.update(visible=(mode == MODE_CUSTOM)),
+                            gr.update(visible=(mode != MODE_KEEP)),
+                        ),
                         inputs=[scene_mode],
-                        outputs=[edit_instruction],
+                        outputs=[edit_instruction, edit_instruction_info, additional_refs],
                     )
 
                     with gr.Row():
@@ -2511,14 +2555,14 @@ with gr.Blocks(css=css) as demo:
                 fn=generate_video,
                 inputs=[
                     reference_image, vid_prompt, scene_mode, edit_instruction,
-                    end_image, duration_seconds, resolution, frame_multiplier,
+                    additional_refs, end_image, duration_seconds, resolution, frame_multiplier,
                     export_quality, seed, randomize_seed, add_audio_cb,
                     audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                     flow_shift_auto, flow_shift,
                 ],
                 outputs=[video_output, video_file],
                 concurrency_id=WAN_QUEUE_ID,
-                concurrency_limit=10,  # Allow multiple in queue, processed sequentially
+                concurrency_limit=10,
             )
 
             # Frame extraction functions
