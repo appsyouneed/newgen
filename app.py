@@ -556,17 +556,10 @@ def apply_sage_attention(pipe):
 
 def apply_torch_compile(pipe, mode="reduce-overhead"):
     """Apply torch.compile to transformer blocks for kernel fusion speedup."""
-    if not _TORCH_COMPILE_AVAILABLE:
-        return False
-    try:
-        if hasattr(pipe, 'transformer') and pipe.transformer is not None:
-            pipe.transformer = torch.compile(pipe.transformer, mode=mode, fullgraph=False)
-        if hasattr(pipe, 'transformer_2') and pipe.transformer_2 is not None:
-            pipe.transformer_2 = torch.compile(pipe.transformer_2, mode=mode, fullgraph=False)
-        return True
-    except Exception as e:
-        print(f"  torch.compile failed: {e}")
-        return False
+    # DISABLED: torch.compile causes infinite recompilation on Wan's MoE architecture
+    # (dual transformer switching mid-inference creates dynamic control flow that
+    # triggers repeated retracing). Re-enable only for single-transformer models.
+    return False
 
 
 def apply_teacache(pipe, threshold=0.05):
