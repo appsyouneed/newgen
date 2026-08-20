@@ -241,6 +241,22 @@ if not os.path.exists("train_log/RIFE_HDv3.py"):
         ], check=True)
     subprocess.run(["unzip", "-n", "RIFEv4.26_0921.zip"], check=True)
 
+# The RIFE zip only contains train_log/ (flownet.pkl + .py wrappers).
+# RIFE_HDv3.py imports from "model.warplayer" and "model.IFNet_HDv3" which are
+# part of the Practical-RIFE repo's model/ directory. If model/ doesn't exist
+# at cwd, clone just that folder from the repo.
+if not os.path.exists("model") or not os.path.exists("model/warplayer.py"):
+    print("Downloading RIFE model/ package (warplayer, IFNet)...")
+    subprocess.run([
+        "git", "clone", "--depth=1", "--filter=blob:none", "--sparse",
+        "https://github.com/hzwer/Practical-RIFE.git", "_rife_tmp"
+    ], check=True)
+    subprocess.run(["git", "sparse-checkout", "set", "model"], check=True, cwd="_rife_tmp")
+    # Move model/ to cwd and clean up
+    if os.path.exists("_rife_tmp/model"):
+        shutil.move("_rife_tmp/model", "model")
+    shutil.rmtree("_rife_tmp", ignore_errors=True)
+
 sys.path.append(os.path.join(os.getcwd(), "train_log"))
 from train_log.RIFE_HDv3 import Model
 
