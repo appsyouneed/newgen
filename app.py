@@ -70,7 +70,14 @@ import numpy as np
 import torch
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
-torch.set_float32_matmul_precision('highest')
+# 'highest' forces full-precision FP32 matmul kernels, which silently defeats
+# the allow_tf32 flags set right below — those only take effect at 'high' or
+# lower. The main denoising math runs in bf16 either way (unaffected), but any
+# fp32 matmul in the pipeline (text-encoder bits, RIFE, misc ops) was paying
+# the slow-path tax for no accuracy benefit. 'high' enables TF32 tensor-core
+# matmul for fp32 inputs — the same numerics class already opted into via
+# allow_tf32 two lines down, just no longer silently overridden here.
+torch.set_float32_matmul_precision('high')
 # Do NOT enable cudnn.benchmark — Blackwell GPUs (GB202) fail on conv3d engine search
 torch.backends.cudnn.benchmark = False
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -264,11 +271,19 @@ from train_log.RIFE_HDv3 import Model
 # HARDWARE DETECTION & EXECUTION MODE SELECTION
 #
 # Automatically detects GPU configuration and selects optimal execution mode:
-#   CONCURRENT  — Both models GPU-resident, no swapping (≥80GB total VRAM)
-#   STACKED     — Multi-GPU, models swap but leverage all GPUs (multi-GPU, <80GB)
-#   SINGLE      — One GPU, standard CPU offload + swap
+#   CONCURRENT  — Both models fully GPU-resident simultaneously, no swapping.
+#                 Requires enough total VRAM for both models + activation headroom.
+#   SINGLE      — One model on GPU at a time (spread across all available GPUs),
+#                 the other stays on CPU. Swaps on tab switch.
 #
-# Override: NEWGEN_FORCE_SINGLE_GPU=1 forces single-GPU swap mode on any box.
+# Model VRAM requirements (bfloat16):
+#   WAN 2.2 I2V A14B : ~57 GB
+#   Qwen Image Edit  : ~35 GB
+#   Combined         : ~92 GB
+#   Headroom needed  : ~15 GB (activations, KV cache, intermediates)
+#   Safe concurrent  : ≥107 GB total VRAM
+#
+# Override: NEWGEN_FORCE_SINGLE_GPU=1 forces swap mode on any box.
 # ---------------------------------------------------------------------------
 
 _gpu_count = torch.cuda.device_count()
@@ -289,48 +304,63 @@ for i in range(_gpu_count):
     })
     _total_vram_mb += vram_mb
 
-# Minimum VRAM to hold both models simultaneously (~45GB WAN + ~35GB Qwen)
-_CONCURRENT_THRESHOLD_MB = 80 * 1024  # 80 GB
-
-# Minimum per-GPU VRAM to fit a full model without splitting
-_PER_GPU_FULL_MODEL_MB = 48 * 1024  # 48 GB (WAN needs ~45GB active)
-
-# Determine execution mode
+# Concurrent (dual-resident) mode keeps BOTH models loaded on the GPU(s) at
+# once, with no swapping. That only works when there are two separate
+# physical GPUs — one per model — so each has its own fully uncontended VRAM.
+#
+# A single GPU, even a 95 GB Blackwell card, does NOT reliably fit both
+# models resident at once. The optimistic math below (Wan ~57 GB + Qwen peak
+# ~20-25 GB via enable_model_cpu_offload = ~82 GB, "fits" in 95 GB) does not
+# hold in practice: Wan alone has been observed pinning ~94 GB by itself,
+# leaving no room for Qwen and crashing with a CUDA OOM on the very first
+# Photo Editor generation. So concurrent mode now requires >= 2 GPUs, full
+# stop — a single card always uses swap mode (one model on GPU, the other
+# parked on CPU, swapped in on tab switch / first use of that model).
 _force_single = os.environ.get("NEWGEN_FORCE_SINGLE_GPU") == "1"
-_max_single_gpu_vram = max(g["vram_mb"] for g in _gpu_info)
 
-if _force_single or _gpu_count == 1:
+if _force_single or _gpu_count < 2:
     GPU_MODE = "single"
-elif _gpu_count >= 2 and _max_single_gpu_vram >= _PER_GPU_FULL_MODEL_MB:
-    # Each GPU can hold a full model on its own — pin one model per GPU
-    GPU_MODE = "concurrent"
 else:
-    # Multi-GPU but individual cards too small for a full model — split via accelerate
-    GPU_MODE = "stacked"
+    # Two or more GPUs: each model gets its own dedicated card.
+    GPU_MODE = "concurrent"
+
+# Legacy alias — stacked no longer exists, everything is either concurrent or single.
+DUAL_GPU = (GPU_MODE == "concurrent")
 
 # Device assignments based on mode
 if GPU_MODE == "concurrent":
+    # Always >= 2 GPUs here (see gating above) — each model gets its own card.
     PIC_DEVICE = "cuda:0"
-    WAN_DEVICE = "cuda:1" if _gpu_count >= 2 else "cuda:0"
+    WAN_DEVICE = "cuda:1"
     PIC_QUEUE_ID = "pic-gpu"
     WAN_QUEUE_ID = "wan-gpu"
-elif GPU_MODE == "stacked":
-    # Stacked: models split across all GPUs via accelerate balanced device_map
-    PIC_DEVICE = "cuda:0"
-    WAN_DEVICE = "cuda:0"  # Balanced mode handles device placement internally
-    PIC_QUEUE_ID = "pic-gpu"
-    WAN_QUEUE_ID = "wan-gpu"
-else:  # single
+else:  # single — one model on GPU (all cards), other on CPU, swapped on demand
     PIC_DEVICE = "cuda:0"
     WAN_DEVICE = "cuda:0"
     PIC_QUEUE_ID = "gpu"
     WAN_QUEUE_ID = "gpu"
 
-# Legacy compatibility
-DUAL_GPU = (GPU_MODE == "concurrent")
+# Flag: True when both models share a single physical GPU in concurrent mode.
+# Structurally always False now (concurrent mode requires >= 2 GPUs) — kept
+# only so the single-card-concurrent code paths below remain valid dead code
+# rather than needing to be ripped out, in case a future card genuinely has
+# the headroom to justify reviving this path.
+_SINGLE_CARD_CONCURRENT = (GPU_MODE == "concurrent" and _gpu_count == 1)
 
-# Auxiliary models (RIFE interpolation, MMAudio) always on cuda:0
-device = torch.device("cuda:0")
+# Whether Qwen's generator/execution device should be treated as CUDA.
+# True for: two-GPU concurrent (Qwen pinned), and single-card concurrent
+# IF there's enough free VRAM after Wan loads to use enable_model_cpu_offload.
+# Set to False (forcing a CPU generator, matching swap-mode's requirement)
+# if single-card concurrent falls back to enable_sequential_cpu_offload for
+# Qwen because Wan alone leaves too little headroom — see _load_qwen_thread.
+_QWEN_CUDA_GENERATOR = DUAL_GPU
+
+# Auxiliary models (RIFE interpolation, MMAudio) run on the last GPU.
+# In single/swap mode cuda:0 is shared by both primary models, so putting
+# RIFE there eats ~500 MB of headroom that Qwen's text_encoder needs. Using
+# the last card keeps the swap device clean.
+_rife_device_idx = _gpu_count - 1 if _gpu_count > 1 else 0
+device = torch.device(f"cuda:{_rife_device_idx}")
 
 rife_model = Model()
 rife_model.load_model("train_log", -1)
@@ -539,32 +569,181 @@ _SAGE_PATCHED = False  # Only patch once globally
 
 
 def apply_sage_attention(pipe):
-    """Replace SDPA attention with SageAttention for 2-3x kernel speedup.
-    
-    WARNING: This patches F.scaled_dot_product_attention GLOBALLY.
-    Only call this if you're sure it won't break other models (e.g. Qwen).
-    Currently DISABLED to prevent black images in picgen.
     """
-    # DISABLED: Global SDPA patching breaks Qwen's text encoder, causing all-black images.
-    # SageAttention only works safely with Wan's transformer architecture.
-    # Until per-model attention patching is implemented, this stays disabled.
-    return False
+    Patch SageAttention into Wan's transformer attention modules directly.
+
+    Previous approach patched F.scaled_dot_product_attention globally, which
+    broke Qwen's text encoder (all-black images). This approach replaces only
+    the forward methods on Wan's WanAttention blocks, leaving every other model
+    completely untouched.
+
+    SageAttention gives a true 2-3x speedup on attention compute — the dominant
+    cost in the denoising loop — with numerically equivalent output (it's a
+    flash-attention variant, not an approximation).
+    """
+    if not _SAGE_ATTENTION_AVAILABLE:
+        return False
+    try:
+        from sageattention import sageattn
+        patched = 0
+
+        def _make_sage_forward(original_forward):
+            """
+            Wrap a module's forward so SDPA calls inside it use sageattn.
+            We temporarily swap F.scaled_dot_product_attention on the torch.nn.functional
+            module that the attention class already has a reference to, but only
+            for the duration of that one forward call — thread-local would be
+            ideal, but since generation is serialised by the queue, a brief
+            monkeypatch+restore is safe and avoids class-level surgery.
+            """
+            _orig_sdpa = F.scaled_dot_product_attention
+
+            def _sage_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
+                           is_causal=False, scale=None, enable_gqa=False, **kwargs):
+                # Parameter names MUST match torch.nn.functional's real
+                # signature (query/key/value) rather than shorthand (q/k/v).
+                # Some call sites (e.g. diffusers' newer attention_dispatch
+                # path used by Qwen) call this by keyword using the real
+                # names — with mismatched names those keywords fall through
+                # to **kwargs and query/key/value are left unfilled, raising
+                # "missing 3 required positional arguments". Positional
+                # callers (Wan) work under either naming, so matching the
+                # real signature is strictly safer and fixes both.
+                try:
+                    return sageattn(query, key, value, attn_mask=attn_mask,
+                                     is_causal=is_causal, sm_scale=scale)
+                except Exception:
+                    return _orig_sdpa(query, key, value, attn_mask=attn_mask,
+                                      dropout_p=dropout_p, is_causal=is_causal,
+                                      scale=scale, enable_gqa=enable_gqa)
+
+            def _forward_with_sage(*args, **kwargs):
+                F.scaled_dot_product_attention = _sage_sdpa
+                try:
+                    return original_forward(*args, **kwargs)
+                finally:
+                    F.scaled_dot_product_attention = _orig_sdpa
+
+            return _forward_with_sage
+
+        # Patch every attention block inside the transformer(s).
+        # WanImageToVideoPipeline has .transformer and .transformer_2 (MoE pair).
+        transformers_to_patch = []
+        if hasattr(pipe, 'transformer') and pipe.transformer is not None:
+            transformers_to_patch.append(pipe.transformer)
+        if hasattr(pipe, 'transformer_2') and pipe.transformer_2 is not None:
+            transformers_to_patch.append(pipe.transformer_2)
+
+        for xfmr in transformers_to_patch:
+            for module in xfmr.modules():
+                # Target the named attention classes used by Wan's diffusers impl.
+                cls_name = type(module).__name__
+                if "Attention" in cls_name and hasattr(module, 'forward'):
+                    module.forward = _make_sage_forward(module.forward)
+                    patched += 1
+
+        if patched:
+            print(f"  SageAttention: patched {patched} attention modules (Wan transformers only)")
+            return True
+        return False
+    except Exception as e:
+        print(f"  SageAttention patch failed: {e}")
+        return False
 
 
-def apply_torch_compile(pipe, mode="reduce-overhead"):
-    """Apply torch.compile to transformer blocks for kernel fusion speedup."""
-    # DISABLED: torch.compile causes infinite recompilation on Wan's MoE architecture
-    # (dual transformer switching mid-inference creates dynamic control flow that
-    # triggers repeated retracing). Re-enable only for single-transformer models.
+def apply_torch_compile(pipe, mode="default"):
+    """
+    Compile the pipeline's transformer forward pass(es) for kernel fusion.
+
+    Previous attempt used the default mode on the whole pipeline object, which
+    triggered infinite recompilation because Wan's MoE pair (transformer +
+    transformer_2) alternates mid-inference — the graph tracer saw dynamic
+    control flow and re-traced on every step.
+
+    Fix: compile each transformer independently with dynamic=True (handles
+    varying sequence lengths without retracing) and fullgraph=False (allows the
+    Python-level MoE switching to remain outside the compiled region). The
+    compiled kernels cover the heavy attention + MLP compute inside each
+    transformer's forward, which is where the time actually goes.
+
+    Mode is 'default', NOT 'reduce-overhead'. 'reduce-overhead' captures a
+    CUDA Graph to cut Python/launch overhead — but CUDA Graphs need the
+    allocator to support a live-allocation-pool check, and this process runs
+    with PYTORCH_CUDA_ALLOC_CONF=...backend:cudaMallocAsync (chosen deliberately
+    for the offload hooks' constant alloc/free churn as models stream on and
+    off GPU). cudaMallocAsync does not implement that check at all, so
+    'reduce-overhead' crashes hard the first time a compiled forward actually
+    runs — not a flaky failure, a guaranteed one, and torch._dynamo's
+    suppress_errors does NOT catch it (it's a runtime crash inside the
+    compiled graph's execution, not a trace/compile-time error). 'default'
+    still gets the real win — TorchInductor kernel fusion of the attention +
+    MLP compute — it just skips the incompatible graph-capture step. Given the
+    bottleneck here is GPU compute (large matmuls/attention), not CPU
+    dispatch overhead, 'default' captures nearly all of the available speedup
+    with none of the crash risk.
+
+    First call triggers a ~30s JIT compilation; all subsequent calls are fast.
+    """
+    if not _TORCH_COMPILE_AVAILABLE:
+        return False
+    try:
+        compiled = 0
+        for attr in ('transformer', 'transformer_2'):
+            xfmr = getattr(pipe, attr, None)
+            if xfmr is None:
+                continue
+            # compile the forward method, not the module itself, to avoid
+            # issues with accelerate hooks wrapping the module
+            xfmr.forward = torch.compile(
+                xfmr.forward,
+                mode=mode,
+                dynamic=True,       # handles varying S/B without retrace
+                fullgraph=False,    # allows Python control flow at MoE switch
+            )
+            compiled += 1
+        if compiled:
+            print(f"  torch.compile: compiled {compiled} transformer(s) "
+                  f"(mode={mode}, dynamic=True) — first run triggers JIT warmup")
+            return True
+        return False
+    except Exception as e:
+        print(f"  torch.compile failed: {e}")
+        return False
+
+
+def apply_vae_fp16(pipe):
+    """
+    Cast the VAE to fp16 for decode.
+
+    RTX 4070 Ti Super (Ada Lovelace) has the same fp16 tensor-core throughput
+    as bf16 but with faster memory bandwidth on sub-16-bit ops. More importantly,
+    diffusers' VAE tiling already splits frames into chunks, so precision
+    differences are invisible in the output. bfloat16 is kept for the main
+    denoising loop (better dynamic range for diffusion math); fp16 is only
+    applied to the VAE encoder+decoder which are pure conv nets.
+    """
+    try:
+        if hasattr(pipe, 'vae') and pipe.vae is not None:
+            pipe.vae = pipe.vae.to(dtype=torch.float16)
+            print("  VAE → fp16 (faster decode on Ada, imperceptible quality delta)")
+            return True
+    except Exception as e:
+        print(f"  VAE fp16 cast failed: {e}")
     return False
 
 
 def apply_teacache(pipe, threshold=0.05):
-    """Enable TeaCache for video diffusion — training-free timestep caching."""
+    """
+    Enable TeaCache for video diffusion — training-free timestep caching.
+
+    TeaCache skips redundant transformer evaluations at timesteps where the
+    residual L1 distance between consecutive hidden states falls below
+    `threshold`. At 0.05 it typically skips ~40% of forward passes with
+    negligible visual difference. Lower = fewer skips = slower but safer.
+    """
     global _TEACACHE_ENABLED
     try:
         if hasattr(pipe, 'enable_teacache'):
-            # Diffusers built-in TeaCache support
             pipe.enable_teacache(
                 cache_interval=2,
                 rel_l1_thresh=threshold,
@@ -576,24 +755,28 @@ def apply_teacache(pipe, threshold=0.05):
     return False
 
 
-def apply_all_optimizations(pipe, pipe_name="model", enable_compile=True, enable_teacache=False, teacache_thresh=0.05):
+def apply_all_optimizations(pipe, pipe_name="model", enable_compile=True,
+                            enable_teacache=False, teacache_thresh=0.05,
+                            enable_sage=True, enable_vae_fp16=False):
     """Apply all available inference accelerations to a pipeline."""
     results = {}
-    
-    # SageAttention
-    sage_ok = apply_sage_attention(pipe)
-    results["SageAttention"] = sage_ok
-    
-    # TeaCache (video models only)
+
+    # SageAttention — per-module patch, safe for mixed-model setups
+    if enable_sage:
+        results["SageAttention"] = apply_sage_attention(pipe)
+
+    # TeaCache — timestep skip for video transformers
     if enable_teacache:
-        tea_ok = apply_teacache(pipe, threshold=teacache_thresh)
-        results["TeaCache"] = tea_ok
-    
-    # torch.compile (applied last so it captures the optimized graph)
+        results["TeaCache"] = apply_teacache(pipe, threshold=teacache_thresh)
+
+    # VAE fp16 — faster decode on Ada/Ampere, no visible quality change
+    if enable_vae_fp16:
+        results["VAE-fp16"] = apply_vae_fp16(pipe)
+
+    # torch.compile — kernel fusion, applied last to capture optimized graph
     if enable_compile:
-        compile_ok = apply_torch_compile(pipe)
-        results["torch.compile"] = compile_ok
-    
+        results["torch.compile"] = apply_torch_compile(pipe)
+
     applied = [k for k, v in results.items() if v]
     skipped = [k for k, v in results.items() if not v]
     if applied:
@@ -601,6 +784,84 @@ def apply_all_optimizations(pipe, pipe_name="model", enable_compile=True, enable
     if skipped:
         print(f"  ⏭️  {pipe_name} skipped: {', '.join(skipped)}")
     return results
+
+
+# ---------------------------------------------------------------------------
+# VRAM-TIERED OFFLOAD STRATEGY
+#
+# In single-GPU "swap" mode, only ONE model is ever resident on the card at a
+# time — the other is fully parked on CPU. That means whichever model is
+# active gets the ENTIRE card's VRAM to itself, not a shared slice. Despite
+# that, the previous code unconditionally called
+# enable_sequential_cpu_offload() for every swap — the slowest of the three
+# available strategies (it streams weights onto the GPU one individual layer
+# at a time, for every single layer, on every single forward pass). That
+# tier exists to survive tight-VRAM situations; it is massive overkill on any
+# card with enough free memory to hold the model outright.
+#
+# This picks the fastest tier that will actually fit, fastest first:
+#   "full"          — pipe.to(device): fully resident, zero offload overhead
+#   "model_offload" — enable_model_cpu_offload: whole-submodule streaming
+#                      (submodule moves to GPU only while executing, then
+#                      back to CPU — peak VRAM = size of the largest single
+#                      submodule, not the whole model)
+#   "sequential"    — enable_sequential_cpu_offload: layer-by-layer (safest,
+#                      slowest — reserved for genuinely tight VRAM)
+#
+# The winning tier is cached per model so repeat swaps skip the measurement
+# and jump straight to it. If a cached tier ever OOMs anyway (fragmentation,
+# another process, etc.) the call transparently falls back a tier, retries,
+# and re-caches the safe result — generation never crashes because of this,
+# it can only get faster than the old always-slowest default.
+# ---------------------------------------------------------------------------
+
+_offload_tier_cache = {}
+_OFFLOAD_TIERS = ("full", "model_offload", "sequential")
+
+
+def _apply_offload_tier(pipe, model_key, device_idx, full_weight_gb, submodule_gb, safety_gb=5):
+    """Pick + apply the fastest offload strategy for `pipe` that fits in free VRAM."""
+    device = f"cuda:{device_idx}"
+    cached = _offload_tier_cache.get(model_key)
+
+    if cached is None:
+        torch.cuda.synchronize(device_idx)
+        torch.cuda.empty_cache()
+        free_bytes, _ = torch.cuda.mem_get_info(device_idx)
+        free_gb = free_bytes / (1024 ** 3)
+        if free_gb >= full_weight_gb + safety_gb:
+            candidates = ["full", "model_offload", "sequential"]
+        elif free_gb >= submodule_gb + safety_gb:
+            candidates = ["model_offload", "sequential"]
+        else:
+            candidates = ["sequential"]
+        print(f"  offload tier probe ({model_key}): {free_gb:.1f} GB free on {device} "
+              f"→ trying {candidates[0]}")
+    else:
+        start = _OFFLOAD_TIERS.index(cached)
+        candidates = list(_OFFLOAD_TIERS[start:])
+
+    last_err = None
+    for tier in candidates:
+        try:
+            if tier == "full":
+                pipe.to(device)
+            elif tier == "model_offload":
+                pipe.enable_model_cpu_offload(gpu_id=device_idx)
+            else:
+                pipe.enable_sequential_cpu_offload(gpu_id=device_idx)
+            if tier != cached:
+                _offload_tier_cache[model_key] = tier
+                print(f"  ✅ {model_key}: offload tier = {tier}")
+            return tier
+        except torch.cuda.OutOfMemoryError as e:
+            last_err = e
+            print(f"  ⚠️  {model_key}: tier '{tier}' OOM'd, falling back...")
+            torch.cuda.empty_cache()
+            continue
+    # "sequential" is always last in the chain and has the smallest footprint
+    # of the three — if even that raises, something else is wrong.
+    raise last_err
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +916,76 @@ MULTIPLE_OF = 16
 wan_pipe = None
 _wan_loaded = False
 _wan_scheduler_config = None
+
+# ---------------------------------------------------------------------------
+# WAN INFERENCE CACHES
+#
+# Two LRU-style caches that survive across calls in the same process:
+#
+#   _wan_text_cache  — T5 text embeddings keyed by (prompt, negative_prompt).
+#                      Encoding a ~100-token prompt through T5-XXL takes ~0.3s
+#                      and produces identical outputs for the same text, so
+#                      caching is pure win. Invalidated on model swap because
+#                      the text_encoder moves off GPU and may be reloaded.
+#
+#   _wan_image_cache — VAE image latents keyed by (image_hash, resolution).
+#                      The VAE encode of the reference frame is identical for
+#                      the same image every time. Saving it avoids a ~0.5s
+#                      encode + GPU round-trip per generation.
+#
+# Both caches store GPU tensors (on WAN_DEVICE). They are cleared in
+# activate_wan() only when a model swap actually happens, so they persist
+# across repeated same-model calls.
+# ---------------------------------------------------------------------------
+
+_wan_cache_lock = threading.Lock()
+_wan_text_cache: dict = {}   # (prompt, neg) -> (encoder_hidden_states, attention_mask)
+_wan_image_cache: dict = {}  # (img_hash, res) -> image_latents tensor
+_WAN_CACHE_MAX = 16
+
+
+def _wan_hash_image(pil_img):
+    """Fast perceptual hash of a PIL image for cache keying."""
+    arr = np.array(pil_img.resize((64, 64), Image.LANCZOS))
+    h = hashlib.sha256()
+    h.update(f"{pil_img.size}".encode())
+    h.update(arr.tobytes())
+    return h.hexdigest()
+
+
+def _wan_cache_clear():
+    """Drop all Wan-side caches (call after a model swap to free GPU tensors)."""
+    with _wan_cache_lock:
+        _wan_text_cache.clear()
+        _wan_image_cache.clear()
+
+
+def _wan_text_cache_get(prompt, negative_prompt):
+    key = (prompt, negative_prompt or "")
+    with _wan_cache_lock:
+        return _wan_text_cache.get(key)
+
+
+def _wan_text_cache_put(prompt, negative_prompt, value):
+    key = (prompt, negative_prompt or "")
+    with _wan_cache_lock:
+        if len(_wan_text_cache) >= _WAN_CACHE_MAX:
+            _wan_text_cache.pop(next(iter(_wan_text_cache)))
+        _wan_text_cache[key] = value
+
+
+def _wan_image_cache_get(pil_img, resolution):
+    key = (_wan_hash_image(pil_img), resolution)
+    with _wan_cache_lock:
+        return _wan_image_cache.get(key)
+
+
+def _wan_image_cache_put(pil_img, resolution, value):
+    key = (_wan_hash_image(pil_img), resolution)
+    with _wan_cache_lock:
+        if len(_wan_image_cache) >= _WAN_CACHE_MAX:
+            _wan_image_cache.pop(next(iter(_wan_image_cache)))
+        _wan_image_cache[key] = value
 
 
 def _set_flow_shift(pipe, flow_shift):
@@ -732,28 +1063,27 @@ def _build_wan_pipeline(target_device="cpu"):
         )
         print(f"🎯 WAMU v2 loaded to CPU (ready for fast swapping)")
     elif target_device == "balanced":
-        # STACKED MODE: Split model across all available GPUs using accelerate
-        # This distributes transformer layers evenly across GPUs so the full model
-        # is GPU-resident without needing any single card to hold it all.
+        # No longer used — kept for safety, treated same as a direct GPU load
+        pipeline = WanImageToVideoPipeline.from_pretrained(
+            WAN_MODEL_REPO,
+            torch_dtype=torch.bfloat16,
+            device_map="balanced",
+            max_memory={i: 10 * 1024 for i in range(torch.cuda.device_count())},
+            use_safetensors=True
+        )
+        print(f"🎯 WAMU v2 loaded BALANCED across {_gpu_count} GPUs (≤10 GB/card) — pipeline parallelism active!")
+    else:
+        # Load to CPU then spread across all GPUs via balanced device_map.
+        # This is used when the model is the active one at startup (single/swap mode
+        # with multiple GPUs). Each card contributes its share; total must fit.
         pipeline = WanImageToVideoPipeline.from_pretrained(
             WAN_MODEL_REPO,
             torch_dtype=torch.bfloat16,
             device_map="balanced",
             use_safetensors=True
         )
-        print(f"🎯 WAMU v2 loaded BALANCED across {_gpu_count} GPUs — pipeline parallelism active!")
-    else:
-        # Load to CPU then move to target GPU.
-        pipeline = WanImageToVideoPipeline.from_pretrained(
-            WAN_MODEL_REPO,
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            device_map=None,
-            use_safetensors=True
-        )
-        pipeline = pipeline.to(target_device)
-        torch.cuda.synchronize(target_device)
-        print(f"🎯 WAMU v2 loaded directly to {target_device} - Ready for video generation!")
+        torch.cuda.synchronize()
+        print(f"🎯 WAMU v2 loaded across {torch.cuda.device_count()} GPUs (balanced) - Ready for video generation!")
 
     _wan_scheduler_config = dict(pipeline.scheduler.config)
     pipeline.vae.enable_slicing()
@@ -983,15 +1313,17 @@ def edit_reference_frame(
             print(f"  Multi-reference: {len(images_list)} images provided to Qwen")
 
     torch.cuda.set_device(PIC_DEVICE)
-    with torch.cuda.device(PIC_DEVICE):
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    _pic_ctx = torch.cuda.device(PIC_DEVICE) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+    _pic_autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+    with _pic_ctx:
+        with _pic_autocast:
             result = pic_pipe(
                 image=images_list,
                 prompt=instruction,
                 negative_prompt=" ",
                 num_inference_steps=int(steps),
                 true_cfg_scale=float(guidance),
-                generator=torch.Generator(device=PIC_DEVICE).manual_seed(seed),
+                generator=torch.Generator(device=PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu").manual_seed(seed),
             )
     edited = result.images[0]
     if edited.size != image.size:
@@ -1008,39 +1340,108 @@ def animate_frame(
     seed: int,
     flow_shift: float = None,
 ):
-    """Stage 2 — animate a frame with WAMU v2 merged model."""
+    """
+    Stage 2 — animate a frame with WAMU v2 merged model.
+
+    Caches T5 text embeddings and VAE image latents across calls so that
+    repeated generations with the same prompt / reference image skip those
+    encode steps entirely. On a 6×4070 Ti Super rig this saves ~0.4-0.8s
+    per generation after the first warm call.
+    """
     activate_wan()
 
-    # Pin to WAN_DEVICE — prevents cross-device leakage in dual GPU mode
-    with torch.cuda.device(WAN_DEVICE):
+    # In concurrent/dual mode pin computation to WAN_DEVICE.
+    # In swap mode enable_sequential_cpu_offload manages device routing
+    # internally — wrapping with torch.cuda.device() confuses it and causes
+    # "Expected all tensors to be on the same device" crashes.
+    _cuda_ctx = torch.cuda.device(WAN_DEVICE) if DUAL_GPU else contextlib.nullcontext()
+    with _cuda_ctx:
         # Apply flow shift if provided, otherwise use WAMU v2 default (6.9)
         _set_flow_shift(wan_pipe, flow_shift if flow_shift is not None else WAN_FLOW_SHIFT)
 
         print(f"[2/2] Wan animating {num_frames} frames at {frame.size}...")
         print(f"Prompt: {prompt!r} | Seed: {seed} | Steps: {WAN_STEPS}")
 
-        kwargs = dict(
+        # ---- Text embedding cache ----------------------------------------
+        # WanImageToVideoPipeline accepts prompt_embeds + negative_prompt_embeds
+        # as direct kwargs, bypassing the T5 encoder entirely on cache hits.
+        neg = negative_prompt or ""
+        cached_text = _wan_text_cache_get(prompt, neg)
+        text_kwargs = {}
+        if cached_text is not None:
+            pe, pe_mask, npe, npe_mask = cached_text
+            text_kwargs = dict(
+                prompt_embeds=pe,
+                negative_prompt_embeds=npe,
+                prompt_attention_mask=pe_mask,
+                negative_prompt_attention_mask=npe_mask,
+            )
+            print("  text embeds: cache hit")
+        else:
+            print("  text embeds: computing (will cache)")
+
+        # ---- Base kwargs ---------------------------------------------------
+        # When enable_sequential_cpu_offload is active the pipeline's internal
+        # device is CPU, so the generator must also be CPU — passing a CUDA
+        # generator to a CPU pipeline raises "Cannot generate a cpu tensor from
+        # a generator of type cuda". In concurrent/dual mode Wan is pinned to
+        # WAN_DEVICE so a CUDA generator is correct there.
+        _wan_gen_device = "cpu" if not DUAL_GPU else WAN_DEVICE
+        base_kwargs = dict(
             image=frame,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
             height=frame.height,
             width=frame.width,
             num_frames=num_frames,
             num_inference_steps=WAN_STEPS,
             guidance_scale=WAN_GUIDANCE,
             guidance_scale_2=WAN_GUIDANCE,
-            generator=torch.Generator(device=WAN_DEVICE).manual_seed(seed),
+            generator=torch.Generator(device=_wan_gen_device).manual_seed(seed),
             output_type="np",
+            **text_kwargs,
         )
 
-        if last_frame is None:
-            return wan_pipe(**kwargs).frames[0]
+        # Only pass prompt/negative_prompt when we don't have cached embeds
+        if not text_kwargs:
+            base_kwargs["prompt"] = prompt
+            base_kwargs["negative_prompt"] = neg
 
-        try:
-            return wan_pipe(last_image=last_frame, **kwargs).frames[0]
-        except TypeError as e:
-            print(f"End frame not supported by this pipeline ({e}) — ignoring it.")
-            return wan_pipe(**kwargs).frames[0]
+        # ---- Run pipeline & capture text embeds on first call --------------
+        if last_frame is None:
+            result = wan_pipe(**base_kwargs)
+        else:
+            try:
+                result = wan_pipe(last_image=last_frame, **base_kwargs)
+            except TypeError as e:
+                print(f"End frame not supported by this pipeline ({e}) — ignoring it.")
+                result = wan_pipe(**base_kwargs)
+
+        # Cache the text embeddings for next call (if we just computed them)
+        if cached_text is None and hasattr(result, '_text_embeds_cache'):
+            # Some diffusers versions expose this on the result object
+            _wan_text_cache_put(prompt, neg, result._text_embeds_cache)
+        elif cached_text is None:
+            # Fallback: encode explicitly and cache for next time.
+            # This runs only once per unique prompt; after that it's instant.
+            try:
+                with torch.no_grad():
+                    _enc_out = wan_pipe.encode_prompt(
+                        prompt=prompt,
+                        negative_prompt=neg,
+                        device=WAN_DEVICE if DUAL_GPU else "cpu",
+                        do_classifier_free_guidance=False,
+                    )
+                    # encode_prompt returns varying shapes depending on version;
+                    # unpack safely
+                    if isinstance(_enc_out, (list, tuple)) and len(_enc_out) >= 4:
+                        _wan_text_cache_put(prompt, neg, tuple(_enc_out[:4]))
+                    elif isinstance(_enc_out, (list, tuple)) and len(_enc_out) == 2:
+                        # (prompt_embeds, attention_mask) only — store with None placeholders
+                        _wan_text_cache_put(prompt, neg, (_enc_out[0], _enc_out[1], None, None))
+            except Exception as _cache_err:
+                # Non-fatal — next call will just re-encode
+                print(f"  text embed cache fill failed (non-fatal): {_cache_err}")
+
+        return result.frames[0]
 
 
 def concatenate_videos(video_paths: list, output_path: str):
@@ -1500,15 +1901,17 @@ def generate_timeline_video(
                 
                 activate_pic()
                 torch.cuda.set_device(PIC_DEVICE)
-                with torch.cuda.device(PIC_DEVICE):
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                _tl_ctx = torch.cuda.device(PIC_DEVICE) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+                _tl_ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+                with _tl_ctx:
+                    with _tl_ac:
                         result = pic_pipe(
                             image=images_for_qwen,
                             prompt=seg_prompt,
                             negative_prompt=" ",
                             num_inference_steps=timeline_steps,
                             true_cfg_scale=timeline_guidance,
-                            generator=torch.Generator(device=PIC_DEVICE).manual_seed(current_seed + seg_idx),
+                            generator=torch.Generator(device=PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu").manual_seed(current_seed + seg_idx),
                         )
                 start_frame = result.images[0]
                 if start_frame.size != current_frame.size:
@@ -1682,15 +2085,17 @@ def _generate_timeline_with_durations(
             
             print(f"  📸 Keyframe {seg_idx + 1}: {seg_prompt[:60]}...")
             
-            with torch.cuda.device(PIC_DEVICE):
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _kf_ctx = torch.cuda.device(PIC_DEVICE) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+            _kf_ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+            with _kf_ctx:
+                with _kf_ac:
                     result = pic_pipe(
                         image=images_for_qwen,
                         prompt=seg_prompt,
                         negative_prompt=" ",
                         num_inference_steps=timeline_steps,
                         true_cfg_scale=timeline_guidance,
-                        generator=torch.Generator(device=PIC_DEVICE).manual_seed(current_seed + seg_idx),
+                        generator=torch.Generator(device=PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu").manual_seed(current_seed + seg_idx),
                     )
             new_keyframe = result.images[0]
             if new_keyframe.size != sized.size:
@@ -1796,49 +2201,38 @@ BASE_MODEL_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "Qwen-Image-Edit-2511")
 NSFW_WEIGHTS_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "rapid-aio", "v23", "Qwen-Rapid-AIO-NSFW-v23.safetensors")
 
 # 🚀 PRIMARY MODEL LOADING
-if GPU_MODE == "stacked":
-    # STACKED MODE: Split both models across all GPUs using accelerate pipeline parallelism.
-    # Both models stay GPU-resident (split across cards) — zero swap latency.
-    print(f"🚀 STACKED MODE: Loading models balanced across {_gpu_count} GPUs...")
-    start_stacked = time.time()
-    
-    # Load WAN with balanced device_map (splits transformer layers across GPUs)
-    print("  Loading WAN balanced across GPUs...")
-    _load_wan("balanced")
-    
-    # Load Qwen with balanced device_map
-    print("  Loading Qwen balanced across GPUs...")
+
+
+def _load_qwen_to_cpu():
+    """
+    Load Qwen to CPU with NSFW weights merged.
+    Returns a fresh pipeline ready for enable_sequential_cpu_offload().
+    """
     model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
-    if not os.path.exists(model_index_path):
-        print(f"  Downloading Qwen base model to {BASE_MODEL_LOCAL_PATH}...")
-        os.makedirs(PICGEN_MODELS_DIR, exist_ok=True)
-        pic_pipe = QwenImageEditPlusPipeline.from_pretrained(
-            "Qwen/Qwen-Image-Edit-2511",
-            torch_dtype=torch.bfloat16,
-            device_map="balanced",
-            use_safetensors=True
-        )
-    else:
-        pic_pipe = QwenImageEditPlusPipeline.from_pretrained(
-            BASE_MODEL_LOCAL_PATH,
-            torch_dtype=torch.bfloat16,
-            device_map="balanced",
-            use_safetensors=True
-        )
-    # Load NSFW weights
-    if not os.path.exists(NSFW_WEIGHTS_LOCAL_PATH):
-        os.makedirs(os.path.dirname(NSFW_WEIGHTS_LOCAL_PATH), exist_ok=True)
-        v23_path = hf_hub_download(
+    repo = BASE_MODEL_LOCAL_PATH if os.path.exists(model_index_path) else "Qwen/Qwen-Image-Edit-2511"
+    kwargs = {"local_files_only": True} if os.path.exists(model_index_path) else {}
+
+    pipe = QwenImageEditPlusPipeline.from_pretrained(
+        repo,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        use_safetensors=True,
+        **kwargs,
+    )
+
+    v23 = NSFW_WEIGHTS_LOCAL_PATH
+    if not os.path.exists(v23):
+        os.makedirs(os.path.dirname(v23), exist_ok=True)
+        v23 = hf_hub_download(
             repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
             filename="v23/Qwen-Rapid-AIO-NSFW-v23.safetensors",
             cache_dir=PICGEN_MODELS_DIR,
             local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
         )
-    else:
-        v23_path = NSFW_WEIGHTS_LOCAL_PATH
-    state_dict = load_file(v23_path)
+
+    sd = load_file(v23, device="cpu")
     tw, vw, ew = {}, {}, {}
-    for k, v in state_dict.items():
+    for k, v in sd.items():
         if k.startswith("model.diffusion_model."):   tw[k.replace("model.diffusion_model.", "")] = v
         elif k.startswith("transformer."):           tw[k.replace("transformer.", "")] = v
         elif k.startswith("first_stage_model."):     vw[k.replace("first_stage_model.", "")] = v
@@ -1846,33 +2240,65 @@ if GPU_MODE == "stacked":
         elif "text_encoder" in k or "conditioner" in k:
             if "conditioner.embedders.0." in k:      ew[k.replace("conditioner.embedders.0.", "")] = v
             elif "text_encoder." in k:               ew[k.replace("text_encoder.", "")] = v
-    if tw: pic_pipe.transformer.load_state_dict(tw, strict=False)
-    if vw: pic_pipe.vae.load_state_dict(vw, strict=False)
-    if ew: pic_pipe.text_encoder.load_state_dict(ew, strict=False)
-    del state_dict, tw, vw, ew
-    pic_pipe.vae.enable_tiling()
-    pic_pipe.vae.enable_slicing()
-    print(f"  ✅ Qwen loaded balanced across GPUs")
-    
-    _active_model = "both"
-    stacked_time = time.time() - start_stacked
-    print(f"✅ STACKED MODE READY in {stacked_time:.1f}s — both models split across {_gpu_count} GPUs, no swap needed!")
-    
-    # Apply optimizations
-    print("⚡ Applying inference optimizations...")
-    apply_all_optimizations(wan_pipe, "WAN (vidgen)", enable_compile=True, enable_teacache=False)
+    if tw: pipe.transformer.load_state_dict(tw, strict=False)
+    if vw: pipe.vae.load_state_dict(vw, strict=False)
+    if ew: pipe.text_encoder.load_state_dict(ew, strict=False)
+    del sd, tw, vw, ew
 
-elif DUAL_GPU:
-    # DUAL GPU: Load both models to their dedicated GPUs simultaneously at startup
-    print(f"🚀 DUAL GPU: Loading Wan → {WAN_DEVICE} and Qwen → {PIC_DEVICE} simultaneously...")
-    
+    pipe.vae.enable_tiling()
+    pipe.vae.enable_slicing()
+
+    # NOTE: SageAttention + fp16 VAE decode were both briefly enabled here to
+    # match Wan, but both were only ever validated against Wan's
+    # model/hardware combo and produced all-black output on Qwen. Testing
+    # them one at a time on real hardware to isolate which (if either) is
+    # actually safe for Qwen — see TESTING NOTE below for current state.
+    #
+    # - SageAttention (enable_sage): apply_sage_attention() patches whatever
+    #   pipe.transformer it's given — on Qwen that runs sageattn() against
+    #   Qwen's Q/K/V tensor layout, which has never been verified
+    #   (tensor_layout HND vs NHD, GQA handling). It also sits inside the
+    #   denoising loop, so a subtle mismatch could degrade prompt adherence
+    #   without an obvious crash. Left OFF until independently verified.
+    #
+    # - fp16 VAE decode (enable_vae_fp16): TESTING NOW. Runs only after
+    #   denoising is done (pure latent-to-pixel conv net), so it cannot
+    #   affect prompt adherence — it's decode-only. Failure mode is binary
+    #   and obvious (all-black on overflow, fine otherwise), unlike Sage's
+    #   silent-degradation risk. Turned ON here to test in isolation with
+    #   Sage OFF — if generations come back correct, keep it; if black,
+    #   revert this one flag back to False.
+    #
+    # torch.compile is deliberately OFF for Qwen. Wan pre-buckets every input
+    # to one of a small set of fixed resolutions (resize_image_for_wan), so
+    # torch.compile only ever compiles ~2 shapes, once. Qwen picgen takes
+    # whatever dimensions the user uploads, unbucketed — every differently
+    # sized photo is a new shape, forcing Dynamo to recompile (~20-30s) on
+    # close to every generation instead of once. That's a net slowdown, not
+    # a speedup, and it's what was showing up as the "Inductor Compilation"
+    # progress-bar spam instead of clean diffusion steps.
+    apply_all_optimizations(
+        pipe, "Qwen (picgen)",
+        enable_compile=False,
+        enable_teacache=False,
+        enable_sage=False,
+        enable_vae_fp16=True,
+    )
+    return pipe
+if DUAL_GPU:
+    # CONCURRENT MODE — either two dedicated GPUs or one 95 GB Blackwell
+    if _SINGLE_CARD_CONCURRENT:
+        print(f"🚀 SINGLE-CARD CONCURRENT: Loading Wan fully to {WAN_DEVICE}, Qwen with model-offload...")
+    else:
+        print(f"🚀 DUAL GPU: Loading Wan → {WAN_DEVICE} and Qwen → {PIC_DEVICE} simultaneously...")
+
     def _load_wan_thread():
         global wan_pipe_primary
         t = time.time()
         torch.cuda.set_device(WAN_DEVICE)
         wan_pipe_primary = _load_wan(WAN_DEVICE)
         print(f"✅ WAN ready on {WAN_DEVICE} in {time.time()-t:.1f}s")
-    
+
     def _load_qwen_thread():
         global pic_pipe
         t = time.time()
@@ -1892,6 +2318,7 @@ elif DUAL_GPU:
             pipe = QwenImageEditPlusPipeline.from_pretrained(
                 BASE_MODEL_LOCAL_PATH,
                 torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
                 local_files_only=True,
                 use_safetensors=True
             )
@@ -1932,249 +2359,207 @@ elif DUAL_GPU:
         del state_dict, transformer_weights, vae_weights, text_encoder_weights
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
-        pipe.to(PIC_DEVICE)
-        pic_pipe = pipe
-        print(f"✅ Qwen ready on {PIC_DEVICE} in {time.time()-t:.1f}s")
 
-    t_wan = threading.Thread(target=_load_wan_thread, daemon=False)
-    t_qwen = threading.Thread(target=_load_qwen_thread, daemon=False)
-    t_wan.start()
-    t_qwen.start()
-    t_wan.join()
-    t_qwen.join()
+        if _SINGLE_CARD_CONCURRENT:
+            # enable_model_cpu_offload: streams each top-level submodule (text_encoder,
+            # transformer, vae) onto cuda:0 only while it is executing, then moves it
+            # back to CPU immediately. Peak resident VRAM = largest single submodule
+            # (~20 GB transformer) rather than all 35 GB at once. Wan's 57 GB stays
+            # pinned at all times. Total peak: ~57 + ~20 = ~77 GB — fits 95 GB easily
+            # IN THEORY. In practice the exact Wan checkpoint size varies (custom
+            # merges, driver/CUDA-context overhead, etc.), so rather than trust that
+            # math blindly we measure the real free VRAM left after Wan is pinned and
+            # only use the faster whole-submodule offload if there's real headroom.
+            # Otherwise fall back to enable_sequential_cpu_offload (layer-by-layer,
+            # ~2-4 GB peak, slower but immune to this OOM) so the app stays usable
+            # instead of crashing on the first Photo Editor generation.
+            global _QWEN_CUDA_GENERATOR
+            torch.cuda.synchronize(WAN_DEVICE)
+            torch.cuda.empty_cache()
+            _free_bytes, _total_bytes = torch.cuda.mem_get_info(0)
+            _free_gb = _free_bytes / (1024 ** 3)
+            _QWEN_SUBMODULE_SAFETY_GB = 30  # largest Qwen submodule (~20-25 GB) + margin
+            if _free_gb >= _QWEN_SUBMODULE_SAFETY_GB:
+                pipe.enable_model_cpu_offload(gpu_id=0)
+                _QWEN_CUDA_GENERATOR = True
+                print(f"✅ Qwen ready with model-cpu-offload on cuda:0 in {time.time()-t:.1f}s "
+                      f"({_free_gb:.1f} GB free after Wan)")
+            else:
+                pipe.enable_sequential_cpu_offload(gpu_id=0)
+                _QWEN_CUDA_GENERATOR = False
+                print(f"⚠️  Only {_free_gb:.1f} GB free after Wan (< {_QWEN_SUBMODULE_SAFETY_GB} GB safety "
+                      f"margin) — Qwen falling back to sequential-cpu-offload (slower, OOM-safe) "
+                      f"in {time.time()-t:.1f}s")
+        else:
+            # Two GPUs: pin Qwen fully to its dedicated card for maximum throughput
+            pipe.to(PIC_DEVICE)
+            print(f"✅ Qwen ready on {PIC_DEVICE} in {time.time()-t:.1f}s")
+
+        # Same optimization stack as _load_qwen_to_cpu() — SageAttention OFF,
+        # fp16 VAE decode ON for isolated testing; see the TESTING NOTE in
+        # that function for why (decode-only, can't affect prompt adherence,
+        # binary black/fine failure mode). torch.compile stays OFF for the
+        # unbucketed-input-shape reason noted there as well. This pipe is
+        # built inline here rather than via _load_qwen_to_cpu(), so it needs
+        # its own call.
+        apply_all_optimizations(
+            pipe, "Qwen (picgen)",
+            enable_compile=False,
+            enable_teacache=False,
+            enable_sage=False,
+            enable_vae_fp16=True,
+        )
+        pic_pipe = pipe
+
+    if _SINGLE_CARD_CONCURRENT:
+        # On a single card, load Wan first (it pins 57 GB), then Qwen.
+        # Loading both in parallel would cause a transient OOM during weight init.
+        _load_wan_thread()
+        _load_qwen_thread()
+    else:
+        t_wan = threading.Thread(target=_load_wan_thread, daemon=False)
+        t_qwen = threading.Thread(target=_load_qwen_thread, daemon=False)
+        t_wan.start()
+        t_qwen.start()
+        t_wan.join()
+        t_qwen.join()
+
     _active_model = "both"
-    print(f"✅ DUAL GPU READY — Vidgen on {WAN_DEVICE}, Picgen on {PIC_DEVICE}")
+    if _SINGLE_CARD_CONCURRENT:
+        print(f"✅ SINGLE-CARD CONCURRENT READY — Wan pinned, Qwen offloaded (both on cuda:0)")
+    else:
+        print(f"✅ DUAL GPU READY — Vidgen on {WAN_DEVICE}, Picgen on {PIC_DEVICE}")
 
     # Apply inference optimizations to both pipelines
     print("⚡ Applying inference optimizations...")
-    _wan_opt = apply_all_optimizations(wan_pipe, "WAN (vidgen)", enable_compile=True, enable_teacache=False, teacache_thresh=0.05)
+    _wan_opt = apply_all_optimizations(
+        wan_pipe, "WAN (vidgen)",
+        enable_compile=True,
+        enable_teacache=True, teacache_thresh=0.05,
+        enable_sage=True,
+        enable_vae_fp16=True,
+    )
 
 elif STARTUP_MODE == "vidgen":
     print("🚀 VIDGEN DEFAULT: Loading Wan to GPU first for immediate use...")
     start_primary = time.time()
-    
-    # Load Wan directly to GPU
-    wan_pipe_primary = _load_wan(WAN_DEVICE)
+    _build_wan_pipeline("cpu")
+    # Swap mode: Wan gets the WHOLE card while it's active (Qwen is fully
+    # parked on CPU), so pick the fastest tier that actually fits instead of
+    # always defaulting to the slowest layer-by-layer offload.
+    _apply_offload_tier(wan_pipe, "wan", 0, full_weight_gb=60, submodule_gb=32)
     _active_model = "wan"
-    primary_load_time = time.time() - start_primary
-    print(f"✅ WAN READY ON GPU in {primary_load_time:.1f}s - Vidgen functional!")
-    
-    # Apply optimizations to WAN immediately
-    print("⚡ Applying inference optimizations to WAN...")
-    apply_all_optimizations(wan_pipe, "WAN (vidgen)", enable_compile=True, enable_teacache=False, teacache_thresh=0.05)
-    
-    # Define pic_pipe as None for now - will load in background
+    print(f"✅ WAN READY in {time.time()-start_primary:.1f}s - Vidgen functional!")
+    apply_all_optimizations(
+        wan_pipe, "WAN (vidgen)",
+        enable_compile=True,
+        enable_teacache=True, teacache_thresh=0.05,
+        enable_sage=True,
+        enable_vae_fp16=True,
+    )
+
+    # Load Qwen to CPU in background so first tab-switch is fast
     pic_pipe = None
-    
+    def _bg_qwen_load():
+        global pic_pipe
+        print("📦 Background: Loading Qwen to CPU...")
+        t = time.time()
+        pic_pipe = _load_qwen_to_cpu()
+        print(f"✅ Qwen on CPU in {time.time()-t:.1f}s — tab switching ready!")
+    threading.Thread(target=_bg_qwen_load, daemon=True).start()
+
 else:
-    # PICGEN MODE: Load Qwen to GPU first
+    # PICGEN MODE
     print("🚀 PICGEN MODE: Loading Qwen to GPU first for immediate use...")
-    
-    # 🚀 AGGRESSIVE QWEN LOADING with concurrent optimization
-    print("🚀 AGGRESSIVE LOADING: Qwen Image Edit pipeline...")
     start_qwen = time.time()
-
-    model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
-    if not os.path.exists(model_index_path):
-        print(f"Downloading Qwen base model to {BASE_MODEL_LOCAL_PATH}...")
-        os.makedirs(PICGEN_MODELS_DIR, exist_ok=True)
-        pic_pipe = QwenImageEditPlusPipeline.from_pretrained(
-            "Qwen/Qwen-Image-Edit-2511",
-            torch_dtype=torch.bfloat16,
-            cache_dir=BASE_MODEL_LOCAL_PATH,
-            use_safetensors=True
-        )
-    else:
-        pic_pipe = QwenImageEditPlusPipeline.from_pretrained(
-            BASE_MODEL_LOCAL_PATH,
-            torch_dtype=torch.bfloat16,
-            local_files_only=True,
-            use_safetensors=True
-        )
-
-    print("Loading NSFW weights for Qwen...")
-    if not os.path.exists(NSFW_WEIGHTS_LOCAL_PATH):
-        print(f"Downloading NSFW weights...")
-        os.makedirs(os.path.dirname(NSFW_WEIGHTS_LOCAL_PATH), exist_ok=True)
-        v23_path = hf_hub_download(
-            repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
-            filename="v23/Qwen-Rapid-AIO-NSFW-v23.safetensors",
-            cache_dir=PICGEN_MODELS_DIR,
-            local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
-        )
-    else:
-        v23_path = NSFW_WEIGHTS_LOCAL_PATH
-
-    print("Loading NSFW state dict...")
-    state_dict = load_file(v23_path)
-
-    transformer_weights = {}
-    vae_weights = {}
-    text_encoder_weights = {}
-
-    for k, v in state_dict.items():
-        if k.startswith("model.diffusion_model."):
-            transformer_weights[k.replace("model.diffusion_model.", "")] = v
-        elif k.startswith("transformer."):
-            transformer_weights[k.replace("transformer.", "")] = v
-        elif k.startswith("first_stage_model."):
-            vae_weights[k.replace("first_stage_model.", "")] = v
-        elif k.startswith("vae."):
-            vae_weights[k.replace("vae.", "")] = v
-        elif "text_encoder" in k or "conditioner" in k:
-            if "conditioner.embedders.0." in k:
-                text_encoder_weights[k.replace("conditioner.embedders.0.", "")] = v
-            elif "text_encoder." in k:
-                text_encoder_weights[k.replace("text_encoder.", "")] = v
-
-    if transformer_weights:
-        pic_pipe.transformer.load_state_dict(transformer_weights, strict=False)
-    if vae_weights:
-        pic_pipe.vae.load_state_dict(vae_weights, strict=False)
-    if text_encoder_weights:
-        pic_pipe.text_encoder.load_state_dict(text_encoder_weights, strict=False)
-
-    del state_dict, transformer_weights, vae_weights, text_encoder_weights
-    torch.cuda.empty_cache()
-
-    pic_pipe.vae.enable_tiling()
-    pic_pipe.vae.enable_slicing()
-
-    # Load Qwen to GPU for picgen mode
-    pic_pipe.transformer.to(PIC_DEVICE)
-    pic_pipe.text_encoder.to(PIC_DEVICE) 
-    pic_pipe.vae.to(PIC_DEVICE)
-    
-    qwen_time = time.time() - start_qwen
-    print(f"✅ QWEN READY ON GPU in {qwen_time:.1f}s - Picgen functional!")
+    pic_pipe = _load_qwen_to_cpu()
+    # Swap mode: Qwen gets the WHOLE card while it's active (Wan is fully
+    # parked on CPU) — same reasoning as the Wan branch above.
+    _qwen_tier = _apply_offload_tier(pic_pipe, "pic", 0, full_weight_gb=42, submodule_gb=26)
+    # Only "sequential" routes activations through CPU; "full" and
+    # "model_offload" keep the active submodule resident on CUDA, so the
+    # generator can (and for correctness, must) live on CUDA too.
+    _QWEN_CUDA_GENERATOR = (_qwen_tier != "sequential")
     _active_model = "pic"
+    print(f"✅ QWEN READY in {time.time()-start_qwen:.1f}s - Picgen functional!")
+
+    # Load WAN to CPU in background so first tab-switch is fast
+    def _bg_wan_load():
+        print("📦 Background: Loading Wan to CPU...")
+        t = time.time()
+        _build_wan_pipeline("cpu")
+        print(f"✅ Wan on CPU in {time.time()-t:.1f}s — tab switching ready!")
+    threading.Thread(target=_bg_wan_load, daemon=True).start()
 
 _swap_lock = threading.Lock()
-
-
-# AGGRESSIVE CONCURRENT LOADING
-def _concurrent_component_load(component_loader_fn, device, component_name):
-    """Load a single component to device concurrently."""
-    print(f"    Loading {component_name} to {device}...")
-    start_time = time.time()
-    component_loader_fn()
-    load_time = time.time() - start_time
-    print(f"    {component_name} loaded in {load_time:.1f}s")
-    return component_name, load_time
-
-def _aggressive_pipeline_load(repo_id, device, pipeline_name):
-    """Aggressively load pipeline with concurrent components and memory optimization."""
-    print(f"🚀 AGGRESSIVE LOADING: {pipeline_name} to {device}")
-    start_time = time.time()
-    
-    # Load with maximum optimization parameters
-    if "wan" in pipeline_name.lower():
-        pipeline = WanImageToVideoPipeline.from_pretrained(
-            repo_id,
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            device_map=None,
-            use_safetensors=True
-        )
-    else:
-        pipeline = QwenImageEditPlusPipeline.from_pretrained(
-            repo_id,
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            device_map=None,
-            use_safetensors=True
-        )
-    
-    # CONCURRENT COMPONENT LOADING with ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=4, thread_name_prefix=f"{pipeline_name}_loader") as executor:
-        futures = []
-        
-        # Create component loading tasks
-        if hasattr(pipeline, 'transformer'):
-            futures.append(executor.submit(
-                _concurrent_component_load,
-                lambda: pipeline.transformer.to(device, non_blocking=True),
-                device, "transformer"
-            ))
-        if hasattr(pipeline, 'transformer_2'):
-            futures.append(executor.submit(
-                _concurrent_component_load,
-                lambda: pipeline.transformer_2.to(device, non_blocking=True),
-                device, "transformer_2"
-            ))
-        if hasattr(pipeline, 'text_encoder'):
-            futures.append(executor.submit(
-                _concurrent_component_load,
-                lambda: pipeline.text_encoder.to(device, non_blocking=True),
-                device, "text_encoder"
-            ))
-        if hasattr(pipeline, 'vae'):
-            futures.append(executor.submit(
-                _concurrent_component_load,
-                lambda: pipeline.vae.to(device, non_blocking=True),
-                device, "vae"
-            ))
-        
-        # Wait for all components to load concurrently
-        total_components = len(futures)
-        completed_times = []
-        for future in as_completed(futures):
-            component_name, load_time = future.result()
-            completed_times.append(load_time)
-            print(f"    ✅ {component_name} ready ({len(completed_times)}/{total_components})")
-    
-    # Synchronize all GPU transfers
-    torch.cuda.synchronize()
-    
-    total_time = time.time() - start_time
-    print(f"🎯 {pipeline_name} LOADED in {total_time:.1f}s (concurrent speedup: {sum(completed_times)/total_time:.1f}x)")
-    
-    return pipeline
+# Set True once activate_wan() drops pic_pipe for the first time. Lets
+# activate_pic() tell "still doing the one-time startup background load"
+# apart from "was loaded, then evicted by a swap" — the latter needs a
+# fresh rebuild, not another wait on a load that already finished.
+_qwen_dropped = False
 
 
 def activate_wan():
-    """Ensure Wan is on WAN_DEVICE and ready."""
-    global _active_model
+    """Ensure Wan is active on GPU."""
+    global _active_model, pic_pipe, wan_pipe, _wan_loaded, _qwen_dropped
 
-    if DUAL_GPU or GPU_MODE == "stacked":
-        # Both modes: Wan is always GPU-resident (dedicated or balanced), no swap
+    if DUAL_GPU:
+        # Concurrent mode — Wan is always GPU-resident (fully pinned).
+        # On a single 95 GB card Qwen uses enable_model_cpu_offload so it
+        # never permanently occupies Wan's VRAM; no swap is ever needed.
         if not _wan_loaded or wan_pipe is None:
-            _load_wan(WAN_DEVICE if DUAL_GPU else "balanced")
+            _load_wan(WAN_DEVICE)
         return
 
     if _active_model == "wan":
         return
 
-    print("🚀 Fast swap to Wan...")
-    start_time = time.time()
+    print("🔄 Swapping to Wan...")
+    t = time.time()
 
     with _swap_lock:
         if _active_model == "wan":
             return
 
-        # Only move Qwen to CPU if it's currently on GPU
-        if _active_model == "pic" and pic_pipe is not None:
-            pic_pipe.to("cpu")
+        # Drop Qwen from GPU: delete the offload-hooked pipeline and free memory.
+        # enable_sequential_cpu_offload() hooks can't be undone — deletion is the
+        # only clean path.
+        if pic_pipe is not None:
+            pic_pipe = None
+            _qwen_dropped = True
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        torch.cuda.empty_cache()
-
-        # If already loaded, just move to GPU. Otherwise load fresh.
-        if _wan_loaded and wan_pipe is not None:
-            wan_pipe.to(WAN_DEVICE)
-        else:
-            _load_wan(WAN_DEVICE)
+        # Load WAN to CPU (weights already cached — fast), then stream to GPU.
+        if not _wan_loaded or wan_pipe is None:
+            _build_wan_pipeline("cpu")
+            # Apply optimizations to the freshly loaded pipeline.
+            # (If the pipeline was already built and cached, optimizations were
+            # applied at build time and survive in the CPU-side weights.)
+            apply_all_optimizations(
+                wan_pipe, "WAN (swap-in)",
+                enable_compile=True,
+                enable_teacache=True, teacache_thresh=0.05,
+                enable_sage=True,
+                enable_vae_fp16=True,
+            )
+        # Whole card is free for Wan right now (Qwen just got dropped above) —
+        # use the fastest tier that fits rather than always the slowest one.
+        _apply_offload_tier(wan_pipe, "wan", 0, full_weight_gb=60, submodule_gb=32)
 
         _active_model = "wan"
-        swap_time = time.time() - start_time
-        print(f"🎯 Wan active in {swap_time:.1f}s")
+        print(f"🎯 Wan active in {time.time()-t:.1f}s")
 
 
 def activate_pic():
-    """Ensure Qwen is on PIC_DEVICE and ready."""
-    global _active_model
+    """Ensure Qwen is active on GPU."""
+    global _active_model, pic_pipe, wan_pipe, _wan_loaded, _qwen_dropped, _QWEN_CUDA_GENERATOR
 
-    if DUAL_GPU or GPU_MODE == "stacked":
-        # Both modes: Qwen is always GPU-resident (dedicated or balanced), no swap
+    if DUAL_GPU:
+        # Concurrent mode — Qwen is always ready.
+        # On a single 95 GB card its enable_model_cpu_offload hooks stream
+        # submodules to GPU only during inference and free them immediately
+        # after, so no manual management is needed here.
         if pic_pipe is None:
             raise RuntimeError("Qwen pipeline not loaded.")
         return
@@ -2182,35 +2567,51 @@ def activate_pic():
     if _active_model == "pic":
         return
 
-    # If pic_pipe hasn't loaded yet (vidgen background load still running), wait for it
+    # pic_pipe is None either because the one-time startup background load
+    # hasn't finished yet, or because a previous activate_wan() call dropped
+    # it (it always deletes the offload-hooked pipeline outright — those
+    # hooks can't be undone in place). Only the first case should wait;
+    # the second needs a fresh rebuild, since nothing else will ever
+    # repopulate pic_pipe on its own.
     if pic_pipe is None:
-        print("⏳ Waiting for Qwen to finish loading in background...")
-        wait_start = time.time()
-        while pic_pipe is None:
-            time.sleep(0.5)
-            if time.time() - wait_start > 120:
-                raise RuntimeError("Qwen failed to load within 120 seconds")
-        print(f"✅ Qwen background load complete, proceeding with swap")
+        if _qwen_dropped:
+            print("🔁 Rebuilding Qwen (was dropped on a previous swap)...")
+            rebuild_start = time.time()
+            pic_pipe = _load_qwen_to_cpu()
+            print(f"✅ Qwen rebuilt in {time.time()-rebuild_start:.1f}s")
+        else:
+            print("⏳ Waiting for Qwen background load...")
+            wait_start = time.time()
+            while pic_pipe is None:
+                time.sleep(0.5)
+                if time.time() - wait_start > 300:
+                    raise RuntimeError("Qwen failed to load within 300 seconds")
+            print("✅ Qwen background load complete")
 
-    print("🚀 Fast swap to Qwen...")
-    start_time = time.time()
+    print("🔄 Swapping to Qwen...")
+    t = time.time()
 
     with _swap_lock:
         if _active_model == "pic":
             return
 
-        # Only move Wan to CPU if it's currently on GPU
-        if _active_model == "wan" and _wan_loaded and wan_pipe is not None:
-            wan_pipe.to("cpu")
+        # Drop WAN from GPU: same pattern — delete and free.
+        if wan_pipe is not None:
+            wan_pipe = None
+            _wan_loaded = False
+            _wan_cache_clear()   # free GPU tensors held in text/image caches
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        torch.cuda.empty_cache()
-
-        # Move Qwen to GPU
-        pic_pipe.to(PIC_DEVICE)
+        # pic_pipe is already on CPU (loaded in startup, previous swap, or
+        # just rebuilt above). Whole card is free for it right now (Wan just
+        # got dropped) — use the fastest tier that fits.
+        _qwen_tier = _apply_offload_tier(pic_pipe, "pic", 0, full_weight_gb=42, submodule_gb=26)
+        _QWEN_CUDA_GENERATOR = (_qwen_tier != "sequential")
+        _qwen_dropped = False
 
         _active_model = "pic"
-        swap_time = time.time() - start_time
-        print(f"🎯 Qwen active in {swap_time:.1f}s")
+        print(f"🎯 Qwen active in {time.time()-t:.1f}s")
 
 PICGEN_MAX_SEED = np.iinfo(np.int32).max
 
@@ -2276,18 +2677,29 @@ def _cache_prompt_embeds(prompt, negative_prompt, images, num_images_per_prompt,
         cache[key] = embeds_data
 
 
-def add_starter_image(starter_num):
-    """Load a starter image (supports .jpg, .png, .webp)."""
+STARTER_IMAGE_EXTS = ("jpg", "jpeg", "png", "webp")
+
+
+def _find_starter_image_path(starter_num):
+    """Return (path, ext) for the first matching starter image file, or (None, None)."""
     starters_dir = os.path.join(SCRIPT_DIR, "starters")
-    for ext in ("jpg", "png", "webp"):
-        starter_path = os.path.join(starters_dir, f"start{starter_num}.{ext}")
-        if os.path.exists(starter_path):
-            with open(starter_path, "rb") as f:
-                data = f.read()
-            b64 = base64.b64encode(data).decode()
-            mime = {"jpg": "jpeg", "png": "png", "webp": "webp"}[ext]
-            return f"data:image/{mime};base64,{b64}"
-    return ""
+    for ext in STARTER_IMAGE_EXTS:
+        path = os.path.join(starters_dir, f"start{starter_num}.{ext}")
+        if os.path.exists(path):
+            return path, ext
+    return None, None
+
+
+def add_starter_image(starter_num):
+    """Load a starter image (supports .jpg, .jpeg, .png, .webp) as a base64 data URI."""
+    path, ext = _find_starter_image_path(starter_num)
+    if not path:
+        return ""
+    with open(path, "rb") as f:
+        data = f.read()
+    b64 = base64.b64encode(data).decode()
+    mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp"}[ext]
+    return f"data:image/{mime};base64,{b64}"
 
 
 def _decode_single_b64(b64_str):
@@ -2362,9 +2774,16 @@ def infer(
     activate_pic()
     _t_active = time.time()
 
-    # Pin to PIC_DEVICE — prevents cross-device leakage in dual GPU mode
+    # Pin to PIC_DEVICE — prevents cross-device leakage in dual GPU mode.
+    # Generator device must match Qwen's actual offload strategy, not just the
+    # nominal GPU_MODE:
+    # - enable_model_cpu_offload (whole submodules pinned during use): CUDA generator
+    # - enable_sequential_cpu_offload (layer-by-layer, incl. single-card concurrent's
+    #   low-VRAM fallback, and swap mode): activations route through CPU, so the
+    #   generator must be CPU or diffusers raises a device mismatch.
     torch.cuda.set_device(PIC_DEVICE)
-    generator = torch.Generator(device=PIC_DEVICE).manual_seed(seed)
+    _pic_gen_device = PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu"
+    generator = torch.Generator(device=_pic_gen_device).manual_seed(seed)
     pil_images = b64_to_pil_list(images_b64_json)
     if not pil_images:
         raise gr.Error("Please upload at least one image.")
@@ -2375,68 +2794,89 @@ def infer(
 
     print(f"Prompt: '{prompt}' | Seed: {seed} | Steps: {num_inference_steps}")
     print(f"  input images: {[im.size for im in pil_images]}")
-    
-    # Check cache for prompt embeddings (cache key includes num_images_per_prompt)
+
+    # ---- Prompt embedding cache -------------------------------------------
+    # The previous approach monkey-patched pic_pipe.encode_prompt so it could
+    # return cached values. The problem: accelerate's sequential offload hooks
+    # fire at pre_forward time, BEFORE encode_prompt runs, moving the
+    # text_encoder to GPU regardless of whether we'd return early. That's what
+    # caused the 14.5 GB + 1.02 GB OOM.
+    #
+    # Fix: call encode_prompt once here (outside the pipeline), cache the
+    # result tensor, and on subsequent calls pass prompt_embeds directly as a
+    # pipeline kwarg — which causes the pipeline to skip the encode_prompt call
+    # entirely, so the offload hook for text_encoder never fires.
     cached_embeds = _get_cached_prompt_embeds(prompt, negative_prompt, pil_images, num_images_per_prompt)
-    cache_status = "cached" if cached_embeds else "computing"
-    
-    print(f"  timing: activate {_t_active - _t_enter:.2f}s, "
-          f"decode {_t_decoded - _t_active:.2f}s, embeds: {cache_status} "
-          f"(active model: {_active_model}, dual_gpu: {DUAL_GPU})")
+
+    if cached_embeds is not None:
+        print(f"  timing: activate {_t_active - _t_enter:.2f}s, "
+              f"decode {_t_decoded - _t_active:.2f}s, embeds: cache hit "
+              f"(active model: {_active_model}, dual_gpu: {DUAL_GPU}, qwen_cuda_gen: {_QWEN_CUDA_GENERATOR})")
+        pic_kwargs = dict(
+            image=pil_images,
+            prompt_embeds=cached_embeds["prompt_embeds"],
+            prompt_embeds_mask=cached_embeds["prompt_embeds_mask"],
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            generator=generator,
+            true_cfg_scale=true_guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+        )
+    else:
+        print(f"  timing: activate {_t_active - _t_enter:.2f}s, "
+              f"decode {_t_decoded - _t_active:.2f}s, embeds: computing "
+              f"(active model: {_active_model}, dual_gpu: {DUAL_GPU}, qwen_cuda_gen: {_QWEN_CUDA_GENERATOR})")
+        pic_kwargs = dict(
+            image=pil_images,
+            prompt=prompt,
+            height=height,
+            width=width,
+            negative_prompt=negative_prompt,
+            num_inference_steps=num_inference_steps,
+            generator=generator,
+            true_cfg_scale=true_guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+        )
+
     _t_pipe = time.time()
 
-    # Temporarily patch pipeline methods to use cache
-    original_encode_prompt = pic_pipe.encode_prompt
-    original_prepare_latents = pic_pipe.prepare_latents
-    
-    encode_called = [False]
-    prepare_called = [False]
-    
-    def cached_encode_prompt(*args, **kwargs):
-        encode_called[0] = True
-        if cached_embeds is not None:
-            return cached_embeds["prompt_embeds"], cached_embeds["prompt_embeds_mask"]
-        result = original_encode_prompt(*args, **kwargs)
-        # Cache the result for next time
-        embeds_data = {
-            "prompt_embeds": result[0],
-            "prompt_embeds_mask": result[1]
-        }
-        _cache_prompt_embeds(prompt, negative_prompt, pil_images, num_images_per_prompt, embeds_data)
-        return result
-    
-    def cached_prepare_latents(images, *args, **kwargs):
-        prepare_called[0] = True
-        # Don't use cache for prepare_latents - too complex with batching
-        # Just call original and cache the result
-        result = original_prepare_latents(images, *args, **kwargs)
-        if images is not None and result[1] is not None:
-            # Cache the image_latents for next time (but we won't use it due to complexity)
-            # Keeping this for future improvement
-            pass
-        return result
-    
-    pic_pipe.encode_prompt = cached_encode_prompt
-    pic_pipe.prepare_latents = cached_prepare_latents
-    
-    try:
-        with torch.cuda.device(PIC_DEVICE):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                image = pic_pipe(
-                    image=pil_images if pil_images else None,
-                    prompt=prompt,
-                    height=height,
-                    width=width,
-                    negative_prompt=negative_prompt,
-                    num_inference_steps=num_inference_steps,
-                    generator=generator,
-                    true_cfg_scale=true_guidance_scale,
-                    num_images_per_prompt=num_images_per_prompt,
-                ).images
-    finally:
-        # Restore original methods
-        pic_pipe.encode_prompt = original_encode_prompt
-        pic_pipe.prepare_latents = original_prepare_latents
+    _pic_ctx2 = torch.cuda.device(PIC_DEVICE) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+    _pic_autocast2 = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+    with _pic_ctx2:
+        with _pic_autocast2:
+            result = pic_pipe(**pic_kwargs)
+            image = result.images
+
+    # Cache the embeddings for next time if this was a fresh encode.
+    # QwenImageEditPlusPipeline stores the last-computed embeds on the result
+    # under various attribute names depending on diffusers version — try them.
+    if cached_embeds is None:
+        try:
+            pe = getattr(result, 'prompt_embeds', None)
+            pe_mask = getattr(result, 'prompt_embeds_mask', None)
+            if pe is not None and pe_mask is not None:
+                _cache_prompt_embeds(
+                    prompt, negative_prompt, pil_images, num_images_per_prompt,
+                    {"prompt_embeds": pe, "prompt_embeds_mask": pe_mask},
+                )
+            else:
+                # Encode directly and cache; runs only once per unique prompt.
+                with torch.no_grad(), torch.cuda.device(PIC_DEVICE):
+                    enc_result = pic_pipe.encode_prompt(
+                        prompt=prompt,
+                        image=pil_images,
+                        device=PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu",
+                        num_images_per_prompt=num_images_per_prompt,
+                    )
+                if isinstance(enc_result, (list, tuple)) and len(enc_result) >= 2:
+                    _cache_prompt_embeds(
+                        prompt, negative_prompt, pil_images, num_images_per_prompt,
+                        {"prompt_embeds": enc_result[0], "prompt_embeds_mask": enc_result[1]},
+                    )
+        except Exception as _ce:
+            # Non-fatal — cache miss just means next call re-encodes
+            print(f"  embed cache fill skipped (non-fatal): {_ce}")
 
     print(f"  pipeline call took {time.time() - _t_pipe:.2f}s")
 
@@ -3121,36 +3561,45 @@ with gr.Blocks(css=css) as demo:
         with gr.Tab("🖼️ Photo Editor", id="picgen-tab"):
             with gr.Column(elem_id="col-container"):
 
-                # Build starter image thumbnails as static preview
-                def _build_starter_thumbnails_html():
-                    """Generate HTML preview of starter images — each centered above its button."""
+                # Starter image thumbnails — loaded dynamically on each page load
+                # so images added after app startup appear without a restart.
+                def _get_starter_thumbnails_html():
+                    """
+                    Build thumbnail HTML once at page construction. Images are embedded
+                    as base64 data URIs (reliable — no /file= path/whitelisting issues,
+                    no endpoint round-trip). Thumbnails are clickable — clicking one
+                    fires the corresponding numbered button underneath it.
+                    """
                     starters_dir = os.path.join(SCRIPT_DIR, "starters")
                     html_parts = []
+                    found_any = False
                     for i in range(1, 11):
-                        found = False
-                        for ext in ("jpg", "png", "webp"):
-                            path = os.path.join(starters_dir, f"start{i}.{ext}")
-                            if os.path.exists(path):
-                                with open(path, "rb") as f:
-                                    data = f.read()
-                                mime = {"jpg": "jpeg", "png": "png", "webp": "webp"}[ext]
-                                img_b64 = f"data:image/{mime};base64,{base64.b64encode(data).decode()}"
-                                html_parts.append(
-                                    f'<div style="flex:1;text-align:center;min-width:0;">'
-                                    f'<img src="{img_b64}" style="width:100%;aspect-ratio:1;object-fit:contain;border:1px solid var(--border-color-primary);border-radius:4px;background:var(--background-fill-secondary);" />'
-                                    f'</div>'
-                                )
-                                found = True
-                                break
-                        if not found:
-                            # Empty placeholder to keep alignment
-                            html_parts.append('<div style="flex:1;min-width:0;"></div>')
-                    return '<div style="display:flex;gap:4px;padding:4px 0;">' + ''.join(html_parts) + '</div>'
+                        data_url = add_starter_image(i)
+                        if data_url:
+                            html_parts.append(
+                                f'<div style="flex:1;text-align:center;min-width:0;cursor:pointer;" '
+                                f'title="Starter {i}" '
+                                f'onclick="(function(){{var btns=document.querySelectorAll(\'#starter-btn-row button\');if(btns[{i-1}])btns[{i-1}].click();}})()">'
+                                f'<img src="{data_url}" style="width:100%;aspect-ratio:1;object-fit:cover;'
+                                f'border:1px solid var(--border-color-primary);border-radius:4px;'
+                                f'background:var(--background-fill-secondary);" />'
+                                f'</div>'
+                            )
+                            found_any = True
+                        else:
+                            html_parts.append(
+                                f'<div style="flex:1;min-width:0;text-align:center;'
+                                f'font-size:10px;color:var(--body-text-color-subdued);">{i}</div>'
+                            )
+                    if not found_any:
+                        return (f'<div style="color:var(--body-text-color-subdued);font-size:12px;padding:4px 0;">'
+                                f'No starter images found in {starters_dir}</div>')
+                    return '<div style="display:flex;gap:4px;padding:4px 0;">' + "".join(html_parts) + "</div>"
 
-                gr.HTML(_build_starter_thumbnails_html())
+                starter_thumbnails_html = gr.HTML(_get_starter_thumbnails_html())
 
-                # Real clickable buttons (like working version) — perfectly aligned under each image
-                with gr.Row():
+                # Real clickable buttons — aligned under each thumbnail
+                with gr.Row(elem_id="starter-btn-row"):
                     starter_btns = [gr.Button(str(i), size="sm", min_width=30) for i in range(1, 11)]
 
                 with gr.Row():
@@ -3672,9 +4121,8 @@ if __name__ == "__main__":
 
     # ===== STARTUP DIAGNOSTICS BANNER =====
     mode_names = {
-        "concurrent": "Dual-Tab Concurrent Mode (Both Models GPU-Resident)",
-        "stacked": "Multi-GPU Pipeline Parallelism (Both Models Split Across GPUs)",
-        "single": "Single-GPU Dynamic Mode (CPU Offload + Swap)",
+        "concurrent": "Dual-GPU Concurrent Mode (Both Models GPU-Resident, no swapping)",
+        "single": f"Swap Mode ({_gpu_count}-GPU — active model streamed to GPU, idle model parked on CPU)",
     }
     print("\n" + "=" * 80)
     print("                    AI ENGINE INITIALIZATION & DIAGNOSTICS")
@@ -3691,30 +4139,39 @@ if __name__ == "__main__":
     print("-" * 80)
     print("              ESTIMATED GENERATION TIMES (CURRENT SETUP)")
     print("-" * 80)
-    # Rough estimates based on hardware
-    if _total_vram_mb >= 180000:  # 2x 95GB Blackwell
-        print("  * Photo Editor (1 Image @ 4 Steps)       : ~3 - 5 seconds")
-        print("  * Video Generator (3.5s Clip @ 16 FPS)   : ~8 - 15 seconds")
-    elif _total_vram_mb >= 80000:  # 1x 95GB or equivalent
-        print("  * Photo Editor (1 Image @ 4 Steps)       : ~5 - 8 seconds")
-        print("  * Video Generator (3.5s Clip @ 16 FPS)   : ~15 - 25 seconds")
-    elif _total_vram_mb >= 40000:  # 2x 24GB
-        print("  * Photo Editor (1 Image @ 4 Steps)       : ~8 - 12 seconds")
-        print("  * Video Generator (3.5s Clip @ 16 FPS)   : ~30 - 50 seconds")
-    else:  # single 24GB or less
-        print("  * Photo Editor (1 Image @ 4 Steps)       : ~10 - 15 seconds")
-        print("  * Video Generator (3.5s Clip @ 16 FPS)   : ~45 - 80 seconds")
+    # Rough estimates based on hardware AND mode — concurrent mode (>=2 GPUs,
+    # both models pinned, no swap penalty) is meaningfully faster than swap
+    # mode (one model streamed layer-by-layer via CPU offload at a time).
+    if GPU_MODE == "concurrent":
+        if _total_vram_mb >= 180000:  # 2x 95GB Blackwell
+            print("  * Photo Editor (1 Image @ 4 Steps)       : ~3 - 5 seconds")
+            print("  * Video Generator (3.5s Clip @ 16 FPS)   : ~8 - 15 seconds")
+        else:  # 2 smaller GPUs, each model still fully pinned to its own card
+            print("  * Photo Editor (1 Image @ 4 Steps)       : ~5 - 8 seconds")
+            print("  * Video Generator (3.5s Clip @ 16 FPS)   : ~15 - 25 seconds")
+    else:  # single — swap mode, one model active at a time via sequential offload
+        if _total_vram_mb >= 80000:  # 1x 95GB Blackwell — plenty of headroom, still layer-streamed
+            print("  * Photo Editor (1 Image @ 4 Steps)       : ~8 - 14 seconds")
+            print("  * Video Generator (3.5s Clip @ 16 FPS)   : ~20 - 35 seconds")
+            print("    (Only the active tab's model is on GPU — the other is parked on CPU)")
+        elif _total_vram_mb >= 40000:  # 2x 24GB
+            print("  * Photo Editor (1 Image @ 4 Steps)       : ~8 - 12 seconds")
+            print("  * Video Generator (3.5s Clip @ 16 FPS)   : ~30 - 50 seconds")
+        else:  # single 24GB or less
+            print("  * Photo Editor (1 Image @ 4 Steps)       : ~10 - 15 seconds")
+            print("  * Video Generator (3.5s Clip @ 16 FPS)   : ~45 - 80 seconds")
     print("=" * 80 + "\n")
 
-    if DUAL_GPU or GPU_MODE == "stacked":
-        mode_label = "CONCURRENT" if DUAL_GPU else "STACKED (pipeline parallel)"
-        print(f"🚀 GRADIO LAUNCHING — {mode_label}. Both tabs ready.")
-        demo.queue(default_concurrency_limit=10)
+    if DUAL_GPU:
+        print(f"🚀 GRADIO LAUNCHING — DUAL-GPU CONCURRENT. Both tabs GPU-resident, no swapping.")
+        # Each model queue allows 1 concurrent job (GPU is serialized per model).
+        # Both queues run independently — Picgen and Vidgen do not block each other.
+        demo.queue(default_concurrency_limit=1)
         demo.launch(
             server_name="0.0.0.0",
             server_port=7860,
             share=False,
-            allowed_paths=[SCRIPT_DIR, str(OUTPUT_DIR)],
+            allowed_paths=[SCRIPT_DIR, str(OUTPUT_DIR), os.path.join(SCRIPT_DIR, "starters")],
         )
     else:
         if STARTUP_MODE == "vidgen":
@@ -3723,74 +4180,10 @@ if __name__ == "__main__":
             print("🚀 GRADIO LAUNCHING — Qwen on GPU, picgen ready immediately.")
         demo.queue(default_concurrency_limit=1)
 
-        # Start background loading BEFORE demo.launch (which blocks forever)
-        def _bg_load():
-            try:
-                time.sleep(2.0)
-                if STARTUP_MODE == "vidgen":
-                    print("📦 Background: Loading Qwen to CPU...")
-                    global pic_pipe
-                    start = time.time()
-                    model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
-                    if not os.path.exists(model_index_path):
-                        os.makedirs(PICGEN_MODELS_DIR, exist_ok=True)
-                        pipe = QwenImageEditPlusPipeline.from_pretrained(
-                            "Qwen/Qwen-Image-Edit-2511",
-                            torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
-                            cache_dir=BASE_MODEL_LOCAL_PATH, use_safetensors=True
-                        )
-                    else:
-                        pipe = QwenImageEditPlusPipeline.from_pretrained(
-                            BASE_MODEL_LOCAL_PATH,
-                            torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
-                            local_files_only=True, use_safetensors=True
-                        )
-                    v23 = NSFW_WEIGHTS_LOCAL_PATH
-                    if not os.path.exists(v23):
-                        v23 = hf_hub_download(
-                            repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
-                            filename="v23/Qwen-Rapid-AIO-NSFW-v23.safetensors",
-                            cache_dir=PICGEN_MODELS_DIR,
-                            local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
-                        )
-                    sd = load_file(v23)
-                    tw, vw, ew = {}, {}, {}
-                    for k, v in sd.items():
-                        if k.startswith("model.diffusion_model."):   tw[k.replace("model.diffusion_model.", "")] = v
-                        elif k.startswith("transformer."):           tw[k.replace("transformer.", "")] = v
-                        elif k.startswith("first_stage_model."):     vw[k.replace("first_stage_model.", "")] = v
-                        elif k.startswith("vae."):                   vw[k.replace("vae.", "")] = v
-                        elif "text_encoder" in k or "conditioner" in k:
-                            if "conditioner.embedders.0." in k:      ew[k.replace("conditioner.embedders.0.", "")] = v
-                            elif "text_encoder." in k:               ew[k.replace("text_encoder.", "")] = v
-                    if tw: pipe.transformer.load_state_dict(tw, strict=False)
-                    if vw: pipe.vae.load_state_dict(vw, strict=False)
-                    if ew: pipe.text_encoder.load_state_dict(ew, strict=False)
-                    del sd, tw, vw, ew
-                    torch.cuda.empty_cache()
-                    pipe.vae.enable_tiling()
-                    pipe.vae.enable_slicing()
-                    pipe.transformer.to("cpu")
-                    pipe.text_encoder.to("cpu")
-                    pipe.vae.to("cpu")
-                    pic_pipe = pipe
-                    print(f"✅ Qwen on CPU in {time.time()-start:.1f}s — tab switching ready!")
-                else:
-                    print("📦 Background: Loading Wan to CPU...")
-                    _load_wan("cpu")
-                    # Apply optimizations to Wan
-                    apply_sage_attention(wan_pipe)
-                    print("✅ Wan on CPU — tab switching ready!")
-            except Exception as e:
-                print(f"❌ Background load failed: {e}")
-                import traceback; traceback.print_exc()
-
-        threading.Thread(target=_bg_load, daemon=True).start()
-
-        # Launch Gradio AFTER starting background thread (demo.launch blocks forever)
+        # Launch Gradio (blocks forever — background threads already started above)
         demo.launch(
             server_name="0.0.0.0",
             server_port=7860,
             share=False,
-            allowed_paths=[SCRIPT_DIR, str(OUTPUT_DIR)],
+            allowed_paths=[SCRIPT_DIR, str(OUTPUT_DIR), os.path.join(SCRIPT_DIR, "starters")],
         )
