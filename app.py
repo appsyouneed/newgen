@@ -787,7 +787,6 @@ def edit_reference_frame(
     image: Image.Image,
     mode: str,
     prompt: str,
-    edit_instruction: str,
     seed: int,
     steps: int,
     guidance: float,
@@ -802,18 +801,23 @@ def edit_reference_frame(
         print("[1/2] Keep-scene mode — reference frame used as-is.")
         return image
 
+    # Both MODE_REPLACE and MODE_CUSTOM now use the motion prompt
     if mode == MODE_CUSTOM:
-        instruction = (edit_instruction or "").strip()
-        if not instruction:
-            raise gr.Error(
-                "Custom edit mode needs an edit instruction. Switch to "
-                f"'{MODE_KEEP}' if you do not want the frame changed."
-            )
+        # Custom mode: use the motion prompt directly as the edit instruction
+        # This allows the prompt to guide character poses, expressions, actions
+        instruction = f"Edit this image to match the following description, keeping the people's identities and features intact: {prompt}"
     else:
+        # Replace mode: use the RELOCATE_INSTRUCTION template with the motion prompt
         instruction = RELOCATE_INSTRUCTION.format(prompt=prompt)
 
-    activate_pic()
     print(f"[1/2] Qwen editing frame -> {instruction[:80]}...")
+    
+    # Show user-friendly message during potentially slow model swap
+    swap_start = time.time()
+    activate_pic()
+    swap_time = time.time() - swap_start
+    if swap_time > 3.0:
+        print(f"⚡ Model swap completed in {swap_time:.1f}s")
 
     torch.cuda.set_device(PIC_DEVICE)
     with torch.cuda.device(PIC_DEVICE):
@@ -918,7 +922,7 @@ def _last_frame_of(video_path: str):
     return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
 
-def generate_with_preset(prompt_dict, choice, reference_image, scene_mode, edit_instruction,
+def generate_with_preset(prompt_dict, choice, reference_image, scene_mode,
                         end_image, duration_seconds, resolution, frame_multiplier,
                         export_quality, seed, randomize_seed, add_audio_cb,
                         audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
@@ -927,7 +931,7 @@ def generate_with_preset(prompt_dict, choice, reference_image, scene_mode, edit_
     if choice and choice in prompt_dict:
         preset_prompt = prompt_dict[choice]
         return generate_video(
-            reference_image, preset_prompt, scene_mode, edit_instruction,
+            reference_image, preset_prompt, scene_mode,
             end_image, duration_seconds, resolution, frame_multiplier,
             export_quality, seed, randomize_seed, add_audio_cb,
             audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
@@ -936,90 +940,90 @@ def generate_with_preset(prompt_dict, choice, reference_image, scene_mode, edit_
     return None, None
 
 # Wrapper functions for each preset dropdown
-def generate_with_solo(choice, reference_image, scene_mode, edit_instruction,
+def generate_with_solo(choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                       export_quality, seed, randomize_seed, add_audio_cb,
                       audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                       flow_shift_auto, flow_shift):
-    return generate_with_preset(vid_solo_prompts_dict, choice, reference_image, scene_mode, edit_instruction,
+    return generate_with_preset(vid_solo_prompts_dict, choice, reference_image, scene_mode,
                                end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
                                audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                                flow_shift_auto, flow_shift)
 
-def generate_with_couple(choice, reference_image, scene_mode, edit_instruction,
-                        end_image, duration_seconds, resolution, frame_multiplier,
+def generate_with_couple(choice, reference_image, scene_mode,
+                      end_image, duration_seconds, resolution, frame_multiplier,
                         export_quality, seed, randomize_seed, add_audio_cb,
                         audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                         flow_shift_auto, flow_shift):
-    return generate_with_preset(vid_couple_prompts_dict, choice, reference_image, scene_mode, edit_instruction,
-                               end_image, duration_seconds, resolution, frame_multiplier,
+    return generate_with_preset(vid_couple_prompts_dict, choice, reference_image, scene_mode,
+                      end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
                                audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                                flow_shift_auto, flow_shift)
 
-def generate_with_multiple(choice, reference_image, scene_mode, edit_instruction,
-                          end_image, duration_seconds, resolution, frame_multiplier,
+def generate_with_multiple(choice, reference_image, scene_mode,
+                      end_image, duration_seconds, resolution, frame_multiplier,
                           export_quality, seed, randomize_seed, add_audio_cb,
                           audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                           flow_shift_auto, flow_shift):
-    return generate_with_preset(vid_multiple_prompts_dict, choice, reference_image, scene_mode, edit_instruction,
-                               end_image, duration_seconds, resolution, frame_multiplier,
+    return generate_with_preset(vid_multiple_prompts_dict, choice, reference_image, scene_mode,
+                      end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
                                audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                                flow_shift_auto, flow_shift)
 
-def generate_with_multistep(choice, reference_image, scene_mode, edit_instruction,
-                           end_image, duration_seconds, resolution, frame_multiplier,
+def generate_with_multistep(choice, reference_image, scene_mode,
+                      end_image, duration_seconds, resolution, frame_multiplier,
                            export_quality, seed, randomize_seed, add_audio_cb,
                            audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                            flow_shift_auto, flow_shift):
-    return generate_with_preset(vid_multistep_prompts_dict, choice, reference_image, scene_mode, edit_instruction,
-                               end_image, duration_seconds, resolution, frame_multiplier,
+    return generate_with_preset(vid_multistep_prompts_dict, choice, reference_image, scene_mode,
+                      end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
                                audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                                flow_shift_auto, flow_shift)
 
-def generate_with_environment(choice, reference_image, scene_mode, edit_instruction,
-                             end_image, duration_seconds, resolution, frame_multiplier,
+def generate_with_environment(choice, reference_image, scene_mode,
+                      end_image, duration_seconds, resolution, frame_multiplier,
                              export_quality, seed, randomize_seed, add_audio_cb,
                              audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                              flow_shift_auto, flow_shift):
-    return generate_with_preset(vid_environment_prompts_dict, choice, reference_image, scene_mode, edit_instruction,
-                               end_image, duration_seconds, resolution, frame_multiplier,
+    return generate_with_preset(vid_environment_prompts_dict, choice, reference_image, scene_mode,
+                      end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
                                audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                                flow_shift_auto, flow_shift)
 
-def generate_with_custom(choice, reference_image, scene_mode, edit_instruction,
-                        end_image, duration_seconds, resolution, frame_multiplier,
+def generate_with_custom(choice, reference_image, scene_mode,
+                      end_image, duration_seconds, resolution, frame_multiplier,
                         export_quality, seed, randomize_seed, add_audio_cb,
                         audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                         flow_shift_auto, flow_shift):
-    return generate_with_preset(vid_custom_prompts_dict, choice, reference_image, scene_mode, edit_instruction,
-                               end_image, duration_seconds, resolution, frame_multiplier,
+    return generate_with_preset(vid_custom_prompts_dict, choice, reference_image, scene_mode,
+                      end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
                                audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                                flow_shift_auto, flow_shift)
 
-def generate_with_multiple_unseen(choice, reference_image, scene_mode, edit_instruction,
-                                 end_image, duration_seconds, resolution, frame_multiplier,
+def generate_with_multiple_unseen(choice, reference_image, scene_mode,
+                      end_image, duration_seconds, resolution, frame_multiplier,
                                  export_quality, seed, randomize_seed, add_audio_cb,
                                  audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                                  flow_shift_auto, flow_shift):
-    return generate_with_preset(vid_multiple_man_unseen_prompts_dict, choice, reference_image, scene_mode, edit_instruction,
-                               end_image, duration_seconds, resolution, frame_multiplier,
+    return generate_with_preset(vid_multiple_man_unseen_prompts_dict, choice, reference_image, scene_mode,
+                      end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
                                audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                                flow_shift_auto, flow_shift)
 
-def generate_with_multiple_seen(choice, reference_image, scene_mode, edit_instruction,
-                               end_image, duration_seconds, resolution, frame_multiplier,
+def generate_with_multiple_seen(choice, reference_image, scene_mode,
+                      end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
                                audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                                flow_shift_auto, flow_shift):
-    return generate_with_preset(vid_multiple_man_seen_prompts_dict, choice, reference_image, scene_mode, edit_instruction,
-                               end_image, duration_seconds, resolution, frame_multiplier,
+    return generate_with_preset(vid_multiple_man_seen_prompts_dict, choice, reference_image, scene_mode,
+                      end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
                                audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                                flow_shift_auto, flow_shift)
@@ -1029,7 +1033,6 @@ def generate_video(
     reference_image,
     prompt,
     scene_mode,
-    edit_instruction="",
     end_image=None,
     duration_seconds=3.5,
     resolution="480p",
@@ -1114,7 +1117,7 @@ def generate_video(
 
         # ---- Stage 1: optional frame preparation --------------------------
         start_frame = edit_reference_frame(
-            sized, scene_mode, prompt, edit_instruction,
+            sized, scene_mode, prompt,
             current_seed, edit_steps, edit_guidance,
         )
 
@@ -1320,8 +1323,84 @@ elif STARTUP_MODE == "vidgen":
     primary_load_time = time.time() - start_primary
     print(f"✅ WAN READY ON GPU in {primary_load_time:.1f}s - Vidgen functional!")
     
-    # Define pic_pipe as None for now - will load in background
+    # Load Qwen to CPU in background for fast first Replace/Custom mode use
     pic_pipe = None
+    def _bg_qwen_load():
+        global pic_pipe
+        print("📦 Background: Loading Qwen to CPU for Replace/Custom modes...")
+        t = time.time()
+        try:
+            model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
+            if not os.path.exists(model_index_path):
+                print(f"Downloading Qwen base model to {BASE_MODEL_LOCAL_PATH}...")
+                os.makedirs(PICGEN_MODELS_DIR, exist_ok=True)
+                pipe = QwenImageEditPlusPipeline.from_pretrained(
+                    "Qwen/Qwen-Image-Edit-2511",
+                    torch_dtype=torch.bfloat16,
+                    cache_dir=BASE_MODEL_LOCAL_PATH,
+                    use_safetensors=True
+                )
+            else:
+                pipe = QwenImageEditPlusPipeline.from_pretrained(
+                    BASE_MODEL_LOCAL_PATH,
+                    torch_dtype=torch.bfloat16,
+                    local_files_only=True,
+                    use_safetensors=True
+                )
+
+            # Load NSFW weights
+            if not os.path.exists(NSFW_WEIGHTS_LOCAL_PATH):
+                print(f"Downloading NSFW weights...")
+                os.makedirs(os.path.dirname(NSFW_WEIGHTS_LOCAL_PATH), exist_ok=True)
+                v23_path = hf_hub_download(
+                    repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
+                    filename="v23/Qwen-Rapid-AIO-NSFW-v23.safetensors",
+                    cache_dir=PICGEN_MODELS_DIR,
+                    local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
+                )
+            else:
+                v23_path = NSFW_WEIGHTS_LOCAL_PATH
+
+            state_dict = load_file(v23_path)
+            transformer_weights = {}
+            vae_weights = {}
+            text_encoder_weights = {}
+
+            for k, v in state_dict.items():
+                if k.startswith("model.diffusion_model."):
+                    transformer_weights[k.replace("model.diffusion_model.", "")] = v
+                elif k.startswith("transformer."):
+                    transformer_weights[k.replace("transformer.", "")] = v
+                elif k.startswith("first_stage_model."):
+                    vae_weights[k.replace("first_stage_model.", "")] = v
+                elif k.startswith("vae."):
+                    vae_weights[k.replace("vae.", "")] = v
+                elif "text_encoder" in k or "conditioner" in k:
+                    if "conditioner.embedders.0." in k:
+                        text_encoder_weights[k.replace("conditioner.embedders.0.", "")] = v
+                    elif "text_encoder." in k:
+                        text_encoder_weights[k.replace("text_encoder.", "")] = v
+
+            if transformer_weights:
+                pipe.transformer.load_state_dict(transformer_weights, strict=False)
+            if vae_weights:
+                pipe.vae.load_state_dict(vae_weights, strict=False)
+            if text_encoder_weights:
+                pipe.text_encoder.load_state_dict(text_encoder_weights, strict=False)
+
+            del state_dict, transformer_weights, vae_weights, text_encoder_weights
+
+            pipe.vae.enable_tiling()
+            pipe.vae.enable_slicing()
+            # Keep on CPU for now, will move to GPU when needed
+            pipe.to("cpu")
+            pic_pipe = pipe
+            print(f"✅ Qwen loaded to CPU in {time.time()-t:.1f}s — Replace/Custom modes ready!")
+        except Exception as e:
+            print(f"❌ Background Qwen load failed: {e}")
+            pic_pipe = None
+    
+    threading.Thread(target=_bg_qwen_load, daemon=True).start()
     
 else:
     # PICGEN MODE: Load Qwen to GPU first
@@ -2233,23 +2312,9 @@ with gr.Blocks(css=css) as demo:
                         label="Scene Handling",
                         info=(
                             "Keep = photo animated untouched, background and bodies "
-                            "identical. Replace = new environment, subjects preserved. "
-                            "Custom = your own edit instruction."
+                            "identical. Replace = new environment with motion prompt. "
+                            "Custom = motion prompt applied as direct edit instruction."
                         ),
-                    )
-                    edit_instruction = gr.Textbox(
-                        label="Custom Edit Instruction",
-                        value="",
-                        lines=2,
-                        visible=False,
-                        placeholder="Applied verbatim to the frame before animation.",
-                    )
-                    
-                    # Show/hide edit_instruction based on scene_mode
-                    scene_mode.change(
-                        fn=lambda mode: gr.update(visible=(mode == MODE_CUSTOM)),
-                        inputs=[scene_mode],
-                        outputs=[edit_instruction],
                     )
 
                     with gr.Row():
@@ -2434,7 +2499,7 @@ with gr.Blocks(css=css) as demo:
             generate_btn.click(
                 fn=generate_video,
                 inputs=[
-                    reference_image, vid_prompt, scene_mode, edit_instruction,
+                    reference_image, vid_prompt, scene_mode,
                     end_image, duration_seconds, resolution, frame_multiplier,
                     export_quality, seed, randomize_seed, add_audio_cb,
                     audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
@@ -2512,6 +2577,29 @@ with gr.Blocks(css=css) as demo:
                 fn=get_frame_as_file,
                 inputs=[video_file, frame_time_input],
                 outputs=[download_file_output],
+            )
+
+            # Track reference_image uploads to protect new images from clear_storage
+            def track_new_upload(img):
+                """Update tracking when user uploads new image during generation."""
+                global _current_input_image_path
+                if img is None or img == "":
+                    _current_input_image_path = None
+                    print("🔓 Input image cleared, no longer protected")
+                elif isinstance(img, str):
+                    _current_input_image_path = img
+                    print(f"🔒 New input image tracked: {img}")
+            
+            reference_image.upload(
+                fn=track_new_upload,
+                inputs=[reference_image],
+                outputs=None,
+            )
+            
+            reference_image.clear(
+                fn=track_new_upload,
+                inputs=[reference_image],
+                outputs=None,
             )
 
         # ------------------------------------------------------------------ #
@@ -2757,10 +2845,11 @@ with gr.Blocks(css=css) as demo:
     function startVideoSync() {
         const video = document.querySelector('#generated-video video');
         if (!video) { setTimeout(startVideoSync, 500); return; }
-        // Update the number input every 100ms while video is playing
+        // Update the number input every 200ms while video is playing
         setInterval(() => {
             const input = document.querySelector('#frame-time-input input');
-            if (input && !isNaN(video.currentTime)) {
+            // Only update if input exists, video time is valid, and user is NOT actively editing the field
+            if (input && !isNaN(video.currentTime) && document.activeElement !== input) {
                 const nativeInput = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
                 if (nativeInput && nativeInput.set) {
                     nativeInput.set.call(input, video.currentTime.toFixed(2));
@@ -2867,5 +2956,8 @@ if __name__ == "__main__":
                 import traceback; traceback.print_exc()
 
         threading.Thread(target=_bg_load, daemon=True).start()
+
+
+
 
 
