@@ -510,6 +510,9 @@ wan_pipe = None
 _wan_loaded = False
 _wan_scheduler_config = None
 
+# Track current input image path to exclude from clear_storage
+_current_input_image_path = None
+
 
 def _set_flow_shift(pipe, flow_shift):
     """
@@ -1052,6 +1055,16 @@ def generate_video(
     
     No interpolation by default (frame_multiplier=16 = native 16fps).
     """
+    global _current_input_image_path
+    
+    # Track the current input image path if it's a filepath (for clear_storage exclusion)
+    if isinstance(reference_image, str):
+        _current_input_image_path = reference_image
+    elif hasattr(reference_image, 'filename'):
+        _current_input_image_path = reference_image.filename
+    else:
+        _current_input_image_path = None
+    
     # Gradio can hand back "" instead of None for an untouched optional image
     # component — normalize both reference_image and end_image so a stray
     # empty string never reaches PIL-only code (that's what caused
@@ -2009,10 +2022,14 @@ with gr.Blocks(css=css) as demo:
         import shutil as _shutil
         import subprocess
         import time
+        global _current_input_image_path
+        
         deleted = []
         errors = []
 
         print(f"🗑️ Starting clear_storage at {time.time()}")
+        if _current_input_image_path:
+            print(f"🔒 Protecting current input image: {_current_input_image_path}")
 
         # BACKUP METHOD 1: Try relative path from current working directory
         gradio_dir_cwd = Path.cwd() / "tmp" / "gradio"
@@ -2030,6 +2047,21 @@ with gr.Blocks(css=css) as demo:
                 for item in gradio_dir.iterdir():
                     if item.name == "vibe_edit_history":
                         continue
+                    
+                    # Skip current input image file
+                    if _current_input_image_path and str(item) in str(_current_input_image_path):
+                        print(f"  Skipping current input: {item}")
+                        continue
+                    
+                    # Skip directory containing current input image
+                    if _current_input_image_path and item.is_dir():
+                        try:
+                            if any(str(_current_input_image_path).startswith(str(item)) for _ in [1]):
+                                print(f"  Skipping directory with current input: {item}")
+                                continue
+                        except:
+                            pass
+                    
                     try:
                         # Try multiple deletion methods
                         if item.is_dir():
@@ -2067,6 +2099,12 @@ with gr.Blocks(css=css) as demo:
                     # Skip other directories
                     if item.is_dir():
                         continue
+                    
+                    # Skip current input image
+                    if _current_input_image_path and str(item) in str(_current_input_image_path):
+                        print(f"  Skipping current input: {item}")
+                        continue
+                    
                     # Delete ALL loose files (including .mp4, .png, etc)
                     try:
                         try:
