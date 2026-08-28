@@ -14,6 +14,7 @@ import json
 import base64
 import hashlib
 import contextlib
+import os
 from pathlib import Path
 from io import BytesIO
 from tqdm import tqdm
@@ -30,9 +31,8 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 # ---------------------------------------------------------------------------
 # STARTUP MODE
 #
-# -vidgen (default) — Video Generator tab is shown first and, on a single-GPU
-#   box, Wan loads to GPU at startup (Qwen stays on CPU until first use).
-# -picgen — Photo Editor tab is shown first and, on a single-GPU box,
+# -vidgen (default) - Video Generator tab is shown first and, on a single-GPU
+# -picgen - Photo Editor tab is shown first and, on a single-GPU box,
 #   Qwen loads to GPU at startup instead (Wan stays on CPU until first use).
 # Has no effect with two GPUs, since neither model is ever swapped there.
 # ---------------------------------------------------------------------------
@@ -70,14 +70,14 @@ import numpy as np
 import torch
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
-# Use 'highest' to preserve strict dtype consistency — 'high' causes bfloat16/float32
+# Use 'highest' to preserve strict dtype consistency  'high' causes bfloat16/float32
 # mismatches in Qwen's text encoder during concurrent dual-GPU inference
-torch.set_float32_matmul_precision('highest')
-# Do NOT enable cudnn.benchmark — Blackwell GPUs (GB202) fail on conv3d engine search
+# Do NOT enable cudnn.benchmark - Blackwell GPUs (GB202) fail on conv3d engine search
+# Do NOT enable cudnn.benchmark  Blackwell GPUs (GB202) fail on conv3d engine search
 torch.backends.cudnn.benchmark = False
 torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-# Do not fix thread counts — multi-GPU concurrent inference needs flexible threading
+# Do not fix thread counts - multi-GPU concurrent inference needs flexible threading
+# Do not fix thread counts  multi-GPU concurrent inference needs flexible threading
 
 # Suppress noisy library warnings after torch is imported
 logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
@@ -175,13 +175,13 @@ from prompts import (
 
 def extract_frame(video_path, timestamp):
     """Extract frame from video, save as JPG, and return file path."""
-    print(f"🎞️  [extract_frame] Starting extraction...")
+    print(f"  [extract_frame] Starting extraction...")
     print(f"   - video_path: {video_path}")
     print(f"   - timestamp: {timestamp}")
     
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(f"❌ [extract_frame] Failed to open video file")
+        print(f" [extract_frame] Failed to open video file")
         return None
     
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -200,7 +200,7 @@ def extract_frame(video_path, timestamp):
     cap.release()
     
     if ret:
-        print(f"✅ [extract_frame] Frame read successfully")
+        print(f" [extract_frame] Frame read successfully")
         print(f"   - Frame shape: {frame.shape}")
         
         # Save frame as high-quality JPG file
@@ -208,10 +208,10 @@ def extract_frame(video_path, timestamp):
         print(f"   - Saving to: {output_path}")
         
         cv2.imwrite(str(output_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 100])
-        print(f"✅ [extract_frame] Frame saved successfully\n")
+        print(f" [extract_frame] Frame saved successfully\n")
         return str(output_path)
     else:
-        print(f"❌ [extract_frame] Failed to read frame at position {frame_number}\n")
+        print(f" [extract_frame] Failed to read frame at position {frame_number}\n")
         return None
 
 
@@ -247,14 +247,14 @@ AGGRESSIVE_OPTIMIZATION = True
 
 _gpu_count = torch.cuda.device_count()
 if _gpu_count < 1:
-    raise RuntimeError("No CUDA device visible — this app requires a GPU.")
+    raise RuntimeError("No CUDA device visible  this app requires a GPU.")
 
 DUAL_GPU = _gpu_count >= 2 and os.environ.get("NEWGEN_FORCE_SINGLE_GPU") != "1"
 PIC_DEVICE = "cuda:0"
 WAN_DEVICE = "cuda:1" if DUAL_GPU else "cuda:0"
 
 if DUAL_GPU:
-    print(f"Dual GPU: Qwen → {PIC_DEVICE}, Wan → {WAN_DEVICE}. Both load at startup, no swapping.")
+    print(f"Dual GPU: Qwen -> {PIC_DEVICE}, Wan -> {WAN_DEVICE}. Both load at startup, no swapping.")
 
 # Separate queues in dual GPU mode so both tabs run concurrently
 PIC_QUEUE_ID = "pic-gpu" if DUAL_GPU else "gpu"
@@ -301,7 +301,7 @@ def interpolate_bits(frames_np, multiplier=2, scale=1.0):
         if t.dtype != torch.float32:
             t = t.float()
         t = t.permute(2, 0, 1).unsqueeze(0)
-        # float32 to match flownet — see the note at model load.
+        # float32 to match flownet  see the note at model load.
         return F.pad(t, padding)
 
     def from_tensor(tensor):
@@ -458,7 +458,7 @@ def add_audio_to_video(video_path: str, audio_prompt: str, duration_sec: float) 
 
 
 # ---------------------------------------------------------------------------
-# WAN 2.2 I2V A14B — MERGED 4-STEP DISTILL (BF16, no LoRA)
+# WAN 2.2 I2V A14B  MERGED 4-STEP DISTILL (BF16, no LoRA)
 #
 # Weights: lightx2v/Wan2.2-Distill-Models
 #   wan2.2_i2v_A14b_high_noise_lightx2v_4step.safetensors  (28.6 GB)
@@ -474,7 +474,7 @@ def add_audio_to_video(video_path: str, audio_prompt: str, duration_sec: float) 
 MAX_SEED = np.iinfo(np.int32).max
 
 # ---------------------------------------------------------------------------
-# WAN 2.2 I2V MODEL — WAMU v2 LIGHTNING (NSFW)
+# WAN 2.2 I2V MODEL  WAMU v2 LIGHTNING (NSFW)
 #
 # WAMU v2 is a Wan 2.2 I2V Lightning merge trained on explicit content.
 # This is a complete diffusers pipeline (transformer + transformer_2 + vae +
@@ -483,7 +483,364 @@ MAX_SEED = np.iinfo(np.int32).max
 # ---------------------------------------------------------------------------
 
 WAN_MODEL_REPO = "TestOrganizationPleaseIgnore/WAMU_v2_WAN2.2_I2V_LIGHTNING"
-print(f"Video model: WAMU v2 — Wan 2.2 I2V Lightning merge (NSFW-capable)")
+print(f"Video model: WAMU v2  Wan 2.2 I2V Lightning merge (NSFW-capable)")
+
+# ---------------------------------------------------------------------------
+# LORA MANAGEMENT
+# ---------------------------------------------------------------------------
+LORA_DIR = Path(SCRIPT_DIR) / "loras"
+LORA_DIR.mkdir(exist_ok=True)
+LORA_CONFIG_FILE = LORA_DIR / "loras.json"
+
+def load_lora_config():
+    """Load LoRA configuration from JSON file."""
+    if not LORA_CONFIG_FILE.exists():
+        return {}
+    try:
+        with open(LORA_CONFIG_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading LoRA config: {e}")
+        return {}
+
+def save_lora_config(config):
+    """Save LoRA configuration to JSON file."""
+    try:
+        with open(LORA_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"Error saving LoRA config: {e}")
+        return False
+
+def download_lora_file(url, filename, progress_callback=None):
+    """Download a LoRA file from URL with progress display."""
+    import requests
+    
+    output_path = LORA_DIR / filename
+    if output_path.exists():
+        print(f" {filename} already exists")
+        return True, "File already exists"
+    
+    try:
+        print(f"\n Downloading {filename}")
+        print(f"   Source: {url}")
+        
+        response = requests.get(url, stream=True, timeout=60)
+        response.raise_for_status()
+        
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded = 0
+        
+        # Use tqdm for progress display (like model downloads)
+        with open(output_path, 'wb') as f:
+            with tqdm(total=total_size, unit='B', unit_scale=True, unit_divisor=1024, desc=filename) as pbar:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        chunk_size = len(chunk)
+                        downloaded += chunk_size
+                        pbar.update(chunk_size)
+                        
+                        # Also call callback if provided
+                        if progress_callback and total_size > 0:
+                            progress_callback(downloaded / total_size)
+        
+        print(f" Downloaded: {filename}\n")
+        return True, "Download complete"
+    except Exception as e:
+        print(f" Download failed: {e}\n")
+        if output_path.exists():
+            output_path.unlink()
+        return False, str(e)
+
+def check_lora_status(config):
+    """Check which LoRAs are downloaded."""
+    status = {}
+    for lora_id, lora_info in config.items():
+        high_exists = False
+        low_exists = False
+        
+        if lora_info.get('high_filename'):
+            high_path = LORA_DIR / lora_info['high_filename']
+            high_exists = high_path.exists()
+        
+        if lora_info.get('low_filename'):
+            low_path = LORA_DIR / lora_info['low_filename']
+            low_exists = low_path.exists()
+        
+        status[lora_id] = {
+            'high_exists': high_exists,
+            'low_exists': low_exists,
+            'high_downloadable': bool(lora_info.get('high_url')),
+            'low_downloadable': bool(lora_info.get('low_url')),
+        }
+    
+    return status
+
+def discover_loras():
+    """Auto-discover all .safetensors LoRA files and merge with config."""
+    # Load config first
+    config = load_lora_config()
+    loras = {}
+    
+    # Add configured LoRAs
+    for lora_id, lora_info in config.items():
+        loras[lora_id] = {
+            'display_name': lora_info.get('display_name', lora_id),
+            'description': lora_info.get('description', ''),
+            'high': str(LORA_DIR / lora_info['high_filename']) if lora_info.get('high_filename') and (LORA_DIR / lora_info['high_filename']).exists() else None,
+            'low': str(LORA_DIR / lora_info['low_filename']) if lora_info.get('low_filename') and (LORA_DIR / lora_info['low_filename']).exists() else None,
+            'trigger_prompt': lora_info.get('trigger_prompt'),
+            'prompt_mode': lora_info.get('prompt_mode', 'append'),
+            'example_prompts': lora_info.get('example_prompts', []),
+            'high_weight': lora_info.get('high_weight', 1.0),
+            'low_weight': lora_info.get('low_weight', 1.0),
+            'recommended_steps': lora_info.get('recommended_steps'),
+            'recommended_flow_shift': lora_info.get('recommended_flow_shift'),
+            'notes': lora_info.get('notes', ''),
+            'config': lora_info,  # Keep full config for downloads
+        }
+    
+    # Also discover any unconfigured LoRAs in folder
+    if LORA_DIR.exists():
+        for lora_file in LORA_DIR.glob("*.safetensors"):
+            filename = lora_file.name
+            # Check if already in config
+            already_configured = False
+            for lora_info in config.values():
+                if filename in [lora_info.get('high_filename'), lora_info.get('low_filename')]:
+                    already_configured = True
+                    break
+            
+            if not already_configured:
+                # Parse high/low from filename
+                filename_lower = filename.lower()
+                if "_high" in filename_lower or "_high_" in filename_lower:
+                    noise_type = "high"
+                elif "_low" in filename_lower or "_low_" in filename_lower:
+                    noise_type = "low"
+                else:
+                    noise_type = "unknown"
+                
+                # Extract base name
+                base_name = filename.replace('.safetensors', '')
+                for suffix in ["_high_noise", "_low_noise", "_high", "_low"]:
+                    if suffix in filename_lower:
+                        idx = filename_lower.index(suffix)
+                        base_name = filename[:idx]
+                        break
+                
+                if base_name not in loras:
+                    loras[base_name] = {
+                        'display_name': base_name,
+                        'description': 'Unconfigured LoRA',
+                        'high': None,
+                        'low': None,
+                        'trigger_prompt': None,
+                        'prompt_mode': 'append',
+                        'example_prompts': [],
+                        'high_weight': 1.0,
+                        'low_weight': 1.0,
+                        'notes': 'Add to loras.json for full configuration',
+                        'config': {},
+                    }
+                
+                loras[base_name][noise_type] = str(lora_file)
+    
+    return loras
+
+# Track active LoRAs (global state)
+_active_loras = {}  # {base_name: {"high": path, "low": path}}
+
+def load_loras_to_pipeline(pipe, selected_loras):
+    """Load selected LoRAs to the Wan pipeline."""
+    global _active_loras
+    
+    if pipe is None:
+        return
+    
+    # Unload all existing LoRAs first
+    try:
+        if hasattr(pipe, 'unfuse_lora'):
+            pipe.unfuse_lora()
+        if hasattr(pipe, 'unload_lora_weights'):
+            pipe.unload_lora_weights()
+    except Exception as e:
+        print(f"Warning: Could not unload previous LoRAs: {e}")
+    
+    _active_loras = {}
+    
+    if not selected_loras:
+        print("No LoRAs selected")
+        return
+    
+    # Load selected LoRAs
+    for base_name, lora_info in selected_loras.items():
+        high_path = lora_info.get("high")
+        low_path = lora_info.get("low")
+        
+        try:
+            # Load high-noise LoRA to transformer (high-noise expert)
+            if high_path and hasattr(pipe, 'transformer'):
+                print(f"Loading high-noise LoRA: {Path(high_path).name}")
+                pipe.load_lora_weights(high_path, adapter_name=f"{base_name}_high")
+                pipe.set_adapters([f"{base_name}_high"], adapter_weights=[1.0])
+            
+            # Load low-noise LoRA to transformer_2 (low-noise expert)
+            if low_path and hasattr(pipe, 'transformer_2'):
+                print(f"Loading low-noise LoRA: {Path(low_path).name}")
+                # Note: diffusers may need specific API for dual-transformer LoRA loading
+                # This is a simplified approach - may need adjustment based on actual API
+                
+            _active_loras[base_name] = lora_info
+            print(f" LoRA '{base_name}' loaded successfully")
+            
+        except Exception as e:
+            print(f"Failed to load LoRA '{base_name}': {e}")
+    
+    print(f"Active LoRAs: {list(_active_loras.keys())}")
+
+def apply_lora_prompt_modifications(base_prompt, selected_loras_info):
+    """Apply trigger prompts from selected LoRAs to the base prompt."""
+    modified_prompt = base_prompt
+    
+    for lora_info in selected_loras_info.values():
+        trigger = lora_info.get('trigger_prompt')
+        mode = lora_info.get('prompt_mode', 'append')
+        
+        if trigger:
+            if mode == 'append':
+                modified_prompt = f"{modified_prompt}, {trigger}"
+            elif mode == 'prepend':
+                modified_prompt = f"{trigger}, {modified_prompt}"
+            elif mode == 'replace':
+                # For replace mode, don't auto-apply - user chooses example prompts
+                pass
+    
+    return modified_prompt.strip().strip(',').strip()
+
+def check_lora_compatibility(selected_loras_info):
+    """
+    Check compatibility between selected LoRAs and return merged settings.
+    Returns: (is_compatible, compatibility_message, merged_settings)
+    """
+    if not selected_loras_info:
+        return True, "", {}
+    
+    lora_names = list(selected_loras_info.keys())
+    
+    # If only one LoRA, always compatible
+    if len(lora_names) == 1:
+        lora_info = list(selected_loras_info.values())[0]
+        return True, f" Using {lora_info['display_name']}", {
+            'recommended_steps': lora_info.get('recommended_steps'),
+            'recommended_flow_shift': lora_info.get('recommended_flow_shift'),
+            'high_weight': lora_info.get('high_weight', 1.0),
+            'low_weight': lora_info.get('low_weight', 1.0),
+        }
+    
+    # Multiple LoRAs - check compatibility
+    recommended_steps = []
+    recommended_flow_shifts = []
+    high_weights = []
+    low_weights = []
+    warnings = []
+    
+    for lora_id, lora_info in selected_loras_info.items():
+        if lora_info.get('recommended_steps'):
+            recommended_steps.append(lora_info['recommended_steps'])
+        if lora_info.get('recommended_flow_shift'):
+            recommended_flow_shifts.append(lora_info['recommended_flow_shift'])
+        high_weights.append(lora_info.get('high_weight', 1.0))
+        low_weights.append(lora_info.get('low_weight', 1.0))
+    
+    # Check if settings are compatible
+    steps_compatible = len(set(recommended_steps)) <= 1 if recommended_steps else True
+    flow_compatible = len(set(recommended_flow_shifts)) <= 1 if recommended_flow_shifts else True
+    
+    # Generate compatibility message
+    display_names = [info['display_name'] for info in selected_loras_info.values()]
+    
+    if not steps_compatible:
+        warnings.append(f" Step conflict: {', '.join(map(str, set(recommended_steps)))} steps recommended")
+    
+    if not flow_compatible:
+        warnings.append(f" Flow shift conflict: {', '.join(map(str, set(recommended_flow_shifts)))}")
+    
+    # Determine merged settings
+    merged_steps = recommended_steps[0] if steps_compatible and recommended_steps else None
+    merged_flow = recommended_flow_shifts[0] if flow_compatible and recommended_flow_shifts else None
+    
+    # Average weights when combining
+    merged_high_weight = sum(high_weights) / len(high_weights)
+    merged_low_weight = sum(low_weights) / len(low_weights)
+    
+    is_compatible = steps_compatible and flow_compatible
+    
+    if is_compatible:
+        message = f" Compatible: {', '.join(display_names)}"
+    else:
+        message = f" Combining: {', '.join(display_names)}\n" + '\n'.join(warnings)
+    
+    merged_settings = {
+        'recommended_steps': merged_steps,
+        'recommended_flow_shift': merged_flow,
+        'high_weight': merged_high_weight,
+        'low_weight': merged_low_weight,
+    }
+    
+    return is_compatible, message, merged_settings
+
+def apply_lora_settings(selected_loras_info, user_steps, user_flow_shift, flow_shift_auto):
+    """
+    Apply LoRA-recommended settings, allowing user overrides.
+    Returns: (final_steps, final_flow_shift, settings_message)
+    """
+    if not selected_loras_info:
+        return user_steps, user_flow_shift, ""
+    
+    # Check compatibility
+    is_compatible, compat_msg, merged_settings = check_lora_compatibility(selected_loras_info)
+    
+    messages = [compat_msg]
+    
+    # Apply recommended steps (if user hasn't overridden)
+    final_steps = user_steps
+    if merged_settings.get('recommended_steps'):
+        recommended = merged_settings['recommended_steps']
+        if user_steps == recommended:
+            final_steps = recommended
+            messages.append(f"Using LoRA steps: {recommended}")
+        else:
+            messages.append(f"Using your steps: {user_steps} (override active, LoRA recommends {recommended})")
+    
+    # Apply recommended flow_shift (if user hasn't overridden and not in auto mode)
+    final_flow_shift = user_flow_shift
+    if not flow_shift_auto and merged_settings.get('recommended_flow_shift'):
+        recommended = merged_settings['recommended_flow_shift']
+        if user_flow_shift == WAN_FLOW_SHIFT:  # User hasn't changed from default
+            final_flow_shift = recommended
+            messages.append(f"Auto-set flow_shift: {recommended} (LoRA recommendation)")
+        else:
+            messages.append(f"Using your flow_shift: {user_flow_shift} (override active, LoRA recommends {recommended})")
+    
+    settings_message = '\n'.join(messages)
+    return final_steps, final_flow_shift, settings_message
+
+# Discover LoRAs at startup
+LORA_CONFIG = load_lora_config()
+AVAILABLE_LORAS = discover_loras()
+LORA_STATUS = check_lora_status(LORA_CONFIG)
+
+print(f"Found {len(AVAILABLE_LORAS)} LoRA(s) in {LORA_DIR}")
+for lora_id, info in AVAILABLE_LORAS.items():
+    status = LORA_STATUS.get(lora_id, {})
+    high_status = "OK" if info['high'] else ("DL" if status.get('high_downloadable') else "X")
+    low_status = "OK" if info['low'] else ("DL" if status.get('low_downloadable') else "X")
+    print(f"  - {info['display_name']}: high={high_status}, low={low_status}")
+
+# ---------------------------------------------------------------------------
 
 # 16 fps is what Wan-AI's own diffusers example for I2V-A14B exports at.
 # (The 24 fps figure in the Wan 2.2 docs refers to the TI2V-5B model.)
@@ -495,7 +852,7 @@ WAN_FLOW_SHIFT = 6.9
 WAN_GUIDANCE = 1.0
 
 MIN_FRAMES_MODEL = 8
-MAX_FRAMES_MODEL = 97       # 6s per segment (97 frames ÷ 16 fps = 6.06s) — keeps quality high
+MAX_FRAMES_MODEL = 97       # 6s per segment (97 frames 16 fps = 6.06s)  keeps quality high
 SEGMENT_DURATION = round(MAX_FRAMES_MODEL / FIXED_FPS, 1)   # ~6.1s per segment
 MIN_DURATION = round(MIN_FRAMES_MODEL / FIXED_FPS, 1)
 MAX_DURATION = 600.0        # 10 minutes max via chaining
@@ -539,7 +896,7 @@ def _set_flow_shift(pipe, flow_shift):
         cfg[key] = float(flow_shift)
         pipe.scheduler = type(pipe.scheduler).from_config(cfg)
     except Exception as e:
-        print(f"Could not apply flow_shift={flow_shift} ({e}) — keeping default.")
+        print(f"Could not apply flow_shift={flow_shift} ({e})  keeping default.")
 
 
 _wan_load_lock = threading.Lock()
@@ -579,7 +936,7 @@ def _build_wan_pipeline(target_device="cpu"):
     global wan_pipe, _wan_loaded, _wan_scheduler_config
 
     if target_device == "cpu":
-        # CPU load — standard path for single-GPU swap mode
+        # CPU load  standard path for single-GPU swap mode
         pipeline = WanImageToVideoPipeline.from_pretrained(
             WAN_MODEL_REPO,
             torch_dtype=torch.bfloat16,
@@ -587,11 +944,11 @@ def _build_wan_pipeline(target_device="cpu"):
             device_map=None,
             use_safetensors=True
         )
-        print(f"🎯 WAMU v2 loaded to CPU (ready for fast swapping)")
+        print(f" WAMU v2 loaded to CPU (ready for fast swapping)")
     else:
         # Load to CPU then move to target GPU.
         # device_map doesn't support specific device indices in this diffusers version.
-        # The .to() call is a fast VRAM transfer — no computation, just memory copy.
+        # The .to() call is a fast VRAM transfer  no computation, just memory copy.
         pipeline = WanImageToVideoPipeline.from_pretrained(
             WAN_MODEL_REPO,
             torch_dtype=torch.bfloat16,
@@ -601,7 +958,7 @@ def _build_wan_pipeline(target_device="cpu"):
         )
         pipeline = pipeline.to(target_device)
         torch.cuda.synchronize(target_device)
-        print(f"🎯 WAMU v2 loaded directly to {target_device} - Ready for video generation!")
+        print(f" WAMU v2 loaded directly to {target_device} - Ready for video generation!")
 
     _wan_scheduler_config = dict(pipeline.scheduler.config)
     pipeline.vae.enable_slicing()
@@ -633,7 +990,7 @@ def model_title():
         "Single GPU: models swap on demand."
     )
     return (
-        "## 🎬 WAMU v2 — Wan 2.2 I2V Lightning (NSFW)\n"
+        "##  WAMU v2  Wan 2.2 I2V Lightning (NSFW)\n"
         f"4-step distilled merge. No LoRAs. {gpu_note}"
     )
 
@@ -720,10 +1077,10 @@ def get_num_frames(duration_seconds: float) -> int:
 # ---------------------------------------------------------------------------
 # SCENE MODES
 #
-# Keep scene      — no image editing at all. The photo goes straight to Wan, so
+# Keep scene       no image editing at all. The photo goes straight to Wan, so
 #                   background, bodies and framing stay pixel-identical.
-# Replace scene   — Qwen repaints the environment around the subjects first.
-# Custom edit     — Qwen applies your edit instruction verbatim, no template.
+# Replace scene    Qwen repaints the environment around the subjects first.
+# Custom edit      Qwen applies your edit instruction verbatim, no template.
 # ---------------------------------------------------------------------------
 
 MODE_KEEP = "Keep original scene"
@@ -732,7 +1089,7 @@ MODE_CUSTOM = "Custom edit instruction"
 SCENE_MODES = [MODE_KEEP, MODE_REPLACE, MODE_CUSTOM]
 
 RELOCATE_INSTRUCTION = (
-    "Keep the people exactly as they are — identical faces, facial features, "
+    "Keep the people exactly as they are  identical faces, facial features, "
     "hair, body shape, proportions and skin tone. Do not alter their identity "
     "or their bodies. Replace the entire background and environment with: "
     "{prompt}. Relight the subjects to match the new environment."
@@ -792,13 +1149,13 @@ def edit_reference_frame(
     guidance: float,
 ) -> Image.Image:
     """
-    Optional stage 1 — Qwen Image Edit prepares the starting frame.
+    Optional stage 1  Qwen Image Edit prepares the starting frame.
 
     Returns the image untouched in keep-scene mode, so nothing is repainted and
     the original background and bodies survive exactly as shot.
     """
     if mode == MODE_KEEP:
-        print("[1/2] Keep-scene mode — reference frame used as-is.")
+        print("[1/2] Keep-scene mode  reference frame used as-is.")
         return image
 
     # Both MODE_REPLACE and MODE_CUSTOM now use the motion prompt
@@ -817,7 +1174,7 @@ def edit_reference_frame(
     activate_pic()
     swap_time = time.time() - swap_start
     if swap_time > 3.0:
-        print(f"⚡ Model swap completed in {swap_time:.1f}s")
+        print(f" Model swap completed in {swap_time:.1f}s")
 
     torch.cuda.set_device(PIC_DEVICE)
     with torch.cuda.device(PIC_DEVICE):
@@ -845,14 +1202,34 @@ def animate_frame(
     seed: int,
     flow_shift: float = None,
     wan_steps: int = None,
+    lora_selections=None,
+    selected_loras_info=None,
+    progress=None,
 ):
-    """Stage 2 — animate a frame with WAMU v2 merged model."""
+    """Stage 2  animate a frame with WAMU v2 merged model."""
     activate_wan()
+    
+    # Load LoRAs if any are selected
+    if lora_selections:
+        selected = {k: v for k, v in AVAILABLE_LORAS.items() if lora_selections.get(k, False)}
+        if selected:
+            print(f"Applying {len(selected)} LoRA(s): {list(selected.keys())}")
+            load_loras_to_pipeline(wan_pipe, selected)
+            
+            # Apply trigger prompt modifications
+            if selected_loras_info:
+                original_prompt = prompt
+                prompt = apply_lora_prompt_modifications(prompt, selected_loras_info)
+                if prompt != original_prompt:
+                    print(f"Prompt modified by LoRAs: {prompt}")
+    else:
+        # No LoRAs selected, make sure any previous LoRAs are unloaded
+        load_loras_to_pipeline(wan_pipe, {})
 
     # Use provided wan_steps, or fall back to WAN_STEPS constant
     steps = wan_steps if wan_steps is not None else WAN_STEPS
 
-    # Pin to WAN_DEVICE — prevents cross-device leakage in dual GPU mode
+    # Pin to WAN_DEVICE  prevents cross-device leakage in dual GPU mode
     with torch.cuda.device(WAN_DEVICE):
         # Apply flow shift if provided, otherwise use WAMU v2 default (6.9)
         _set_flow_shift(wan_pipe, flow_shift if flow_shift is not None else WAN_FLOW_SHIFT)
@@ -880,7 +1257,7 @@ def animate_frame(
         try:
             return wan_pipe(last_image=last_frame, **kwargs).frames[0]
         except TypeError as e:
-            print(f"End frame not supported by this pipeline ({e}) — ignoring it.")
+            print(f"End frame not supported by this pipeline ({e})  ignoring it.")
             return wan_pipe(**kwargs).frames[0]
 
 
@@ -1041,12 +1418,13 @@ def generate_video(
     seed=42,
     randomize_seed=True,
     add_audio_cb=False,
-    audio_prompt_tb="realistic female vocalizations and breathing that match the woman's physical characteristics visible in the video, natural voice pitch and tone corresponding to her body size and appearance, intimate sounds, soft ambient atmosphere",
+    audio_prompt_tb="realistic female breathing that matches the woman's movements and actions in video",
     negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
     flow_shift_auto=True,
     flow_shift=None,
+    *lora_args,  # Variable number of LoRA checkbox states
     progress=gr.Progress(track_tqdm=True),
 ):
     """
@@ -1060,6 +1438,23 @@ def generate_video(
     """
     global _current_input_image_path
     
+    # Convert LoRA checkbox args to dictionary and collect info
+    lora_selections = {}
+    selected_loras_info = {}
+    if lora_args and len(lora_args) == len(AVAILABLE_LORAS):
+        for (lora_id, lora_info), is_enabled in zip(AVAILABLE_LORAS.items(), lora_args):
+            lora_selections[lora_id] = is_enabled
+            if is_enabled:
+                selected_loras_info[lora_id] = lora_info
+    
+    # Apply LoRA-recommended settings (with user override support)
+    if selected_loras_info:
+        edit_steps, flow_shift, lora_settings_msg = apply_lora_settings(
+            selected_loras_info, edit_steps, flow_shift, flow_shift_auto
+        )
+        if lora_settings_msg:
+            print(lora_settings_msg)
+    
     # Track the current input image path if it's a filepath (for clear_storage exclusion)
     if isinstance(reference_image, str):
         _current_input_image_path = reference_image
@@ -1069,7 +1464,7 @@ def generate_video(
         _current_input_image_path = None
     
     # Gradio can hand back "" instead of None for an untouched optional image
-    # component — normalize both reference_image and end_image so a stray
+    # component  normalize both reference_image and end_image so a stray
     # empty string never reaches PIL-only code (that's what caused
     # `'str' object has no attribute 'size'` on end_image).
     reference_image = _ensure_pil(reference_image)
@@ -1080,7 +1475,7 @@ def generate_video(
     if not prompt or not prompt.strip():
         raise gr.Error("Please enter a prompt describing the motion and scene.")
     
-    # 🎯 ADAPTIVE FLOW SHIFT: Auto-adjust based on duration for better prompt following
+    #  ADAPTIVE FLOW SHIFT: Auto-adjust based on duration for better prompt following
     if flow_shift_auto:
         # Auto mode: calculate optimal flow shift based on duration
         if duration_seconds <= 6.0:
@@ -1096,13 +1491,13 @@ def generate_video(
             # Very long videos: Minimum flow shift to prioritize prompt
             adaptive_flow_shift = 4.0
         
-        print(f"🎯 Auto flow_shift: {adaptive_flow_shift:.1f} (duration: {duration_seconds}s)")
+        print(f" Auto flow_shift: {adaptive_flow_shift:.1f} (duration: {duration_seconds}s)")
         flow_shift = adaptive_flow_shift
     else:
         # Manual mode: use user-specified flow_shift
         if flow_shift is None:
             flow_shift = WAN_FLOW_SHIFT
-        print(f"🎯 Manual flow_shift: {flow_shift} (user override)")
+        print(f" Manual flow_shift: {flow_shift} (user override)")
 
     if not negative_prompt or not str(negative_prompt).strip():
         negative_prompt = default_negative_prompt
@@ -1141,6 +1536,9 @@ def generate_video(
             raw_frames = animate_frame(
                 current_frame, seg_end, prompt, negative_prompt,
                 num_frames, seg_seed, flow_shift, edit_steps,
+                lora_selections,
+                selected_loras_info,
+                progress,
             )
 
             # RIFE interpolation, per segment, before export.
@@ -1167,7 +1565,7 @@ def generate_video(
             # Chain: the next segment starts where this one ended.
             nxt = _last_frame_of(seg_path)
             if nxt is None:
-                print("Could not read segment tail frame — stopping chain here.")
+                print("Could not read segment tail frame  stopping chain here.")
                 break
             current_frame = nxt
             seg_seed = random.randint(0, MAX_SEED)
@@ -1203,9 +1601,9 @@ def generate_video(
             shutil.move(final_path, named_path)
             final_path = str(named_path)
         except Exception as e:
-            print(f"Could not rename output ({e}) — serving original path.")
+            print(f"Could not rename output ({e})  serving original path.")
 
-        print(f"Done in {time.time() - started:.1f}s — {seg_index} segment(s), "
+        print(f"Done in {time.time() - started:.1f}s  {seg_index} segment(s), "
               f"seed {current_seed} -> {os.path.basename(final_path)}")
         return final_path, final_path
 
@@ -1229,23 +1627,23 @@ PICGEN_MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 BASE_MODEL_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "Qwen-Image-Edit-2511")
 NSFW_WEIGHTS_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "rapid-aio", "v23", "Qwen-Rapid-AIO-NSFW-v23.safetensors")
 
-# 🚀 PRIMARY MODEL LOADING
+#  PRIMARY MODEL LOADING
 if DUAL_GPU:
     # DUAL GPU: Load both models to their dedicated GPUs simultaneously at startup
-    print(f"🚀 DUAL GPU: Loading Wan → {WAN_DEVICE} and Qwen → {PIC_DEVICE} simultaneously...")
+    print(f" DUAL GPU: Loading Wan -> {WAN_DEVICE} and Qwen -> {PIC_DEVICE} simultaneously...")
     
     def _load_wan_thread():
         global wan_pipe_primary
         t = time.time()
         torch.cuda.set_device(WAN_DEVICE)
         wan_pipe_primary = _load_wan(WAN_DEVICE)
-        print(f"✅ WAN ready on {WAN_DEVICE} in {time.time()-t:.1f}s")
+        print(f" WAN ready on {WAN_DEVICE} in {time.time()-t:.1f}s")
     
     def _load_qwen_thread():
         global pic_pipe
         t = time.time()
         torch.cuda.set_device(PIC_DEVICE)
-        print("🚀 Loading Qwen Image Edit pipeline...")
+        print(" Loading Qwen Image Edit pipeline...")
         model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
         if not os.path.exists(model_index_path):
             print(f"Downloading Qwen base model to {BASE_MODEL_LOCAL_PATH}...")
@@ -1302,7 +1700,7 @@ if DUAL_GPU:
         pipe.vae.enable_slicing()
         pipe.to(PIC_DEVICE)
         pic_pipe = pipe
-        print(f"✅ Qwen ready on {PIC_DEVICE} in {time.time()-t:.1f}s")
+        print(f" Qwen ready on {PIC_DEVICE} in {time.time()-t:.1f}s")
 
     t_wan = threading.Thread(target=_load_wan_thread, daemon=False)
     t_qwen = threading.Thread(target=_load_qwen_thread, daemon=False)
@@ -1311,23 +1709,23 @@ if DUAL_GPU:
     t_wan.join()
     t_qwen.join()
     _active_model = "both"
-    print(f"✅ DUAL GPU READY — Vidgen on {WAN_DEVICE}, Picgen on {PIC_DEVICE}")
+    print(f" DUAL GPU READY  Vidgen on {WAN_DEVICE}, Picgen on {PIC_DEVICE}")
 
 elif STARTUP_MODE == "vidgen":
-    print("🚀 VIDGEN DEFAULT: Loading Wan to GPU first for immediate use...")
+    print(" VIDGEN DEFAULT: Loading Wan to GPU first for immediate use...")
     start_primary = time.time()
     
     # Load Wan directly to GPU
     wan_pipe_primary = _load_wan(WAN_DEVICE)
     _active_model = "wan"
     primary_load_time = time.time() - start_primary
-    print(f"✅ WAN READY ON GPU in {primary_load_time:.1f}s - Vidgen functional!")
+    print(f" WAN READY ON GPU in {primary_load_time:.1f}s - Vidgen functional!")
     
     # Load Qwen to CPU in background for fast first Replace/Custom mode use
     pic_pipe = None
     def _bg_qwen_load():
         global pic_pipe
-        print("📦 Background: Loading Qwen to CPU for Replace/Custom modes...")
+        print("Background: Loading Qwen to CPU for Replace/Custom modes...")
         t = time.time()
         try:
             model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
@@ -1395,19 +1793,19 @@ elif STARTUP_MODE == "vidgen":
             # Keep on CPU for now, will move to GPU when needed
             pipe.to("cpu")
             pic_pipe = pipe
-            print(f"✅ Qwen loaded to CPU in {time.time()-t:.1f}s — Replace/Custom modes ready!")
+            print(f" Qwen loaded to CPU in {time.time()-t:.1f}s  Replace/Custom modes ready!")
         except Exception as e:
-            print(f"❌ Background Qwen load failed: {e}")
+            print(f" Background Qwen load failed: {e}")
             pic_pipe = None
     
     threading.Thread(target=_bg_qwen_load, daemon=True).start()
     
 else:
     # PICGEN MODE: Load Qwen to GPU first
-    print("🚀 PICGEN MODE: Loading Qwen to GPU first for immediate use...")
+    print(" PICGEN MODE: Loading Qwen to GPU first for immediate use...")
     
-    # 🚀 AGGRESSIVE QWEN LOADING with concurrent optimization
-    print("🚀 AGGRESSIVE LOADING: Qwen Image Edit pipeline...")
+    #  AGGRESSIVE QWEN LOADING with concurrent optimization
+    print(" AGGRESSIVE LOADING: Qwen Image Edit pipeline...")
     start_qwen = time.time()
 
     model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
@@ -1482,7 +1880,7 @@ else:
     pic_pipe.vae.to(PIC_DEVICE)
     
     qwen_time = time.time() - start_qwen
-    print(f"✅ QWEN READY ON GPU in {qwen_time:.1f}s - Picgen functional!")
+    print(f" QWEN READY ON GPU in {qwen_time:.1f}s - Picgen functional!")
     _active_model = "pic"
 
 _swap_lock = threading.Lock()
@@ -1500,7 +1898,7 @@ def _concurrent_component_load(component_loader_fn, device, component_name):
 
 def _aggressive_pipeline_load(repo_id, device, pipeline_name):
     """Aggressively load pipeline with concurrent components and memory optimization."""
-    print(f"🚀 AGGRESSIVE LOADING: {pipeline_name} to {device}")
+    print(f" AGGRESSIVE LOADING: {pipeline_name} to {device}")
     start_time = time.time()
     
     # Load with maximum optimization parameters
@@ -1557,13 +1955,13 @@ def _aggressive_pipeline_load(repo_id, device, pipeline_name):
         for future in as_completed(futures):
             component_name, load_time = future.result()
             completed_times.append(load_time)
-            print(f"    ✅ {component_name} ready ({len(completed_times)}/{total_components})")
+            print(f"     {component_name} ready ({len(completed_times)}/{total_components})")
     
     # Synchronize all GPU transfers
     torch.cuda.synchronize()
     
     total_time = time.time() - start_time
-    print(f"🎯 {pipeline_name} LOADED in {total_time:.1f}s (concurrent speedup: {sum(completed_times)/total_time:.1f}x)")
+    print(f" {pipeline_name} LOADED in {total_time:.1f}s (concurrent speedup: {sum(completed_times)/total_time:.1f}x)")
     
     return pipeline
 
@@ -1582,7 +1980,7 @@ def activate_wan():
     if _active_model == "wan":
         return
 
-    print("🚀 Fast swap to Wan...")
+    print(" Fast swap to Wan...")
     start_time = time.time()
 
     with _swap_lock:
@@ -1603,7 +2001,7 @@ def activate_wan():
 
         _active_model = "wan"
         swap_time = time.time() - start_time
-        print(f"🎯 Wan active in {swap_time:.1f}s")
+        print(f" Wan active in {swap_time:.1f}s")
 
 
 def activate_pic():
@@ -1613,7 +2011,7 @@ def activate_pic():
     if DUAL_GPU:
         # Dual GPU: Qwen is always on PIC_DEVICE, no swap needed
         if pic_pipe is None:
-            raise RuntimeError("Qwen pipeline not loaded — dual GPU startup failed.")
+            raise RuntimeError("Qwen pipeline not loaded  dual GPU startup failed.")
         return
 
     if _active_model == "pic":
@@ -1621,15 +2019,15 @@ def activate_pic():
 
     # If pic_pipe hasn't loaded yet (vidgen background load still running), wait for it
     if pic_pipe is None:
-        print("⏳ Waiting for Qwen to finish loading in background...")
+        print("Waiting for Qwen to finish loading in background...")
         wait_start = time.time()
         while pic_pipe is None:
             time.sleep(0.5)
             if time.time() - wait_start > 120:
                 raise RuntimeError("Qwen failed to load within 120 seconds")
-        print(f"✅ Qwen background load complete, proceeding with swap")
+        print(f" Qwen background load complete, proceeding with swap")
 
-    print("🚀 Fast swap to Qwen...")
+    print(" Fast swap to Qwen...")
     start_time = time.time()
 
     with _swap_lock:
@@ -1647,7 +2045,7 @@ def activate_pic():
 
         _active_model = "pic"
         swap_time = time.time() - start_time
-        print(f"🎯 Qwen active in {swap_time:.1f}s")
+        print(f" Qwen active in {swap_time:.1f}s")
 
 PICGEN_MAX_SEED = np.iinfo(np.int32).max
 
@@ -1795,7 +2193,7 @@ def infer(
     activate_pic()
     _t_active = time.time()
 
-    # Pin to PIC_DEVICE — prevents cross-device leakage in dual GPU mode
+    # Pin to PIC_DEVICE  prevents cross-device leakage in dual GPU mode
     torch.cuda.set_device(PIC_DEVICE)
     generator = torch.Generator(device=PIC_DEVICE).manual_seed(seed)
     pil_images = b64_to_pil_list(images_b64_json)
@@ -1988,7 +2386,7 @@ function init() {
             lb.style.cssText = 'display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.85);z-index:9999;align-items:center;justify-content:center;';
             lb.innerHTML = '<div style="position:relative;max-width:80vw;max-height:80vh;">'
                 + '<img id="picgen-lb-img" style="max-width:80vw;max-height:80vh;border-radius:8px;display:block;">'
-                + '<button id="picgen-lb-close" style="position:absolute;top:-14px;right:-14px;width:28px;height:28px;border-radius:50%;background:#e53e3e;color:#fff;border:none;cursor:pointer;font-size:16px;line-height:1;">✕</button>'
+                + '<button id="picgen-lb-close" style="position:absolute;top:-14px;right:-14px;width:28px;height:28px;border-radius:50%;background:#e53e3e;color:#fff;border:none;cursor:pointer;font-size:16px;line-height:1;"></button>'
                 + '</div>';
             document.body.appendChild(lb);
             lb.addEventListener('click', (e) => { if (e.target === lb) lb.style.display = 'none'; });
@@ -2090,14 +2488,14 @@ body, .gradio-container { margin: 0 !important; padding: 0 !important; max-width
 """
 
 with gr.Blocks(css=css) as demo:
-    # Clear button — outside tabs, always visible at top right
+    # Clear button  outside tabs, always visible at top right
     with gr.Row():
         gr.HTML("<div style='flex:1'></div>")  # spacer pushes button right
-        clear_storage_btn = gr.Button("🗑 Clear Storage", variant="secondary", size="sm", scale=0)
+        clear_storage_btn = gr.Button("Clear Storage", variant="secondary", size="sm", scale=0)
     clear_storage_status = gr.Textbox(visible=False, label="")
 
     def clear_storage():
-        """Delete all generated files — same as running clear.sh."""
+        """Delete all generated files  same as running clear.sh."""
         import shutil as _shutil
         import subprocess
         import time
@@ -2106,9 +2504,10 @@ with gr.Blocks(css=css) as demo:
         deleted = []
         errors = []
 
-        print(f"🗑️ Starting clear_storage at {time.time()}")
+        print(f"Starting clear_storage at {time.time()}")
+        print(f"_current_input_image_path = {repr(_current_input_image_path)}")
         if _current_input_image_path:
-            print(f"🔒 Protecting current input image: {_current_input_image_path}")
+            print(f"Protecting current input image: {_current_input_image_path}")
 
         # BACKUP METHOD 1: Try relative path from current working directory
         gradio_dir_cwd = Path.cwd() / "tmp" / "gradio"
@@ -2127,19 +2526,30 @@ with gr.Blocks(css=css) as demo:
                     if item.name == "vibe_edit_history":
                         continue
                     
-                    # Skip current input image file
-                    if _current_input_image_path and str(item) in str(_current_input_image_path):
-                        print(f"  Skipping current input: {item}")
-                        continue
+                    # Check if we should skip this item (file or directory)
+                    should_skip = False
                     
-                    # Skip directory containing current input image
-                    if _current_input_image_path and item.is_dir():
-                        try:
-                            if any(str(_current_input_image_path).startswith(str(item)) for _ in [1]):
-                                print(f"  Skipping directory with current input: {item}")
-                                continue
-                        except:
-                            pass
+                    if _current_input_image_path:
+                        protected_path = Path(_current_input_image_path)
+                        
+                        # Skip if this IS the protected file
+                        if item == protected_path:
+                            print(f"   Skipping protected file: {item}")
+                            should_skip = True
+                        
+                        # Skip if this directory CONTAINS the protected file
+                        elif item.is_dir():
+                            try:
+                                # Check if protected path is inside this directory
+                                protected_path.relative_to(item)
+                                print(f"   Skipping directory containing protected file: {item}")
+                                should_skip = True
+                            except ValueError:
+                                # Not a parent directory, can delete
+                                pass
+                    
+                    if should_skip:
+                        continue
                     
                     try:
                         # Try multiple deletion methods
@@ -2214,7 +2624,7 @@ with gr.Blocks(css=css) as demo:
                 )
                 break
 
-        # 2. outputs/images — delete contents, keep folder
+        # 2. outputs/images  delete contents, keep folder
         # Try multiple paths
         for images_dir in [IMAGE_OUTPUT_DIR, Path.cwd() / "outputs" / "images", Path("/root/newgen/outputs/images")]:
             if images_dir.exists():
@@ -2238,7 +2648,7 @@ with gr.Blocks(css=css) as demo:
                         errors.append(f"{item.name}: {e}")
                 break
 
-        # 3. outputs/videos — delete contents, keep folder
+        # 3. outputs/videos  delete contents, keep folder
         for videos_dir in [VIDEO_OUTPUT_DIR, Path.cwd() / "outputs" / "videos", Path("/root/newgen/outputs/videos")]:
             if videos_dir.exists():
                 print(f"Found videos dir at: {videos_dir}")
@@ -2261,10 +2671,10 @@ with gr.Blocks(css=css) as demo:
                         errors.append(f"{item.name}: {e}")
                 break
 
-        print(f"🗑️ Finished clear_storage. Deleted {len(deleted)} items, {len(errors)} errors")
+        print(f"Finished clear_storage. Deleted {len(deleted)} items, {len(errors)} errors")
         if errors:
-            return gr.update(visible=True, value=f"⚠️ Done with errors: {'; '.join(errors[:5])}")
-        return gr.update(visible=True, value=f"✅ Cleared {len(deleted)} items.")
+            return gr.update(visible=True, value=f" Done with errors: {'; '.join(errors[:5])}")
+        return gr.update(visible=True, value=f" Cleared {len(deleted)} items.")
 
 
 
@@ -2281,9 +2691,9 @@ with gr.Blocks(css=css) as demo:
     with gr.Tabs(selected=(0 if STARTUP_MODE == "vidgen" else 1)):
 
         # ------------------------------------------------------------------ #
-        #  TAB 1 — VIDEO GENERATOR (Qwen relocate -> Wan 2.2 4-step animate)  #
+        #  TAB 1  VIDEO GENERATOR (Qwen relocate -> Wan 2.2 4-step animate)  #
         # ------------------------------------------------------------------ #
-        with gr.Tab("🎬 Video Generator"):
+        with gr.Tab(" Video Generator"):
             gr.Markdown(model_title())
 
             with gr.Row():
@@ -2336,6 +2746,14 @@ with gr.Blocks(css=css) as demo:
                                 interactive=False,
                             )
                     
+                    # Steps slider - auto-updates based on selected LoRAs
+                    with gr.Row():
+                        edit_steps = gr.Slider(
+                            1, 20, value=4, step=1,
+                            label="Generation Steps",
+                            info="Auto-set by LoRAs or manually override",
+                        )
+                    
                     # Enable/disable flow_shift slider based on auto checkbox
                     def update_flow_shift_interactivity(auto_enabled):
                         if auto_enabled:
@@ -2352,7 +2770,7 @@ with gr.Blocks(css=css) as demo:
                     with gr.Row():
                         add_audio_cb = gr.Checkbox(label="Add Audio (MMAudio)", value=False)
                         audio_prompt_tb = gr.Textbox(
-                            label="Audio Prompt", value="realistic female vocalizations and breathing that match the woman's physical characteristics visible in the video, natural voice pitch and tone corresponding to her body size and appearance, intimate sounds, soft ambient atmosphere",
+                            label="Audio Prompt", value="realistic female breathing that matches the woman's movements and actions in video",
                         )
 
                 with gr.Column(scale=1):
@@ -2365,18 +2783,16 @@ with gr.Blocks(css=css) as demo:
                     
                     # Generate button directly under video output
                     generate_btn = gr.Button(
-                        "🎬 Generate Video", variant="primary", size="lg"
+                        "Generate Video", variant="primary", size="lg"
                     )
-                    
                     # Clear storage button directly under generate button
                     clear_storage_btn_vid = gr.Button(
-                        "🗑️ Clear Storage", variant="secondary", size="lg",
-                        elem_id="clear-storage-btn-vid"
+                        "Clear Storage", variant="secondary", size="lg",
                     )
                     
                     with gr.Row():
                         frame_time_input = gr.Number(
-                            label="Frame time (seconds) — auto-updates as video plays",
+                            label="Frame time (seconds) - auto-updates as video plays",
                             value=0.0,
                             minimum=0.0,
                             step=0.1,
@@ -2385,12 +2801,12 @@ with gr.Blocks(css=css) as demo:
                         )
                     with gr.Row():
                         use_as_reference_btn = gr.Button(
-                            "📌 Use Frame as Reference",
-                            scale=1,
+                            "Use Frame as Reference",
+                            "Use Frame as Reference",
                         )
                         download_frame_btn = gr.Button(
-                            "💾 Download Frame",
-                            scale=1,
+                            "Download Frame",
+                            "Download Frame",
                         )
                     
                     # Compact 4x2 grid layout for preset prompts
@@ -2446,10 +2862,221 @@ with gr.Blocks(css=css) as demo:
                         label="End Frame (optional, first segment only)",
                         type="pil",
                     )
-            # Hidden file component — populated by generate_btn and used for frame extraction
+            # Hidden file component - populated by generate_btn and used for frame extraction
             video_file = gr.File(visible=False)
-            # Download Frame output — gr.File shows a clickable download link when populated
-            download_file_output = gr.File(label="⬇ Click to Download Frame", visible=True)
+            
+            # LoRA Selection Accordion
+            lora_checkboxes = {}
+            lora_download_btns = {}
+            lora_example_dropdowns = {}
+            with gr.Accordion("LoRA Models (Optional)", open=False):
+                if AVAILABLE_LORAS:
+                    gr.Markdown(
+                        "**Select LoRAs to apply:**  \n"
+                        "Enable checkboxes to use LoRAs. Download missing files with DL buttons. "
+                        "Example prompts available for configured LoRAs."
+                    )
+                    
+                    for lora_id, lora_info in AVAILABLE_LORAS.items():
+                        status = LORA_STATUS.get(lora_id, {})
+                        display_name = lora_info.get('display_name', lora_id)
+                        
+                        # Determine download status
+                        high_exists = bool(lora_info['high'])
+                        low_exists = bool(lora_info['low'])
+                        high_downloadable = status.get('high_downloadable', False)
+                        low_downloadable = status.get('low_downloadable', False)
+                        
+                        needs_download = (not high_exists and high_downloadable) or (not low_exists and low_downloadable)
+                        can_use = high_exists or low_exists
+                        
+                        with gr.Group():
+                            with gr.Row():
+                                # Enable checkbox
+                                lora_checkboxes[lora_id] = gr.Checkbox(
+                                    label=f"{display_name}",
+                                    value=False,
+                                    interactive=can_use,
+                                    scale=3,
+                                )
+                                
+                                # Download button (if needed)
+                                if needs_download:
+                                    download_label = []
+                                    if not high_exists and high_downloadable:
+                                        download_label.append("High")
+                                    if not low_exists and low_downloadable:
+                                        download_label.append("Low")
+                                    
+                                    lora_download_btns[lora_id] = gr.Button(
+                                        f"Download {' + '.join(download_label)}",
+                                        size="sm",
+                                        scale=1,
+                                    )
+                            
+                            # Status and info in collapsible accordion
+                            high_status = "OK" if high_exists else ("DL" if high_downloadable else "X")
+                            low_status = "OK" if low_exists else ("DL" if low_downloadable else "X")
+                            
+                            with gr.Accordion(f"Status: High {high_status} | Low {low_status}", open=False):
+                                info_parts = []
+                                if lora_info.get('description'):
+                                    info_parts.append(f"**Description:** {lora_info['description']}")
+                                if lora_info.get('notes'):
+                                    info_parts.append(f"**Notes:** {lora_info['notes']}")
+                                
+                                if info_parts:
+                                    gr.Markdown("\n\n".join(info_parts), elem_classes="lora-info")
+                            
+                            # Example prompts dropdown (if available)
+                            example_prompts = lora_info.get('example_prompts', [])
+                            if example_prompts:
+                                prompt_choices = {ex['name']: ex['prompt'] for ex in example_prompts}
+                                lora_example_dropdowns[lora_id] = gr.Dropdown(
+                                    label=f"Example Prompts for {display_name}",
+                                    choices=list(prompt_choices.keys()),
+                                    value=None,
+                                    interactive=True,
+                                )
+                                
+                                # Handler to update main prompt when example selected
+                                def create_example_handler(prompts_dict):
+                                    def handler(selected):
+                                        if selected and selected in prompts_dict:
+                                            return prompts_dict[selected]
+                                        return gr.update()
+                                    return handler
+                                
+                                lora_example_dropdowns[lora_id].change(
+                                    fn=create_example_handler(prompt_choices),
+                                    inputs=[lora_example_dropdowns[lora_id]],
+                                    outputs=[vid_prompt],
+                                )
+                    
+                    # Download status display
+                    lora_download_status = gr.Markdown("", visible=False)
+                    
+                    # Download handlers
+                    def download_lora_handler(lora_id):
+                        """Download missing LoRA files for a specific LoRA."""
+                        global AVAILABLE_LORAS, LORA_STATUS
+                        
+                        config = LORA_CONFIG.get(lora_id, {})
+                        results = []
+                        success_count = 0
+                        
+                        # Download high if needed
+                        if config.get('high_url') and config.get('high_filename'):
+                            high_path = LORA_DIR / config['high_filename']
+                            if not high_path.exists():
+                                success, msg = download_lora_file(
+                                    config['high_url'],
+                                    config['high_filename']
+                                )
+                                results.append(f"**High:** {msg}")
+                                if success:
+                                    success_count += 1
+                            else:
+                                results.append(f"**High:** Already downloaded")
+                        
+                        # Download low if needed
+                        if config.get('low_url') and config.get('low_filename'):
+                            low_path = LORA_DIR / config['low_filename']
+                            if not low_path.exists():
+                                success, msg = download_lora_file(
+                                    config['low_url'],
+                                    config['low_filename']
+                                )
+                                results.append(f"**Low:** {msg}")
+                                if success:
+                                    success_count += 1
+                            else:
+                                results.append(f"**Low:** Already downloaded")
+                        
+                        if not results:
+                            return gr.update(visible=True, value="Nothing to download")
+                        
+                        # Refresh global state
+                        AVAILABLE_LORAS = discover_loras()
+                        LORA_STATUS = check_lora_status(LORA_CONFIG)
+                        
+                        status_msg = "\n".join(results)
+                        if success_count > 0:
+                            status_msg += f"\n\n**{success_count} file(s) downloaded successfully!**\n\n**Please refresh the page** to enable the checkbox."
+                        
+                        return gr.update(visible=True, value=status_msg)
+                    
+                    # Attach download handlers
+                    for lora_id, btn in lora_download_btns.items():
+                        btn.click(
+                            fn=lambda lid=lora_id: download_lora_handler(lid),
+                            inputs=[],
+                            outputs=[lora_download_status],
+                        )
+                
+                else:
+                    gr.Markdown(
+                        "**No LoRAs configured.**  \n"
+                        f"Add LoRA entries to `{LORA_CONFIG_FILE}` or place `.safetensors` files in `{LORA_DIR}` and restart."
+                    )
+            
+            # LoRA Compatibility Status Display
+            lora_compat_status = gr.Markdown(
+                "", 
+                visible=False,
+                elem_classes="lora-compat-status"
+            )
+            
+            # Function to update compatibility status AND steps slider when checkboxes change
+            def update_lora_compatibility_and_steps(*checkbox_states):
+                """Show compatibility status and update steps slider when LoRAs are selected."""
+                if not AVAILABLE_LORAS:
+                    return gr.update(visible=False, value=""), gr.update()
+                
+                # Collect selected LoRAs
+                selected = {}
+                for (lora_id, lora_info), is_enabled in zip(AVAILABLE_LORAS.items(), checkbox_states):
+                    if is_enabled:
+                        selected[lora_id] = lora_info
+                
+                if not selected:
+                    return gr.update(visible=False, value=""), gr.update(value=4)
+                
+                # Check compatibility
+                is_compatible, message, settings = check_lora_compatibility(selected)
+                
+                # Build status message
+                status_lines = [f"### Active LoRAs: {len(selected)}"]
+                status_lines.append(message)
+                
+                if settings.get('recommended_steps'):
+                    status_lines.append(f"**Recommended Steps:** {settings['recommended_steps']}")
+                if settings.get('recommended_flow_shift'):
+                    status_lines.append(f"**Recommended Flow Shift:** {settings['recommended_flow_shift']}")
+                
+                if len(selected) > 1:
+                    status_lines.append(f"**Average Weights:** High={settings['high_weight']:.2f}, Low={settings['low_weight']:.2f}")
+                
+                if not is_compatible:
+                    status_lines.append("\n**Note:** Settings conflict - using defaults. You can manually override.")
+                
+                # Selecting a LoRA immediately applies its recommendation.
+                # The user can subsequently move the slider to override it.
+                recommended_steps = settings.get('recommended_steps')
+                
+                return gr.update(visible=True, value="\n".join(status_lines)), gr.update(value=recommended_steps) if recommended_steps is not None else gr.update()
+            
+            # Attach compatibility checker to all LoRA checkboxes
+            if lora_checkboxes:
+                for checkbox in lora_checkboxes.values():
+                    checkbox.change(
+                        fn=update_lora_compatibility_and_steps,
+                        inputs=list(lora_checkboxes.values()),
+                        outputs=[lora_compat_status, edit_steps],
+                    )
+
+            # Download Frame output gr.File shows a clickable download link when populated
+            download_file_output = gr.File(label="Click to Download Frame", visible=True)
 
             with gr.Accordion("Advanced Settings", open=False):
                 with gr.Row():
@@ -2468,10 +3095,6 @@ with gr.Blocks(css=css) as demo:
                         1, 10, value=7, step=1, label="Export Quality",
                     )
                 with gr.Row():
-                    edit_steps = gr.Slider(
-                        1, 20, value=3, step=1,
-                        label="Frame-Edit Steps (Qwen stage)",
-                    )
                     edit_guidance = gr.Slider(
                         1.0, 10.0, value=1.0, step=0.1,
                         label="Frame-Edit Guidance (Qwen stage)",
@@ -2504,7 +3127,7 @@ with gr.Blocks(css=css) as demo:
                     export_quality, seed, randomize_seed, add_audio_cb,
                     audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                     flow_shift_auto, flow_shift,
-                ],
+                ] + list(lora_checkboxes.values()),  # Add LoRA checkboxes
                 outputs=[video_output, video_file],
                 concurrency_id=WAN_QUEUE_ID,
                 concurrency_limit=10,  # Allow multiple in queue, processed sequentially
@@ -2547,7 +3170,7 @@ with gr.Blocks(css=css) as demo:
             # Frame extraction functions
             def get_frame_as_file(video_path, timestamp):
                 """Extract frame at given seconds, return file path."""
-                print(f"\n🔍 get_frame_as_file called, ts={timestamp}")
+                print(f"\nget_frame_as_file called, ts={timestamp}")
                 if not video_path:
                     raise gr.Error("No video available. Generate a video first.")
                 if hasattr(video_path, 'name'):
@@ -2562,50 +3185,53 @@ with gr.Blocks(css=css) as demo:
                 frame_path = extract_frame(path, ts)
                 if not frame_path:
                     raise gr.Error("Failed to extract frame from video.")
-                print(f"✅ Frame extracted: {frame_path}")
+                print(f" Frame extracted: {frame_path}")
                 return frame_path
 
-            # Use Frame as Reference — reads timestamp from number box, puts frame into reference_image
+            # Use Frame as Reference  reads timestamp from number box, puts frame into reference_image
             use_as_reference_btn.click(
                 fn=get_frame_as_file,
                 inputs=[video_file, frame_time_input],
                 outputs=[reference_image],
             )
 
-            # Download Frame — reads timestamp from number box, puts frame into gr.File for download
+            # Download Frame  reads timestamp from number box, puts frame into gr.File for download
             download_frame_btn.click(
                 fn=get_frame_as_file,
                 inputs=[video_file, frame_time_input],
                 outputs=[download_file_output],
             )
 
-            # Track reference_image uploads to protect new images from clear_storage
-            def track_new_upload(img):
-                """Update tracking when user uploads new image during generation."""
+            # Track reference_image changes to protect new images from clear_storage
+            def track_image_change(img):
+                """Update tracking whenever reference_image changes (upload, clear, replace)."""
                 global _current_input_image_path
+                print(f"track_image_change called with: {type(img)} = {img}")
                 if img is None or img == "":
                     _current_input_image_path = None
-                    print("🔓 Input image cleared, no longer protected")
+                    print("Input image cleared, no longer protected")
                 elif isinstance(img, str):
                     _current_input_image_path = img
-                    print(f"🔒 New input image tracked: {img}")
+                    print(f"Input image updated (str): {img}")
+                elif hasattr(img, 'name'):
+                    _current_input_image_path = img.name
+                    print(f"Input image updated (obj.name): {img.name}")
+                else:
+                    print(f" Unknown image type, not tracking")
+                print(f"_current_input_image_path is now: {_current_input_image_path}")
+                return None
             
-            reference_image.upload(
-                fn=track_new_upload,
+            # Use .change() instead of .upload() - fires AFTER upload completes with filepath
+            reference_image.change(
+                fn=track_image_change,
                 inputs=[reference_image],
-                outputs=None,
-            )
-            
-            reference_image.clear(
-                fn=track_new_upload,
-                inputs=[reference_image],
-                outputs=None,
+                outputs=[],
             )
 
         # ------------------------------------------------------------------ #
-        #  TAB 2 — PHOTO EDITOR (picgen)                                      #
+        #  TAB 2  PHOTO EDITOR (picgen)                                      #
         # ------------------------------------------------------------------ #
-        with gr.Tab("🖼️ Photo Editor"):
+        with gr.Tab("Photo Editor"):
             with gr.Column(elem_id="col-container"):
 
                 with gr.Row():
@@ -2623,9 +3249,9 @@ with gr.Blocks(css=css) as demo:
                         )
                         gr.HTML("""
                         <div class="uploader-toolbar">
-                            <button id="tb-upload" class="tb-btn">⬆ Upload</button>
-                            <button id="tb-remove" class="tb-btn">✕ Remove Selected</button>
-                            <button id="tb-clear" class="tb-btn">🗑 Clear All</button>
+                            <button id="tb-upload" class="tb-btn">Upload</button>
+                            <button id="tb-remove" class="tb-btn">Remove Selected</button>
+                            <button id="tb-clear" class="tb-btn">Clear All</button>
                         </div>
                         <div id="gallery-drop-zone">
                             <div id="upload-prompt" class="upload-prompt-modern">
@@ -2666,7 +3292,7 @@ with gr.Blocks(css=css) as demo:
                             interactive=False,
                             columns=2,
                         )
-                        use_output_btn = gr.Button("↗️ Use as input", variant="secondary", size="sm")
+                        use_output_btn = gr.Button("Use as input", variant="secondary", size="sm")
 
                         # Row 1: 4 dropdowns
                         with gr.Row():
@@ -2702,7 +3328,7 @@ with gr.Blocks(css=css) as demo:
                                 value=None, interactive=True, scale=1,
                             )
 
-                        pic_run_button = gr.Button("🖼️ Generate", variant="primary", size="lg")
+                        pic_run_button = gr.Button("Generate", variant="primary", size="lg")
 
                 with gr.Accordion("Advanced Settings", open=False):
                     pic_seed = gr.Slider(label="Seed", minimum=0, maximum=PICGEN_MAX_SEED, step=1, value=0)
@@ -2715,7 +3341,7 @@ with gr.Blocks(css=css) as demo:
                     fullscreen_toggle = gr.Checkbox(label="Full Screen Mode", value=False, info="Expand image boxes to full page width")
                     keyboard_toggle = gr.Checkbox(label="Disable On-Screen Keyboard", value=False, info="Prevent keyboard from appearing on mobile devices")
 
-                # Preset dropdown handlers — selecting updates prompt box
+                # Preset dropdown handlers  selecting updates prompt box
                 preset_dropdown.change(fn=update_solo_prompt, inputs=[preset_dropdown], outputs=[pic_prompt], scroll_to_output=False)
                 preset_dropdown2.change(fn=update_couple_man_unseen_prompt, inputs=[preset_dropdown2], outputs=[pic_prompt], scroll_to_output=False)
                 preset_dropdown3.change(fn=update_couple_man_seen_prompt, inputs=[preset_dropdown3], outputs=[pic_prompt], scroll_to_output=False)
@@ -2874,7 +3500,7 @@ if __name__ == "__main__":
     os.makedirs(os.path.join(SCRIPT_DIR, "tmp"), exist_ok=True)
 
     if DUAL_GPU:
-        print(f"🚀 GRADIO LAUNCHING — Wan on {WAN_DEVICE}, Qwen on {PIC_DEVICE}. Both tabs ready.")
+        print(f" GRADIO LAUNCHING  Wan on {WAN_DEVICE}, Qwen on {PIC_DEVICE}. Both tabs ready.")
         demo.queue(default_concurrency_limit=10)
         demo.launch(
             server_name="0.0.0.0",
@@ -2884,9 +3510,9 @@ if __name__ == "__main__":
         )
     else:
         if STARTUP_MODE == "vidgen":
-            print("🚀 GRADIO LAUNCHING — Wan on GPU, vidgen ready immediately.")
+            print(" GRADIO LAUNCHING  Wan on GPU, vidgen ready immediately.")
         else:
-            print("🚀 GRADIO LAUNCHING — Qwen on GPU, picgen ready immediately.")
+            print(" GRADIO LAUNCHING  Qwen on GPU, picgen ready immediately.")
         demo.queue(default_concurrency_limit=1)
         demo.launch(
             server_name="0.0.0.0",
@@ -2900,7 +3526,7 @@ if __name__ == "__main__":
             try:
                 time.sleep(2.0)
                 if STARTUP_MODE == "vidgen":
-                    print("📦 Background: Loading Qwen to CPU...")
+                    print("Background: Loading Qwen to CPU...")
                     global pic_pipe
                     start = time.time()
                     model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
@@ -2946,13 +3572,13 @@ if __name__ == "__main__":
                     pipe.text_encoder.to("cpu")
                     pipe.vae.to("cpu")
                     pic_pipe = pipe
-                    print(f"✅ Qwen on CPU in {time.time()-start:.1f}s — tab switching ready!")
+                    print(f" Qwen on CPU in {time.time()-start:.1f}s  tab switching ready!")
                 else:
-                    print("📦 Background: Loading Wan to CPU...")
+                    print("Background: Loading Wan to CPU...")
                     _load_wan("cpu")
-                    print("✅ Wan on CPU — tab switching ready!")
+                    print(" Wan on CPU  tab switching ready!")
             except Exception as e:
-                print(f"❌ Background load failed: {e}")
+                print(f" Background load failed: {e}")
                 import traceback; traceback.print_exc()
 
         threading.Thread(target=_bg_load, daemon=True).start()
