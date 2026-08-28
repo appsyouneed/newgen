@@ -1,0 +1,771 @@
+{
+  "ultimate_deepthroat": {
+    "display_name": "Ultimate DeepThroat",
+    "description": "Trained on 593 clips with various resolutions. Handles almost every POV. Works best at 4 steps.",
+    "high_url": "https://huggingface.co/sergfdgfh/wan2.2ultimatedeepthroat/resolve/main/wan22-ultimatedeepthroat-i2v-102epoc-high-k3nk.safetensors",
+    "low_url": "https://huggingface.co/SRodge00/ultimatedeepthroat/resolve/main/wan22-ultimatedeepthroat-I2V-101epoc-low-k3nk.safetensors",
+    "high_filename": "wan22-ultimatedeepthroat-i2v-102epoc-high-k3nk.safetensors",
+    "low_filename": "wan22-ultimatedeepthroat-I2V-101epoc-low-k3nk.safetensors",
+    "trigger_prompt": null,
+    "prompt_mode": "replace",
+    "example_prompts": [
+      {
+        "name": "Simple",
+        "prompt": "a woman in front of a penis, she engages in a deep throat blowjob, she swallows the penis all the way. Her lips touches the mans groin. Her nose smashes against the man's hips."
+      },
+      {
+        "name": "Penis Pullout",
+        "prompt": "a woman kneeling with an erected gigantic penis fully inside her throat, her throat is bulged due to the big penis inside she widely opens her mouth moves her head back, revealing a thick fat veiny penis. the woman's throat reduces in side and becomes normal. The penis has a big glans that exists the womans mouth. The erected penis then bounces as the woman keeps her mouth open."
+      },
+      {
+        "name": "Regular Swallow",
+        "prompt": "a woman on top of an erected penis, she widely opens her mouth and swallows the entire penis, sucks the cock deep throat, she opens her mouth and she moves her head over the erected penis, she sucks it from tip to base, she has her tongue sticking out, her mouth keeps open to accommodate the thickness of the penis in her mouth. the neck of the woman is bulging and bulging due to the dimensions of the large penis. The woman's nose gets smashed against the man hips violently. When her face smashes the man's groin the extended tongue of the woman wraps under the man's testicles. The man is thrusting his penis back and forth in rapid motions smashing the face of the woman with his energetic thrusts."
+      },
+      {
+        "name": "Head Moving",
+        "prompt": "a woman kneeling with an erected gigantic penis fully inside her throat, her throat is bulged due to the big penis inside of her mouth, she widely opens her mouth moves her head and forth while swallowing the penis. the woman's throat keeps bulging as the penis goes inside her mouth. The penis has a big glans that exists the woman's mouth."
+      },
+      {
+        "name": "Out of the Blue",
+        "prompt": "a cinematic scene with a woman in the frame, a man enters from the side, only his lower body is visible, side view of his hips, thighs and legs, with a gigantic erected penis with testicles appears and she starts engaging in a deepthroat blowjob with that penis. She swallows the entire penis, her nose smashes agains the man's hips. She moves her head back and fort swallowing the penis, realistic proportions, natural lighting, cinematic composition"
+      }
+    ],
+    "high_weight": 1.0,
+    "low_weight": 1.0,
+    "recommended_steps": 4,
+    "recommended_flow_shift": 6.9,
+    "resolution_bucket": 211,
+    "notes": "On 69 position, the glans may come out reversed. Manage by not showing glans in prompt. 69 position might need its own model.",
+    "auto_enabled": false,
+    "tags": ["deepthroat", "blowjob", "motion", "nsfw"]
+  },
+  "ulitmate_pussy_asshole": {
+    "display_name": "Ultimate Pussy & Anus Helper",
+    "description": "Helps generating realistic female genitalia. Versatile - doesn't force poses/positions. Trained on ~140 hand-captioned 5-second clips.",
+    "high_url": "https://huggingface.co/profpeng/pussyasshelper/resolve/main/wan2.2_i2v_high_ulitmate_pussy_asshole.safetensors",
+    "low_url": "https://huggingface.co/profpeng/pussyasshelper/resolve/main/wan2.2_i2v_low_ulitmate_pussy_asshole.safetensors",
+    "high_filename": "wan2.2_i2v_high_ulitmate_pussy_asshole.safetensors",
+    "low_filename": "wan2.2_i2v_low_ulitmate_pussy_asshole.safetensors",
+    "trigger_prompt": null,
+    "prompt_mode": "natural",
+    "example_prompts": [
+      {
+        "name": "Female Masturbation - Hand Rub",
+        "prompt": "close-up view of a woman, she rubs her vagina with her hand, natural lighting, realistic anatomy"
+      },
+      {
+        "name": "Female Masturbation - Finger Insert",
+        "prompt": "close-up view of a woman, she inserts her finger into her vagina, slow deliberate motion, intimate perspective"
+      },
+      {
+        "name": "Pussy Spread",
+        "prompt": "close-up intimate view, a woman spreads her vagina with two hands, revealing detailed anatomy, natural skin texture"
+      },
+      {
+        "name": "Hairy Vagina",
+        "prompt": "close-up view of a woman with hairy vagina, natural pubic hair visible, intimate perspective, realistic detail"
+      },
+      {
+        "name": "Ass Spread",
+        "prompt": "rear view close-up, a woman spreads her ass with both hands, revealing anus, natural lighting, detailed anatomy"
+      },
+      {
+        "name": "Asshole Winking",
+        "prompt": "extreme close-up rear view, her anus contracts repeatedly in rhythmic motion, detailed intimate perspective"
+      },
+      {
+        "name": "Multiple Angles",
+        "prompt": "intimate close-up of female genitalia from various angles, natural poses, realistic anatomy, cinematic lighting"
+      }
+    ],
+    "high_weight": 0.75,
+    "low_weight": 0.95,
+    "recommended_steps": 10,
+    "recommended_flow_shift": 6.9,
+    "notes": "⚠️ IMPORTANT: Use with default WAN checkpoint, NOT with WAN merges (degrades quality). Greatly benefits from higher resolutions. For max quality use 6+ low steps (10+ total). LoRA strength: high=0.5-1.0, low=0.9-1.0. Can be used with or without genitalia in initial frame.",
+    "auto_enabled": false,
+    "tags": ["genitalia", "close-up", "masturbation", "anatomy", "nsfw"],
+    "concepts": [
+      "Any angle and distance",
+      "Almost any pose",
+      "Female masturbation",
+      "Pussy spread",
+      "With/without pubic hair",
+      "Ass spread",
+      "Asshole winking",
+      "Works with or without genitalia in initial frame"
+    ]
+  },
+  "sex_smash_cut": {
+    "display_name": "Sex Smash Cut",
+    "description": "Creates scene transitions with penetration. Works best on wider aspect ratios. May produce body horror ~20% of time - regenerate if needed.",
+    "high_url": "https://huggingface.co/xXPussyD3str0y3rXx/smashcut/resolve/main/wan2.2-i2v-high-sex-smashcut-v1.0.safetensors",
+    "low_url": "https://huggingface.co/primalfearfear/smashLOW/resolve/main/wan2.2-i2v-low-sex-smashcut-v1.0.safetensors",
+    "high_filename": "sex_smash_cut_high.safetensors",
+    "low_filename": "sex_smash_cut_low.safetensors",
+    "trigger_prompt": "<SM4SHCUT> The scene changes and a man is thrusting his penis into and out of her pussy",
+    "prompt_mode": "append",
+    "example_prompts": [
+      {
+        "name": "Basic Smash Cut",
+        "prompt": "<SM4SHCUT> The scene changes and a man is thrusting his penis into and out of her pussy, natural motion, realistic anatomy"
+      },
+      {
+        "name": "Smash Cut - From Behind",
+        "prompt": "<SM4SHCUT> The scene changes and a man is thrusting his penis into and out of her pussy from behind, doggy style position, rhythmic motion"
+      },
+      {
+        "name": "Smash Cut - Missionary",
+        "prompt": "<SM4SHCUT> The scene changes and a man is thrusting his penis into and out of her pussy in missionary position, intimate perspective, close-up view"
+      },
+      {
+        "name": "Smash Cut - Side View",
+        "prompt": "<SM4SHCUT> The scene changes and a man is thrusting his penis into and out of her pussy, side angle view, showing full penetration motion"
+      },
+      {
+        "name": "Smash Cut - Fast Pace",
+        "prompt": "<SM4SHCUT> The scene changes and a man is thrusting his penis into and out of her pussy rapidly, energetic motion, intense pace"
+      }
+    ],
+    "high_weight": 0.8,
+    "low_weight": 0.8,
+    "recommended_steps": 4,
+    "recommended_flow_shift": 6.9,
+    "notes": "⚠️ TRIGGER REQUIRED: Must include '<SM4SHCUT> The scene changes and a man is thrusting his penis into and out of her pussy' in prompt. Works best on wider aspect ratios (16:9). Produces body horror about 20% of time - just regenerate. Start weight at 0.8, adjust 0.6-0.9 if needed. Without trigger, effect is much weaker.",
+    "auto_enabled": false,
+    "tags": ["penetration", "transition", "scene-change", "motion", "nsfw"]
+  },
+  "combo_handjob_blowjob": {
+    "display_name": "Combo Handjob Blowjob",
+    "description": "Hand and mouth used simultaneously on penis. Works well at strength 1 even without general NSFW LoRA. Works even if hand not on phallus initially.",
+    "high_url": "https://huggingface.co/primalfearfear/blowjobHIGH/resolve/main/WAN-2.2-I2V-HandjobBlowjobCombo-HIGH-v1.safetensors",
+    "low_url": "https://huggingface.co/primalfearfear/blowjobLOW/resolve/main/WAN-2.2-I2V-HandjobBlowjobCombo-LOW-v1.safetensors",
+    "high_filename": "combo_handjob_blowjob_high.safetensors",
+    "low_filename": "combo_handjob_blowjob_low.safetensors",
+    "trigger_prompt": null,
+    "prompt_mode": "natural",
+    "example_prompts": [
+      {
+        "name": "Basic Combo - POV",
+        "prompt": "POV perspective, a woman uses her hand and mouth simultaneously on an erect penis, she strokes the shaft with her hand while sucking the tip, rhythmic coordinated motion"
+      },
+      {
+        "name": "Basic Combo - Side View",
+        "prompt": "side view, a woman performs oral sex while stroking the penis with her hand, her hand moves up and down the shaft as her mouth works the tip, natural coordinated motion"
+      },
+      {
+        "name": "Combo - Two Hands",
+        "prompt": "close-up view, a woman uses both hands on the penis shaft while her mouth focuses on the tip, she strokes with both hands in alternating motion while sucking"
+      },
+      {
+        "name": "Combo - Slow Sensual",
+        "prompt": "intimate perspective, a woman slowly strokes the penis with her hand while sensually licking and sucking, deliberate unhurried motion, eye contact"
+      },
+      {
+        "name": "Combo - Fast Intense",
+        "prompt": "a woman rapidly strokes the penis shaft with her hand while vigorously sucking, fast coordinated motion, intense pace, saliva visible"
+      },
+      {
+        "name": "Combo - Starting Motion",
+        "prompt": "a woman brings her hand to an erect penis and begins stroking while taking it into her mouth, the coordinated hand and mouth motion begins and continues"
+      }
+    ],
+    "high_weight": 1.0,
+    "low_weight": 1.0,
+    "recommended_steps": 4,
+    "recommended_flow_shift": 6.9,
+    "notes": "✅ NO TRIGGERS NEEDED - Works automatically when loaded. Works at strength 1.0 without general NSFW LoRA. Supports both POV and third-person/side views. Better for live-action than anime (animated fingers can blur, but upscaling helps). Works even if hand not initially on phallus. File size: 500MB versions (better quality than 250MB versions).",
+    "auto_enabled": false,
+    "tags": ["handjob", "blowjob", "combo", "oral", "motion", "nsfw"]
+  },
+  "cowgirl_reverse_cowgirl": {
+    "display_name": "Cowgirl & Reverse Cowgirl",
+    "description": "Both cowgirl and reverse cowgirl positions with penetration. Works for T2V and I2V. Supports multiple camera angles and movements. Penises may be elongated.",
+    "high_url": "https://huggingface.co/profpeng/wancowgirlbest/resolve/main/wan22.r3v3rs3_c0wg1rl-14b-High-i2v_e70.safetensors",
+    "low_url": "https://huggingface.co/profpeng/wancowgirlbest/resolve/main/wan22.r3v3rs3_c0wg1rl-14b-Low-i2v_e70.safetensors",
+    "high_filename": "cowgirl_reverse_cowgirl_high.safetensors",
+    "low_filename": "cowgirl_reverse_cowgirl_low.safetensors",
+    "trigger_prompt": "r3v3rs3_c0wg1rl",
+    "prompt_mode": "append",
+    "example_prompts": [
+      {
+        "name": "Reverse Cowgirl - Urban Night",
+        "prompt": "r3v3rs3_c0wg1rl, a nude woman with light brown hair small breasts and a navel piercing straddling a nude man with a visible erect penis penetrating her vagina. The man's hands grip her hips from below as she rides him in the reverse cowgirl position facing forward with a slight devilish smile. His penis is thrusting into her and his testicles are visible below. They are in an urban street setting at night with neon signs in the background. The perspective is from a low angle looking up at the woman. The lighting is bright highlighting their bodies against the dimly lit street. The woman's legs are spread wide and the man is lying on his back beneath her."
+      },
+      {
+        "name": "Cowgirl - Fireplace",
+        "prompt": "c0wg1rl, a nude woman with light skin long blonde hair and small breasts straddling a man who is lying on his back. The woman's legs are spread wide and she is sitting on top of the man in the cowgirl position with his erect penis penetrating her vagina. She has a navel piercing and a focused expression on her face. The man's lower body and erect penis are visible while his upper body is out of frame. They are in a dimly lit room with a fireplace in the background casting warm light and shadows. The perspective is from a slightly low angle looking up at the woman."
+      },
+      {
+        "name": "Reverse Cowgirl - Couch",
+        "prompt": "r3v3rs3_c0wg1rl, A nude woman with light skin small breasts and long blonde hair straddling a nude man with a muscular build in the reverse cowgirl position. The man is lying on his back on a beige couch with the woman facing forward with her eyes closed and mouth slightly open in pleasure. His erect penis is visibly thrusting in and out of her vagina. The woman is leaning backward and her hands rest on his chest and her legs are spread apart. She bounces up and down. The man's penis thrusts in and out of her vagina."
+      },
+      {
+        "name": "Reverse Cowgirl - Close-up",
+        "prompt": "r3v3rs3_c0wg1rl, close-up detailed view of a woman straddling a man in reverse cowgirl position, her legs spread wide, his erect penis penetrating her vagina, she bounces rhythmically, intimate perspective"
+      },
+      {
+        "name": "Cowgirl - Side Angle",
+        "prompt": "c0wg1rl, side angle view from the left, a woman rides a man in cowgirl position, her body moving up and down, his penis thrusting into her vagina, rhythmic motion"
+      },
+      {
+        "name": "Reverse Cowgirl - Camera Movement",
+        "prompt": "r3v3rs3_c0wg1rl, a woman rides a man in reverse cowgirl position, she bounces energetically, the camera slides slowly to the left creating a parallax effect, dynamic perspective"
+      }
+    ],
+    "high_weight": 0.8,
+    "low_weight": 0.8,
+    "recommended_steps": 4,
+    "recommended_flow_shift": 6.9,
+    "notes": "🎯 TRIGGERS: Use 'r3v3rs3_c0wg1rl' for reverse cowgirl (woman facing away), 'c0wg1rl' for regular cowgirl (woman facing man). r3v3rs3 works best and can work for both positions. ⚠️ Penises may appear elongated. Add motion phrases like 'She bounces up and down' or 'The man's penis thrusts in and out of her vagina'. Camera angles supported: close-up, wide angle, side angle left/right, low/high angle looking up/down. Camera movements work: 'The camera slides slowly to the left, creating a parallax effect'. Works great with Text-to-Image workflow (create image, then animate with I2V). Compatible with other 2.1/2.2 LoRAs. Start weight 0.8, adjust 0.6-0.9.",
+    "auto_enabled": false,
+    "tags": ["cowgirl", "reverse-cowgirl", "riding", "penetration", "position", "nsfw"]
+  },
+  "anal_sex": {
+    "display_name": "Anal Sex",
+    "description": "Anal penetration from various positions. Trained on 63 videos at 16fps. Works for I2V, T2V version coming soon.",
+    "high_url": "https://huggingface.co/Dylann/anl-wn2-high/resolve/main/wan22_i2v_anal_v1_high_noise.safetensors",
+    "low_url": "https://huggingface.co/Dylann/anlside-high/resolve/main/wan22_i2v_anal_v1_low_noise.safetensors",
+    "high_filename": "anal_sex_high.safetensors",
+    "low_filename": "anal_sex_low.safetensors",
+    "trigger_prompt": "anal sex",
+    "prompt_mode": "append",
+    "example_prompts": [
+      {
+        "name": "Anal - Doggy Style",
+        "prompt": "anal sex, a woman on her hands and knees, a man behind her with his penis penetrating her anus, rhythmic thrusting motion, rear entry position, intimate perspective"
+      },
+      {
+        "name": "Anal - Missionary",
+        "prompt": "anal sex, a woman lying on her back with legs raised, a man between her legs with his penis penetrating her anus, slow deliberate motion, face-to-face position"
+      },
+      {
+        "name": "Anal - Side Position",
+        "prompt": "anal sex, side angle view, a woman lying on her side, a man behind her with his penis thrusting into her anus, spooning position, gentle rhythmic motion"
+      },
+      {
+        "name": "Anal - Bent Over",
+        "prompt": "anal sex, a woman bent over a surface, a man standing behind her with his penis penetrating her anus, standing rear entry, energetic thrusting motion"
+      },
+      {
+        "name": "Anal - Close-up Detail",
+        "prompt": "anal sex, close-up detailed view of anal penetration, his penis thrusting in and out of her anus, intimate perspective, natural skin texture"
+      },
+      {
+        "name": "Anal - Reverse Cowgirl Style",
+        "prompt": "anal sex, a woman straddling a man in reverse position, his penis penetrating her anus, she moves up and down, reverse cowgirl anal position"
+      }
+    ],
+    "high_weight": 0.8,
+    "low_weight": 0.8,
+    "recommended_steps": 4,
+    "notes": "🎯 TRIGGER REQUIRED: Include 'anal sex' in prompt. Trained on 63 videos at 16fps (81 frames each). Various anal positions supported. Start weight at 0.8, adjust 0.6-0.9 as needed. Currently I2V only, T2V version coming soon. Compatible with Wan 2.2 and Wan 2.1 checkpoints. Trained for ~8000 steps over 4-5 days. Without trigger, effect is much weaker.",
+    "auto_enabled": false,
+    "tags": ["anal", "penetration", "position", "rear-entry", "nsfw"]
+  },
+  "pov_cowgirl": {
+    "display_name": "POV Cowgirl",
+    "description": "First-person POV cowgirl position. Works well even without general NSFW LoRA. Updated training for better hip movement. Hip motion may be less aggressive than expected.",
+    "high_url": "https://huggingface.co/Chroma111/CivitAI-Archive-2/resolve/main/1874099/2169837/WAN-2.2-I2V-POV-Cowgirl-HIGH-v1.0-fixed.safetensors",
+    "low_url": "https://huggingface.co/Sentinel7/wan/resolve/main/1874099/2169847/WAN-2.2-I2V-POV-Cowgirl-LOW-v1.0-fixed.safetensors",
+    "high_filename": "pov_cowgirl_high.safetensors",
+    "low_filename": "pov_cowgirl_low.safetensors",
+    "trigger_prompt": null,
+    "prompt_mode": "natural",
+    "example_prompts": [
+      {
+        "name": "POV Cowgirl - Basic",
+        "prompt": "POV first-person perspective, a woman straddling and riding on top, she moves her hips up and down, cowgirl position viewed from below, her breasts bounce with the motion"
+      },
+      {
+        "name": "POV Cowgirl - Intense",
+        "prompt": "POV first-person view, a woman energetically riding in cowgirl position, she bounces vigorously up and down, her hips grinding and moving rhythmically, intense passionate motion"
+      },
+      {
+        "name": "POV Cowgirl - Slow Sensual",
+        "prompt": "POV first-person perspective, a woman slowly riding in cowgirl position, she grinds her hips in slow circular motions, sensual deliberate movement, eye contact maintained"
+      },
+      {
+        "name": "POV Cowgirl - Leaning Forward",
+        "prompt": "POV perspective from below, a woman in cowgirl position leaning forward, her hands on chest, she rocks back and forth, close intimate angle, her face visible above"
+      },
+      {
+        "name": "POV Cowgirl - Hip Focus",
+        "prompt": "POV first-person view, close focus on a woman's hips and lower body as she rides in cowgirl position, her hips move up and down rhythmically, detailed hip motion"
+      },
+      {
+        "name": "POV Cowgirl - Aggressive Bounce",
+        "prompt": "POV first-person perspective, a woman aggressively bouncing in cowgirl position, rapid hip movements, she slams down repeatedly, high-energy passionate riding motion"
+      }
+    ],
+    "high_weight": 0.8,
+    "low_weight": 0.8,
+    "recommended_steps": 4,
+    "notes": "✅ NO TRIGGERS NEEDED - Works automatically when loaded. Works well even without general NSFW LoRA (but works better with it). v1.0 has updated training settings for better movement preservation. Hip motion may be less aggressive than desired - use prompts emphasizing movement ('bounces vigorously', 'aggressive riding', 'energetic hip motion'). Trained locally on RTX 3090. Start weight 0.8, adjust 0.6-0.9. POV (first-person) perspective focused.",
+    "auto_enabled": false,
+    "tags": ["pov", "cowgirl", "first-person", "riding", "position", "nsfw"]
+  },
+  "doggy_zoom_reveal": {
+    "display_name": "Doggy Zoom Reveal",
+    "description": "Camera zooms out to reveal doggy style sex. Works for T2V and I2V. Square outputs (480x480, 720x720) more consistent. Man appears during camera motion.",
+    "high_url": "https://huggingface.co/hank87/zoomoutrevealdoggy/resolve/main/I2V_doggyslider_high.safetensors",
+    "low_url": "https://huggingface.co/hank87/zoomoutrevealdoggy/resolve/main/I2V_doggyslider_low.safetensors",
+    "high_filename": "doggy_zoom_reveal_high.safetensors",
+    "low_filename": "doggy_zoom_reveal_low.safetensors",
+    "trigger_prompt": null,
+    "prompt_mode": "natural",
+    "example_prompts": [
+      {
+        "name": "Doggy Zoom - Basic",
+        "prompt": "Camera zooms out right away to reveal her on all fours, naked, ass in the air, having fast, rough, intense sex with a man behind her. The man is thrusting his penis inside her from behind, causing her hips to jolt with each impact."
+      },
+      {
+        "name": "Doggy Zoom - Face Focus Start",
+        "prompt": "Camera starts with tight close-up on her face showing pleasure, then zooms out to reveal her on all fours having intense doggy style sex with a man thrusting from behind, rapid rhythmic motion"
+      },
+      {
+        "name": "Doggy Zoom - Slow Reveal",
+        "prompt": "Camera slowly zooms out from close-up to reveal a woman on hands and knees, naked, a man behind her thrusting his penis into her, doggy style position, steady paced motion"
+      },
+      {
+        "name": "Doggy Zoom - Aggressive",
+        "prompt": "Camera rapidly zooms out to reveal aggressive doggy style sex, a woman on all fours, man behind pounding hard and fast, her body jolting with each powerful thrust, intense rough motion"
+      },
+      {
+        "name": "Doggy Zoom - Side Angle",
+        "prompt": "Camera zooms out from side angle to reveal her on all fours having sex doggy style, the man's penis thrusting in and out from behind, side view perspective, rhythmic motion visible"
+      },
+      {
+        "name": "Doggy Zoom - Wide Reveal",
+        "prompt": "Camera zooms far out to show full scene of doggy style sex, woman on all fours, ass raised, man behind thrusting energetically, wide angle reveals entire bodies and motion"
+      }
+    ],
+    "high_weight": 0.8,
+    "low_weight": 0.8,
+    "recommended_steps": 4,
+    "notes": "✅ NO TRIGGERS NEEDED - Works automatically when loaded. 🎬 CAMERA EFFECT: Zooms out to reveal doggy position. 📍 BEST RESULTS: Square format (480x480 or 720x720) is more consistent than other formats. 🖼️ I2V BEHAVIOR: Tight close-up starting frame = man already behind. Less zoomed start = man appears during zoom. ✨ I2V works better than T2V currently. Typical prompt: 'Camera zooms out right away to reveal her on all fours, naked, ass in the air, having fast, rough, intense sex with a man behind her.' Start weight 0.8, adjust 0.6-0.9.",
+    "auto_enabled": false,
+    "tags": ["doggy", "zoom", "camera-movement", "reveal", "position", "nsfw"]
+  },
+  "pov_paizuri_titfuck": {
+    "display_name": "POV Paizuri / Titfuck",
+    "description": "POV titfucking/paizuri with detailed motion control. 50% man thrusting, 50% woman moving. Finger interlacing and breast wrapping tagged. smallBoobs tag available but minimal effect.",
+    "high_url": "https://huggingface.co/rahul7star/wan2.2Lora/resolve/main/WAN-2.2-I2V-POV-Titfuck-Paizuri-HIGH-v1.0.safetensors",
+    "low_url": "https://huggingface.co/rahul7star/wan2.2Lora/resolve/main/WAN-2.2-I2V-POV-Titfuck-Paizuri-LOW-v1.0.safetensors",
+    "high_filename": "pov_paizuri_titfuck_high.safetensors",
+    "low_filename": "pov_paizuri_titfuck_low.safetensors",
+    "trigger_prompt": "titJob, paizuri",
+    "prompt_mode": "append",
+    "example_prompts": [
+      {
+        "name": "Paizuri - Man Thrusting",
+        "prompt": "titJob, paizuri, manMove, gather, fingersTogether, A man is thrusting his penis between her breasts. She gathers her breasts together around the penis, with her fingertips touching together."
+      },
+      {
+        "name": "Paizuri - Woman Moving",
+        "prompt": "titJob, paizuri, girlMove, gather, fingersTogether, She rubs her breasts up and down his penis. She gathers her breasts together around the penis, with her fingertips touching together."
+      },
+      {
+        "name": "Paizuri - Basic POV",
+        "prompt": "titJob, paizuri, POV perspective, a woman presses her breasts together around an erect penis, she moves her breasts up and down, rhythmic motion"
+      },
+      {
+        "name": "Paizuri - Man Control",
+        "prompt": "titJob, paizuri, manMove, POV view, a man thrusts his penis between a woman's breasts as she holds them together, fast thrusting motion"
+      },
+      {
+        "name": "Paizuri - Slow Sensual",
+        "prompt": "titJob, paizuri, girlMove, gather, fingersTogether, she slowly rubs her gathered breasts up and down his penis, her fingers interlaced, sensual deliberate motion, eye contact"
+      },
+      {
+        "name": "Paizuri - Aggressive",
+        "prompt": "titJob, paizuri, manMove, a man rapidly thrusts his penis between her breasts, she squeezes them together tightly, fast energetic motion, vigorous pace"
+      }
+    ],
+    "high_weight": 0.8,
+    "low_weight": 0.8,
+    "recommended_steps": 4,
+    "notes": "🎯 TRIGGERS: Main triggers 'titJob, paizuri' required. Motion control: 'manMove' (man thrusts) OR 'girlMove' (woman moves breasts). Optional: 'gather' (wraps breasts around penis), 'fingersTogether' (interlaced fingers), 'smallBoobs' (minimal effect). Trained on ~50% manMove / 50% girlMove clips. Example: 'titJob, paizuri, manMove, gather, fingersTogether, A man is thrusting his penis between her breasts. She gathers her breasts together around the penis, with her fingertips touching together.' Creator ~80% satisfied, may revisit. Start weight 0.8, adjust 0.6-0.9.",
+    "auto_enabled": false,
+    "tags": ["paizuri", "titfuck", "pov", "breast", "titjob", "nsfw"]
+  },
+  "sex_from_behind_front_facing": {
+    "display_name": "Sex From Behind (Front Facing)",
+    "description": "Front-facing camera showing intimate moments from behind. Ideal for doggystyle, plow, prone, or ¾ front positions. Focuses on facial expressions and dynamic movement. v2.1 corrects over-training.",
+    "high_url": "https://huggingface.co/profpeng/sexfrombehind/resolve/main/sfbehind_v2.1_high_noise.safetensors",
+    "low_url": "https://huggingface.co/fiojanea/Esan_testi/resolve/main/sfbehind_v2.1_low_noise.safetensors",
+    "high_filename": "sex_from_behind_front_facing_high.safetensors",
+    "low_filename": "sex_from_behind_front_facing_low.safetensors",
+    "trigger_prompt": "sfb3hind",
+    "prompt_mode": "append",
+    "example_prompts": [
+      {
+        "name": "From Behind - Fast Thrusts",
+        "prompt": "sfb3hind, front facing camera, a woman's face in view as she is penetrated from behind, fast thrusts, her expression shows pleasure, dynamic movement, rhythmic motion"
+      },
+      {
+        "name": "From Behind - Slow Intense",
+        "prompt": "sfb3hind, front view, a woman facing camera in doggystyle position, slow deep penetration from behind, her facial expressions visible, intense intimate moment"
+      },
+      {
+        "name": "From Behind - Hair Pull",
+        "prompt": "sfb3hind, front facing angle, a man pulls her hair while penetrating from behind, fast rough thrusts, her face shows pleasure, slides in and out rapidly"
+      },
+      {
+        "name": "From Behind - Hands on Neck",
+        "prompt": "sfb3hind, front camera view, hands on her neck as she is penetrated from behind, short thrusts, intimate control, her facial expressions visible, intense motion"
+      },
+      {
+        "name": "From Behind - Prone Position",
+        "prompt": "sfb3hind, front view, a woman lying prone facing camera, penetration from behind, slow deliberate thrusts, her face and upper body visible, intimate angle"
+      },
+      {
+        "name": "From Behind - Three Quarter View",
+        "prompt": "sfb3hind, ¾ front angle, a woman in doggystyle position facing mostly toward camera, penetrates from behind, fast rhythmic motion, facial expressions and body movement visible"
+      }
+    ],
+    "high_weight": 0.8,
+    "low_weight": 0.8,
+    "recommended_steps": 8,
+    "notes": "🎯 TRIGGERS: 'sfb3hind' or 'sfbehind' required. 📷 CAMERA: Front-facing, woman faces camera during sex from behind. 🎭 FOCUS: Facial expressions + dynamic movement. 📍 POSITIONS: Doggystyle, plow, prone, ¾ front (side angles not recommended). 🏷️ KEYWORDS: 'short thrusts', 'fast thrusts', 'slides in and out', 'penetrates', 'fast/slow/rough', 'pulls her hair', 'hands on neck'. ⚙️ ADVANCED SETTINGS: Creator uses 3 KSamplers, 8 total steps, shift 5, with specific high/low noise + lightning LoRA setup. v2.1 corrections: Over-trained v2.0 fixed, 'penetrates' keyword added, more implied penetration training data. Start weight 0.8, adjust 0.6-0.9.",
+    "auto_enabled": false,
+    "tags": ["from-behind", "front-facing", "doggystyle", "facial-expression", "dynamic", "nsfw"]
+  },
+  "perfect_fingering": {
+    "display_name": "Perfect Fingering",
+    "description": "Fingering motion LoRA with realistic in/out finger movement. Creator's first LoRA. Works well at 0.7-1.0 weight. Slight chance for squirting with prompts. Focuses on natural finger sliding motion.",
+    "high_url": "https://huggingface.co/3dn3lt/Wan2.2-nsfw-0.08a/resolve/main/Sensual_fingering_v1_high_noise.safetensors",
+    "low_url": "https://huggingface.co/SRodge00/sensualfinger/resolve/main/Sensual_fingering_v1_low_noise(1).safetensors",
+    "high_filename": "perfect_fingering_high.safetensors",
+    "low_filename": "perfect_fingering_low.safetensors",
+    "trigger_prompt": "sensual_fingering",
+    "prompt_mode": "append",
+    "example_prompts": [
+      {
+        "name": "Fingering - Basic Motion",
+        "prompt": "sensual_fingering, The beautiful girl is fingering her vagina with her two middle fingers, her fingers are slowly sliding in and out of her vagina, rhythmic motion"
+      },
+      {
+        "name": "Fingering - With Squirting",
+        "prompt": "sensual_fingering, The beautiful girl is fingering her vagina with her two middle fingers, her fingers are slowly sliding in and out of her vagina, water is squirting out of her vagina when her fingers slides out"
+      },
+      {
+        "name": "Fingering - Fast Pace",
+        "prompt": "sensual_fingering, A woman rapidly fingers herself with two fingers, her fingers quickly sliding in and out of her wet vagina, fast rhythmic motion, intense pleasure"
+      },
+      {
+        "name": "Fingering - Slow Sensual",
+        "prompt": "sensual_fingering, She slowly fingers herself with her middle fingers, deliberate sliding motion in and out, slow sensual pace, her body responding to each movement"
+      },
+      {
+        "name": "Fingering - Deep Motion",
+        "prompt": "sensual_fingering, Her fingers slide deep inside her vagina then pull back out, deep fingering motion, her fingers glistening, rhythmic in and out movement"
+      },
+      {
+        "name": "Fingering - Close Up",
+        "prompt": "sensual_fingering, Close-up view of her two fingers sliding in and out of her vagina, clear view of finger motion, detailed sliding movement, natural rhythm"
+      }
+    ],
+    "high_weight": 0.8,
+    "low_weight": 0.8,
+    "recommended_steps": 4,
+    "notes": "🎯 TRIGGER: 'sensual_fingering' recommended for best results. ✨ FIRST LORA EVER by creator - works surprisingly well! 🎬 MOTION FOCUS: Fingers actually go in and out realistically (creator was 'sick of fingering motions that suck'). 💦 SQUIRTING: Slight chance to generate squirting with prompt, but better to mix with dedicated squirting LoRA. ⚖️ WEIGHT: Creator recommends 0.7-1.0 weight range (higher than typical 0.8). 📍 EXAMPLE PROMPT: 'sensual_fingering, The beautiful girl is fingering her vagina with her two middle fingers, her fingers are slowly sliding in and out of her vagina, water is squirting out of her vagina when her fingers slides out.' Quote: 'works like a tabasco on the pizza' 🌶️. Start weight 0.8-1.0, adjust 0.7-1.0.",
+    "auto_enabled": false,
+    "tags": ["fingering", "masturbation", "finger-motion", "solo", "nsfw"]
+  },
+  "anal_side_view": {
+    "display_name": "Anal Sex (Side View)",
+    "description": "SIDE VIEW ONLY anal penetration. Trained on deep & quick penetration. Works T2V & I2V. Challenging training - 'like herding third generation escaped house cats while blindfolded, barefoot and lit on fire.' Penis must be visible in scene.",
+    "high_url": "https://huggingface.co/profpeng/wananalsideview/resolve/main/Wan2.2_Anal-v1-HighNoise-I2V_T2V.safetensors",
+    "low_url": "https://huggingface.co/SR47/Wananalside/resolve/main/Wan2.2_Anal-v1-LowNoise-I2V_T2V.safetensors",
+    "high_filename": "anal_side_view_high.safetensors",
+    "low_filename": "anal_side_view_low.safetensors",
+    "trigger_prompt": null,
+    "prompt_mode": "natural",
+    "example_prompts": [
+      {
+        "name": "Anal Side - Deep Penetration",
+        "prompt": "Side view, a man is deeply penetrating a woman's anus with his penis, his large penis fully inserted, intense rhythmic thrusting, clear side angle perspective"
+      },
+      {
+        "name": "Anal Side - Quick Thrusts",
+        "prompt": "Side angle view, a man's penis is penetrating a woman's anus with quick rapid thrusts, fast paced motion, side perspective showing full penetration"
+      },
+      {
+        "name": "Anal Side - Insertion",
+        "prompt": "Side view, a man is inserting his penis into a man's anus, slow deliberate entry, side angle showing clear penetration, intimate perspective"
+      },
+      {
+        "name": "Anal Side - Large Penis",
+        "prompt": "Side perspective, a large penis is penetrating her anus deeply, thick shaft sliding in and out, side view showing detailed motion, rhythmic thrusting"
+      },
+      {
+        "name": "Anal Side - Spooning Position",
+        "prompt": "Side view angle, spooning position with his penis penetrating her anus from behind, bodies close together, side perspective showing intimate connection and motion"
+      },
+      {
+        "name": "Anal Side - Close Detail",
+        "prompt": "Close-up side angle view, a man's penis deeply penetrating a woman's anus, detailed view of shaft entering, side perspective showing clear insertion and motion"
+      }
+    ],
+    "high_weight": 0.8,
+    "low_weight": 0.6,
+    "recommended_steps": 4,
+    "notes": "⚠️ SIDE VIEW ONLY - Not designed for other angles. 🎯 NO TRIGGERS - Works automatically (use prompts from training data). 📍 SUGGESTED PROMPTS: 'a man is penetrating a woman's anus with his penis', 'a large penis is penetrating her anus', 'man's penis is deeply penetrating a woman's anus', 'a man is inserting his penis into a woman's anus'. ⚖️ WEIGHT: 0.5-1.0 range. Lower weight (0.5-0.65) on LOW noise model if face changing/artifacts. T2V may need below 1.0 strength. 🚨 LIMITATIONS: Struggles when penis not already visible, struggles when penis not already in anus, struggles when man pulls out (shaft only, no tip). 🎓 TRAINING: Most challenging training ever - 90 handpicked images + 40 videos. Trained on deep + normal anal. 🔥 Creator quote: 'like herding third generation escaped house cats over wild American plains while blindfolded, barefoot and lit on fire.' Start weight 0.8 high / 0.6 low, adjust 0.5-1.0.",
+    "auto_enabled": false,
+    "tags": ["anal", "side-view", "penetration", "deep", "quick", "nsfw"]
+  },
+  "pov_missionary": {
+    "display_name": "POV Missionary",
+    "description": "POV missionary position with leg spread. I2V handles penis starting outside vagina, even with no man in frame (though penis quality lower). v1.1 trained at higher res with more movement & bouncing breasts. Breast size controllable.",
+    "high_url": "https://huggingface.co/SRodge00/missionary/resolve/main/wan2.2_i2v_highnoise_pov_missionary_v1.0.safetensors",
+    "low_url": "https://huggingface.co/Fatt-Croll/CivitAI-Archive-2/resolve/main/1331682/2098396/wan2.2_i2v_pov_missionary_v1.0_lownoise.safetensors",
+    "high_filename": "pov_missionary_high.safetensors",
+    "low_filename": "pov_missionary_low.safetensors",
+    "trigger_prompt": null,
+    "prompt_mode": "natural",
+    "example_prompts": [
+      {
+        "name": "Missionary - Fast Bouncing",
+        "prompt": "A woman with her legs spread having sex with a man. A man is thrusting his penis back and forth inside her vagina at the bottom of the screen. Movement is fast with bouncing breasts. Her breasts are medium sized."
+      },
+      {
+        "name": "Missionary - Slow Motion",
+        "prompt": "A woman with her legs spread having sex with a man. A man is thrusting his penis back and forth inside her vagina at the bottom of the screen. Movement is slow. Her breasts are large."
+      },
+      {
+        "name": "Missionary - Small Breasts Fast",
+        "prompt": "A woman with her legs spread having sex with a man. A man is thrusting his penis back and forth inside her vagina at the bottom of the screen. Movement is fast with bouncing breasts. Her breasts are small."
+      },
+      {
+        "name": "Missionary - Large Breasts",
+        "prompt": "POV missionary position, a woman with her legs spread wide having sex with a man, his penis thrusting rhythmically inside her vagina visible at bottom of screen, fast movement with large bouncing breasts"
+      },
+      {
+        "name": "Missionary - Sensual Slow",
+        "prompt": "POV view, a woman lying back with legs spread, having intimate sex with a man, his penis moving slowly in and out of her vagina at bottom of frame, slow sensual motion, medium breasts"
+      },
+      {
+        "name": "Missionary - Intense Fast",
+        "prompt": "POV missionary angle, woman with spread legs having intense sex, man's penis rapidly thrusting back and forth inside her vagina visible at bottom, fast aggressive movement, breasts bouncing vigorously"
+      }
+    ],
+    "high_weight": 0.8,
+    "low_weight": 0.8,
+    "recommended_steps": 4,
+    "notes": "🎯 NO TRIGGERS - Works automatically. 📍 IMPORTANT PROMPT PARTS: 'with her legs spread having sex with a man' + 'A man is thrusting his penis back and forth inside her vagina at the bottom of the screen' + '{Movement is fast with bouncing breasts|Movement is slow}' + 'Her breasts are {small|medium sized|large}'. 🎬 I2V FEATURES: Can handle penis starting outside vagina. Can even work with no man in starting image (but penis quality suffers - Wan doesn't know penises well yet). ⚠️ SPEED LORA NOTE: Creator found that using speed LoRAs (lightning/self-forcing) on highnoise step limits facial variety and causes slow-motion for 5s videos. May want to disable speed LoRA for highnoise step. 📍 v1.1 UPDATES: Higher resolution training, more movement data, bouncing breast motion improved. 💡 TIP: Use negative prompts for what you don't want (e.g., if you want small breasts, put 'large breasts' in negative). Start weight 0.8, adjust 0.6-0.9.",
+    "auto_enabled": false,
+    "tags": ["missionary", "pov", "legs-spread", "penetration", "bouncing", "nsfw"]
+  },
+  "missionary_multi_angle": {
+    "display_name": "Missionary (Multi-Angle)",
+    "description": "Missionary sex from multiple camera angles: side view, POV, high angle, low angle. Works T2V & I2V. Angle-specific prompting for camera control. Generic trigger + angle modifiers.",
+    "high_url": "https://huggingface.co/3dn3lt/Wan2.2-nsfw-0.08a/resolve/main/Wan2.2%20-%20I2V%20-%20Missionary%20Sex%20-%20HIGH%2014B.safetensors",
+    "low_url": "https://huggingface.co/Chroma111/CivitAI-Archive-2/resolve/main/1849369/2176200/Wan2.2%20-%20I2V%20-%20Missionary%20Sex%20-%20LOW%2014B.safetensors",
+    "high_filename": "missionary_multi_angle_high.safetensors",
+    "low_filename": "missionary_multi_angle_low.safetensors",
+    "trigger_prompt": "A naked man and a naked woman having sex. He thrusts his penis in and out of her vagina.",
+    "prompt_mode": "prepend",
+    "example_prompts": [
+      {
+        "name": "Missionary - Side View",
+        "prompt": "A naked man and a naked woman having sex. He thrusts his penis in and out of her vagina. Viewed from the side. Side angle perspective shows their bodies in profile, rhythmic thrusting motion"
+      },
+      {
+        "name": "Missionary - POV Shot",
+        "prompt": "A naked man and a naked woman having sex. He thrusts his penis in and out of her vagina. A POV shot. First person perspective, woman's body visible below, intimate close angle"
+      },
+      {
+        "name": "Missionary - High Angle",
+        "prompt": "A naked man and a naked woman having sex. He thrusts his penis in and out of her vagina. Viewed from a high angle. Camera positioned above looking down, both bodies visible, overhead perspective"
+      },
+      {
+        "name": "Missionary - Low Angle",
+        "prompt": "A naked man and a naked woman having sex. He thrusts his penis in and out of her vagina. Viewed from below. Camera angle from underneath looking up, dramatic low perspective, bodies from below"
+      },
+      {
+        "name": "Missionary - Side Intimate",
+        "prompt": "A naked man and a naked woman having sex. He thrusts his penis in and out of her vagina. Viewed from the side. Side profile angle, slow intimate motion, their faces visible in profile"
+      },
+      {
+        "name": "Missionary - High Angle Wide",
+        "prompt": "A naked man and a naked woman having sex. He thrusts his penis in and out of her vagina. Viewed from a high angle. Wide overhead shot, full bodies visible, rhythmic motion from above"
+      }
+    ],
+    "high_weight": 0.8,
+    "low_weight": 0.8,
+    "recommended_steps": 4,
+    "notes": "🎯 TRIGGER: 'A naked man and a naked woman having sex. He thrusts his penis in and out of her vagina.' (base trigger). 📷 ANGLE MODIFIERS (add after trigger): 'viewed from the side' (side angle), 'a pov shot' (first person), 'viewed from a high angle' (overhead), 'viewed from below' (low angle). 🎬 MULTI-ANGLE TRAINING: Trained on multiple camera perspectives for flexible framing. Works for both T2V and I2V. 💡 USAGE TIP: Start with base trigger, then add angle modifier, then add motion/detail descriptions. Example: 'A naked man and a naked woman having sex. He thrusts his penis in and out of her vagina. Viewed from the side. Their bodies in profile, rhythmic motion.' Start weight 0.8, adjust 0.6-0.9.",
+    "auto_enabled": false,
+    "tags": ["missionary", "multi-angle", "side-view", "pov", "high-angle", "low-angle", "nsfw"]
+  },
+  "assertive_cowgirl": {
+    "display_name": "Assertive Cowgirl (Hip Slammin')",
+    "description": "AGGRESSIVE cowgirl with 'hip slammin' motion. Squatting position, face focus, woman slams hips down while upper body stays still. HIGH=body motion, LOW=genital close-ups only. Landscape orientation best. I2V focused.",
+    "high_url": "https://huggingface.co/marubok/wan/resolve/main/w22_i2v_Assertive-Cowgirl_H.safetensors",
+    "low_url": "https://huggingface.co/marubok/wan/resolve/main/w22_i2v_Assertive-Cowgirl_L.safetensors",
+    "high_filename": "assertive_cowgirl_high.safetensors",
+    "low_filename": "assertive_cowgirl_low.safetensors",
+    "trigger_prompt": "a woman is straddling a man and eagerly having sex with him. she is squatting.",
+    "prompt_mode": "prepend",
+    "example_prompts": [
+      {
+        "name": "Assertive - Quick Hip Slam",
+        "prompt": "a woman is straddling a man and eagerly having sex with him. she is squatting. The man's penis slides in and out of view as it enters her vagina. she moves quickly. her hips move quickly down on his penis."
+      },
+      {
+        "name": "Assertive - Vigorous Slam",
+        "prompt": "a woman is straddling a man and eagerly having sex with him. she is squatting. His penis is penetrating her vagina. you can see his penis sliding in and out of her vagina. she vigorously slams her hips down on the man."
+      },
+      {
+        "name": "Assertive - Energetic Motion",
+        "prompt": "a woman is straddling a man and eagerly having sex with him. she is squatting. The man's penis slides in and out of view as it enters her vagina. she moves energetically. she is quickly moving her hips up and down."
+      },
+      {
+        "name": "Assertive - Face Focus Fast",
+        "prompt": "a woman is straddling a man and eagerly having sex with him. she is squatting. POV face focus, you can see his penis sliding in and out of her vagina, she moves quickly, her hips slam down aggressively"
+      },
+      {
+        "name": "Assertive - Aggressive Slam",
+        "prompt": "a woman is straddling a man and eagerly having sex with him. she is squatting. she slams her hips down aggressively on his penis. His penis is penetrating her vagina. her hips move quickly down."
+      },
+      {
+        "name": "Assertive - Reverse View",
+        "prompt": "a woman is straddling a man and eagerly having sex with him. she is squatting. Reverse cowgirl view, you can see his penis sliding in and out, she vigorously slams her hips down, quick energetic motion"
+      }
+    ],
+    "high_weight": 0.9,
+    "low_weight": 0.9,
+    "recommended_steps": 4,
+    "notes": "🤠 HIP SLAMMIN' COWGIRL! 🎯 TRIGGER: 'a woman is straddling a man and eagerly having sex with him. she is squatting.' 🎬 MOTION STYLE: Aggressive/assertive - woman slams hips down while upper body stays mostly still (squatting, face focus). 📍 HELPFUL PHRASES (trained into LOW): 'The man's penis slides in and out of view as it enters her vagina.', 'His penis is penetrating her vagina. you can see his penis sliding in and out of her vagina.' 💪 MOVEMENT PHRASES: 'she moves quickly', 'she moves energetically', 'her hips move quickly down on his penis', 'she vigorously slams her hips down on the man', 'she is quickly moving her hips up and down'. ⚙️ TRAINING SPLIT: HIGH trained on hip motion, LOW trained ONLY on genital close-ups (preserves facial expressions). 📐 ORIENTATION: Landscape inputs give most consistent results. 🔄 REVERSE: Works with reverse/ass-view but no anus training data. ⚖️ WEIGHT: Creator recommends 0.7-1.0, usually 1.0 is fine. 💡 CFG TIP: Increase high noise CFG to ~6.0 for better movement. ⚠️ NOTE: Creator says 'much better 2.2 cowgirl loras out now' - use HIGH for aggressive hip motion, but rely on other loras for accurate genitals. Trained mostly on SFM/anime/MMD clips. Start weight 0.9-1.0, adjust 0.7-1.0.",
+    "auto_enabled": false,
+    "tags": ["cowgirl", "assertive", "aggressive", "hip-slam", "squatting", "face-focus", "nsfw"]
+  },
+  "pov_insertion": {
+    "display_name": "POV Insertion",
+    "description": "Captures the moment of INSERTION when penis not initially in frame. Handles missionary AND doggystyle. Perfect for I2V starting with no penetration. Specialized insertion animation.",
+    "high_url": "https://huggingface.co/marubok/wan/resolve/main/w22_i2v_POV-Cowgirl-Insertion-v1-B_H.safetensors",
+    "low_url": "https://huggingface.co/primalfearfear/POVCowgirlLOW/resolve/main/W22_POV_Cowgirl_Insertion_i2v_LN_v1.safetensors",
+    "high_filename": "pov_insertion_high.safetensors",
+    "low_filename": "pov_insertion_low.safetensors",
+    "trigger_prompt": "A man appears and inserts his penis into her pussy",
+    "prompt_mode": "append",
+    "example_prompts": [
+      {
+        "name": "Insertion - Missionary Start",
+        "prompt": "POV missionary position, a woman lying on her back with legs spread. A man appears and inserts his penis into her pussy. Slow deliberate insertion, intimate perspective, her body reacts to entry"
+      },
+      {
+        "name": "Insertion - Doggystyle Entry",
+        "prompt": "POV doggystyle angle, a woman on all fours presenting herself. A man appears and inserts his penis into her pussy. Penis enters from behind, clear insertion motion visible"
+      },
+      {
+        "name": "Insertion - Cowgirl Mount",
+        "prompt": "POV looking up at a woman straddling above. A man appears and inserts his penis into her pussy. She lowers herself onto the penis, slow mounting motion, intimate eye contact"
+      },
+      {
+        "name": "Insertion - Missionary Close",
+        "prompt": "Close-up POV missionary, woman's legs spread wide. A man appears and inserts his penis into her pussy. Detailed view of initial penetration, slow entry, her expression shows sensation"
+      },
+      {
+        "name": "Insertion - Doggystyle Deep",
+        "prompt": "POV from behind, woman bent over presenting. A man appears and inserts his penis into her pussy. Penis slides in deeply, full insertion from behind, clear motion"
+      },
+      {
+        "name": "Insertion - Missionary Gentle",
+        "prompt": "Soft POV missionary angle, intimate lighting. A man appears and inserts his penis into her pussy. Gentle slow insertion, romantic perspective, her legs wrap around"
+      }
+    ],
+    "high_weight": 0.8,
+    "low_weight": 0.8,
+    "recommended_steps": 4,
+    "notes": "🎯 TRIGGER: 'A man appears and inserts his penis into her pussy' (REQUIRED). 🎬 SPECIALIZED USE: Specifically trained to capture THE MOMENT OF INSERTION when penis is NOT initially visible in frame. Perfect for I2V scenarios starting with woman alone/no penetration. 📍 POSITIONS SUPPORTED: Missionary AND Doggystyle (trained on both). 💡 USE CASE: Start with image showing woman ready/waiting, LoRA animates man appearing and inserting. Fills gap that other LoRAs struggle with. 🎥 ANIMATION FOCUS: The initial entry motion, not ongoing sex - combine with other LoRAs for continuation. ⚖️ WEIGHT: Standard 0.8, adjust 0.6-0.9 as needed. 🌟 UNIQUE FEATURE: Handles 'penis not in frame at start' scenario that most other LoRAs fail at. Start weight 0.8, adjust 0.6-0.9.",
+    "auto_enabled": false,
+    "tags": ["insertion", "pov", "missionary", "doggystyle", "entry", "initial-penetration", "nsfw"]
+  },
+  "deepthroat_face_fuck": {
+    "display_name": "Deepthroat & Face Fuck",
+    "description": "Advanced deepthroat/face fuck with detailed motion, gagging, saliva, struggling. v3 improved POV, mixed with cum/big cock datasets. Works with/without man in initial frame. More detailed than basic deepthroat.",
+    "high_url": "https://huggingface.co/SRodge00/deepthroat2/resolve/main/Wan22_Throat_V1_high_noise.safetensors",
+    "low_url": "https://huggingface.co/SRodge00/deepthroat2/resolve/main/Wan22_Throat_V1_low_noise.safetensors",
+    "high_filename": "deepthroat_face_fuck_high.safetensors",
+    "low_filename": "deepthroat_face_fuck_low.safetensors",
+    "trigger_prompt": "deepthroat, face fuck",
+    "prompt_mode": "natural",
+    "example_prompts": [
+      {
+        "name": "Deepthroat - Side View Basic",
+        "prompt": "a woman is kneeling in front of a man, he is grabbing her head with both hands, she is giving him a deepthroat blowjob, she moves her head back and forth with almost the entire penis in her mouth, the view is from the side, deepthroat"
+      },
+      {
+        "name": "Face Fuck - Above View",
+        "prompt": "a woman is sitting down and leaning back against something with a man on top of her, he is face fucking her, he thrusts his hips back and forth moving the penis inside her mouth, almost the entire penis is in her mouth, the view is from above, face fuck, close-up"
+      },
+      {
+        "name": "Deepthroat - Balls Deep Gagging",
+        "prompt": "a woman is kneeling in front of a man, he is grabbing her head with both hands, she is giving him a deepthroat blowjob, her mouth is all the way down at the bottom of the penis, the entire penis is in her mouth, she gags on the penis, saliva drool is dangling from her chin, the view is from the side, balls deep, deepthroat, gagging"
+      },
+      {
+        "name": "Face Fuck - Struggling Saliva",
+        "prompt": "a woman is kneeling in front of a man, he is grabbing her head with both hands, he is face fucking her, she is struggling, she gags on the penis and spits out saliva, saliva drool is dangling from his penis, saliva drool is dangling from her chin, the view is from the side, balls deep, face fuck, gagging, big penis"
+      },
+      {
+        "name": "Deepthroat - Hip Thrusting",
+        "prompt": "a woman is kneeling in front of a man, he is grabbing her head with both hands, he thrusts his hips back and forth moving the penis inside her mouth, almost the entire penis is in her mouth, she is gagging, saliva drool on her face, the view is from the side, deepthroat, gagging, balls deep"
+      },
+      {
+        "name": "Face Fuck - Full Sequence",
+        "prompt": "a woman is kneeling in front of a man, he is grabbing her head with both hands, he is face fucking her, she moves her head back and forth along the length of the penis, she moves her mouth all the way down to the bottom of the penis, saliva drool is dangling from her chin, the view is from the side, face fuck, big penis"
+      }
+    ],
+    "high_weight": 0.8,
+    "low_weight": 0.8,
+    "recommended_steps": 4,
+    "notes": "🎯 TRIGGERS: Mix 'deepthroat' and 'face fuck' as needed. No strict requirement. 🎬 ADVANCED FEATURES: Detailed gagging, saliva drool (chin/penis/testicles), struggling, balls deep, man appearing from left/right. v3 UPDATE: Increased training set mixed with cum + big cock datasets. Much better POV. Can't do cum as well as dedicated Cum LoRA but quite good. 📍 KEY PHRASES: 'he is grabbing her head with both hands', 'almost the entire penis is in her mouth', 'she moves her head back and forth', 'he thrusts his hips back and forth', 'saliva drool is dangling from her chin', 'she is gagging', 'she is struggling', 'balls deep', 'big penis'. 📷 VIEWS: 'the view is from the side' (most common), 'the view is from above', 'close-up'. 💧 SALIVA DETAIL: Trained on drool on face/chin/penis/testicles. 🎭 POSITIONS: Kneeling (most common), sitting/leaning back. ⚠️ CREATOR NOTE: 'Penis shape not amazing, sometimes lost' but good enough to share. Works with 6 steps + lightx2v at strength 3 (high) / 1.5 (low). 💡 MAN APPEARING: 'a man appears on the left/right part of the view' (from underlying training). Start weight 0.8, adjust 0.6-0.9.",
+    "auto_enabled": false,
+    "tags": ["deepthroat", "face-fuck", "gagging", "saliva", "blowjob", "oral", "nsfw"]
+  },
+  "gagging_deepthroat": {
+    "display_name": "Gagging Deepthroat (Rough)",
+    "description": "EXTREME gagging/coughing reactions during deepthroat. Woman holds penis in throat, nose smashed against hips. Trained on 756 clips (1-3sec) showing discomfort, nausea, strong gag reflex. Rough/intense focus.",
+    "high_url": "https://huggingface.co/HectorUnai/test/resolve/main/acciones/blowjob/wan22-G4GG1NGv6-11epoc-high-i2v-k3nk.safetensors",
+    "low_url": "https://huggingface.co/HectorUnai/test/resolve/main/acciones/blowjob/wan22-G4GG1NGv6-11epoc-low-i2v-k3nk.safetensors",
+    "high_filename": "gagging_deepthroat_high.safetensors",
+    "low_filename": "gagging_deepthroat_low.safetensors",
+    "trigger_prompt": "she exhibits strong gag reflex responses, arching her back, shrugging her shoulders and frowning while smashing her nose against the man",
+    "prompt_mode": "append",
+    "example_prompts": [
+      {
+        "name": "Gagging - Nose Smash Hold",
+        "prompt": "she smashes her head forward and stops there, She swallows the entire penis, her nose smashes against the man's hips. stops moving. She holds the penis inside her throat. she exhibits strong gag reflex responses, arching her back, shrugging her shoulders and frowning while smashing her nose against the man's hips"
+      },
+      {
+        "name": "Gagging - Tap Out Signal",
+        "prompt": "She swallows the entire penis deeply, her nose pressed against his hips, she holds it there struggling. Visible gagging indicates discomfort and nausea during swallowing. she exhibits strong gag reflex responses, she taps with her right hand on the man's hips"
+      },
+      {
+        "name": "Gagging - Extreme Reflex",
+        "prompt": "she smashes her head forward taking the full length, stops completely still with nose against hips, She holds the penis inside her throat. she exhibits strong gag reflex responses, arching her back, shrugging her shoulders and frowning, visible discomfort and gagging"
+      },
+      {
+        "name": "Gagging - Coughing Reaction",
+        "prompt": "She takes the entire penis down her throat, her face smashes against his body, she stops moving and holds it deep. she coughs and gags with the penis shoved down her throat, she exhibits strong gag reflex responses, arching her back and shrugging"
+      },
+      {
+        "name": "Gagging - Nose Press Struggle",
+        "prompt": "she swallows the penis completely, her nose smashes against the man's hips and stays pressed there, She holds the penis inside her throat without moving. she exhibits strong gag reflex responses, frowning and struggling with visible nausea"
+      },
+      {
+        "name": "Gagging - Full Depth Hold",
+        "prompt": "she smashes her head forward in one motion, stops immediately with nose touching hips, entire penis swallowed, she holds this position. Visible gagging indicates discomfort. she exhibits strong gag reflex responses, arching her back, shrugging her shoulders and frowning"
+      }
+    ],
+    "high_weight": 0.8,
+    "low_weight": 0.8,
+    "recommended_steps": 4,
+    "notes": "⚠️ EXTREME/ROUGH CONTENT - Focus on INTENSE gagging reactions! 🎯 TRIGGER: 'she exhibits strong gag reflex responses, arching her back, shrugging her shoulders and frowning while smashing her nose against the man' (HIGHLY RECOMMENDED). 🎬 TRAINING: 756 clips (1-3sec each) of woman coughing, gagging, reacting with penis deep in throat. Focus on DISCOMFORT reactions. 💪 KEY ACTIONS: 'she smashes her head forward and stops there', 'She swallows the entire penis', 'her nose smashes against the man's hips', 'She holds the penis inside her throat', 'stops moving', 'Visible gagging indicates discomfort and nausea'. 🤢 REACTIONS: Strong gag reflex, arching back, shrugging shoulders, frowning, tapping out with hand on hips (signal to stop), coughing, struggling, visible nausea. 🎥 FOCUS: The MOMENT of holding penis deep + physical reaction (not the motion before/after). ⚡ INTENSITY: Most extreme of all deepthroat LoRAs - focuses on rough/uncomfortable reactions. 📍 USE CASE: For rough/extreme deepthroat scenarios with realistic gagging responses. Start weight 0.8, adjust 0.6-0.9.",
+    "auto_enabled": false,
+    "tags": ["gagging", "extreme", "rough", "deepthroat", "gag-reflex", "intense", "nsfw"]
+  
+}
+}
