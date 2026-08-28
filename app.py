@@ -31,9 +31,9 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 # STARTUP MODE
 #
 # -vidgen (default) — Video Generator tab is shown first and, on a single-GPU
-#   box, Wan loads to GPU at startup (MageFlow stays on CPU until first use).
+#   box, Wan loads to GPU at startup (Qwen stays on CPU until first use).
 # -picgen — Photo Editor tab is shown first and, on a single-GPU box,
-#   MageFlow loads to GPU at startup instead (Wan stays on CPU until first use).
+#   Qwen loads to GPU at startup instead (Wan stays on CPU until first use).
 # Has no effect with two GPUs, since neither model is ever swapped there.
 # ---------------------------------------------------------------------------
 
@@ -98,6 +98,7 @@ import contextlib as _ctx
 from huggingface_hub import hf_hub_download
 from torch.nn import functional as F
 from PIL import Image
+from safetensors.torch import load_file
 
 # ---------------------------------------------------------------------------
 # SAGEATTENTION — 2-3x faster attention kernels (optional, auto-detected)
@@ -113,7 +114,10 @@ import gradio as gr
 from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
 from diffusers.utils.export_utils import export_to_video
 
-from mage_flow import MageFlowPipeline
+try:
+    from diffusers import QwenImageEditPlusPipeline
+except ImportError:
+    from qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
@@ -274,10 +278,10 @@ from train_log.RIFE_HDv3 import Model
 #
 # Model VRAM requirements (bfloat16):
 #   WAN 2.2 I2V A14B : ~57 GB
-#   MageFlow-Edit    : ~18 GB
-#   Combined         : ~75 GB
+#   Qwen Image Edit  : ~35 GB
+#   Combined         : ~92 GB
 #   Headroom needed  : ~15 GB (activations, KV cache, intermediates)
-#   Safe concurrent  : ≥80 GB total VRAM (single 95 GB Blackwell fits both)
+#   Safe concurrent  : ≥107 GB total VRAM
 #
 # Override: NEWGEN_FORCE_SINGLE_GPU=1 forces swap mode on any box.
 # ---------------------------------------------------------------------------
@@ -301,41 +305,33 @@ for i in range(_gpu_count):
     _total_vram_mb += vram_mb
 
 # Concurrent (dual-resident) mode keeps BOTH models loaded on the GPU(s) at
-# once, with no swapping. With MageFlow at ~17.5 GB and Wan at ~55-60 GB
-# (480p), the combined footprint is ~75 GB — fits comfortably on a single
-# 95 GB Blackwell card. So concurrent mode is now viable with just 1 GPU
-# when total VRAM >= 80 GB, or always with 2+ GPUs.
+# once, with no swapping. That only works when there are two separate
+# physical GPUs — one per model — so each has its own fully uncontended VRAM.
 #
-# Override: NEWGEN_FORCE_SINGLE_GPU=1 forces swap mode on any box.
+# A single GPU, even a 95 GB Blackwell card, does NOT reliably fit both
+# models resident at once. The optimistic math below (Wan ~57 GB + Qwen peak
+# ~20-25 GB via enable_model_cpu_offload = ~82 GB, "fits" in 95 GB) does not
+# hold in practice: Wan alone has been observed pinning ~94 GB by itself,
+# leaving no room for Qwen and crashing with a CUDA OOM on the very first
+# Photo Editor generation. So concurrent mode now requires >= 2 GPUs, full
+# stop — a single card always uses swap mode (one model on GPU, the other
+# parked on CPU, swapped in on tab switch / first use of that model).
 _force_single = os.environ.get("NEWGEN_FORCE_SINGLE_GPU") == "1"
 
-# MageFlow is ~17.5 GB, Wan peak at 480p is ~55 GB, need ~10 GB headroom
-_CONCURRENT_VRAM_THRESHOLD_MB = 80 * 1024  # 80 GB minimum for single-card concurrent
-
-if _force_single:
+if _force_single or _gpu_count < 2:
     GPU_MODE = "single"
-elif _gpu_count >= 2:
+else:
     # Two or more GPUs: each model gets its own dedicated card.
     GPU_MODE = "concurrent"
-elif _total_vram_mb >= _CONCURRENT_VRAM_THRESHOLD_MB:
-    # Single GPU with enough VRAM for both models simultaneously
-    GPU_MODE = "concurrent"
-else:
-    GPU_MODE = "single"
 
 # Legacy alias — stacked no longer exists, everything is either concurrent or single.
 DUAL_GPU = (GPU_MODE == "concurrent")
 
 # Device assignments based on mode
 if GPU_MODE == "concurrent":
-    if _gpu_count >= 2:
-        # Two+ GPUs: each model gets its own dedicated card.
-        PIC_DEVICE = "cuda:0"
-        WAN_DEVICE = "cuda:1"
-    else:
-        # Single GPU concurrent (Blackwell 95 GB+): both on same card.
-        PIC_DEVICE = "cuda:0"
-        WAN_DEVICE = "cuda:0"
+    # Always >= 2 GPUs here (see gating above) — each model gets its own card.
+    PIC_DEVICE = "cuda:0"
+    WAN_DEVICE = "cuda:1"
     PIC_QUEUE_ID = "pic-gpu"
     WAN_QUEUE_ID = "wan-gpu"
 else:  # single — one model on GPU (all cards), other on CPU, swapped on demand
@@ -345,10 +341,19 @@ else:  # single — one model on GPU (all cards), other on CPU, swapped on deman
     WAN_QUEUE_ID = "gpu"
 
 # Flag: True when both models share a single physical GPU in concurrent mode.
+# Structurally always False now (concurrent mode requires >= 2 GPUs) — kept
+# only so the single-card-concurrent code paths below remain valid dead code
+# rather than needing to be ripped out, in case a future card genuinely has
+# the headroom to justify reviving this path.
 _SINGLE_CARD_CONCURRENT = (GPU_MODE == "concurrent" and _gpu_count == 1)
 
-# MageFlow manages its own device placement internally via from_pretrained(device=...).
-# No separate offload-strategy flag is needed for picgen anymore.
+# Whether Qwen's generator/execution device should be treated as CUDA.
+# True for: two-GPU concurrent (Qwen pinned), and single-card concurrent
+# IF there's enough free VRAM after Wan loads to use enable_model_cpu_offload.
+# Set to False (forcing a CPU generator, matching swap-mode's requirement)
+# if single-card concurrent falls back to enable_sequential_cpu_offload for
+# Qwen because Wan alone leaves too little headroom — see _load_qwen_thread.
+_QWEN_CUDA_GENERATOR = DUAL_GPU
 
 # Auxiliary models (RIFE interpolation, MMAudio) run on the last GPU.
 # In single/swap mode cuda:0 is shared by both primary models, so putting
@@ -1105,7 +1110,7 @@ default_negative_prompt = (
 
 def model_title():
     gpu_note = (
-        f"Dual GPU: MageFlow on {PIC_DEVICE}, Wan on {WAN_DEVICE} (no swapping)."
+        f"Dual GPU: Qwen on {PIC_DEVICE}, Wan on {WAN_DEVICE} (no swapping)."
         if DUAL_GPU else
         "Single GPU: models swap on demand."
     )
@@ -1272,13 +1277,13 @@ def edit_reference_frame(
     additional_images: list = None,
 ) -> Image.Image:
     """
-    Optional stage 1 — MageFlow edits the starting frame.
+    Optional stage 1 — Qwen Image Edit prepares the starting frame.
 
     Returns the image untouched in keep-scene mode, so nothing is repainted and
     the original background and bodies survive exactly as shot.
     
     When additional_images are provided (Custom/Replace modes), all images are
-    passed to MageFlow as multi-reference input for better context.
+    passed to Qwen as multi-reference input for better context.
     """
     if mode == MODE_KEEP:
         print("[1/2] Keep-scene mode — reference frame used as-is.")
@@ -1295,30 +1300,32 @@ def edit_reference_frame(
         instruction = RELOCATE_INSTRUCTION.format(prompt=prompt)
 
     activate_pic()
-    print(f"[1/2] MageFlow editing frame -> {instruction[:80]}...")
+    print(f"[1/2] Qwen editing frame -> {instruction[:80]}...")
 
-    # Build ref_images — single image or list for multi-reference
+    # Build image list — primary image first, then any additional references
+    images_list = [image]
     if additional_images:
-        ref_list = [image]
         for ref in additional_images:
             pil_ref = _ensure_pil(ref)
             if pil_ref is not None:
-                ref_list.append(pil_ref)
-        ref = ref_list
-        if len(ref_list) > 1:
-            print(f"  Multi-reference: {len(ref_list)} images provided to MageFlow")
-    else:
-        ref = image
+                images_list.append(pil_ref)
+        if len(images_list) > 1:
+            print(f"  Multi-reference: {len(images_list)} images provided to Qwen")
 
-    output = pic_pipe.edit(
-        [instruction],
-        [ref],
-        steps=int(steps),
-        cfg=float(guidance),
-        seeds=[seed],
-        max_size=max(image.width, image.height),
-    )
-    edited = output[0]
+    torch.cuda.set_device(PIC_DEVICE)
+    _pic_ctx = torch.cuda.device(PIC_DEVICE) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+    _pic_autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+    with _pic_ctx:
+        with _pic_autocast:
+            result = pic_pipe(
+                image=images_list,
+                prompt=instruction,
+                negative_prompt=" ",
+                num_inference_steps=int(steps),
+                true_cfg_scale=float(guidance),
+                generator=torch.Generator(device=PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu").manual_seed(seed),
+            )
+    edited = result.images[0]
     if edited.size != image.size:
         edited = edited.resize(image.size, Image.LANCZOS)
     return edited
@@ -1880,29 +1887,33 @@ def generate_timeline_video(
                 print(f"⚠️  Segment {seg_num}: empty prompt, using previous frame as-is")
                 start_frame = current_frame
             else:
-                # MageFlow edits the current frame with this segment's prompt
-                print(f"🎬 Segment {seg_num}/{num_segments}: MageFlow editing → {seg_prompt[:60]}...")
+                # Qwen edits the current frame with this segment's prompt
+                print(f"🎬 Segment {seg_num}/{num_segments}: Qwen editing → {seg_prompt[:60]}...")
                 
-                # Build ref_images for MageFlow
+                # Build image list for Qwen
+                images_for_qwen = [current_frame]
                 if additional_pil:
-                    ref = [current_frame] + additional_pil
-                else:
-                    ref = current_frame
+                    images_for_qwen.extend(additional_pil)
                 
                 # Timeline needs stronger guidance to make visible changes between segments
                 timeline_guidance = max(float(edit_guidance), 3.0)
                 timeline_steps = max(int(edit_steps), 6)
                 
                 activate_pic()
-                output = pic_pipe.edit(
-                    [seg_prompt],
-                    [ref],
-                    steps=timeline_steps,
-                    cfg=timeline_guidance,
-                    seeds=[current_seed + seg_idx],
-                    max_size=max(current_frame.width, current_frame.height),
-                )
-                start_frame = output[0]
+                torch.cuda.set_device(PIC_DEVICE)
+                _tl_ctx = torch.cuda.device(PIC_DEVICE) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+                _tl_ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+                with _tl_ctx:
+                    with _tl_ac:
+                        result = pic_pipe(
+                            image=images_for_qwen,
+                            prompt=seg_prompt,
+                            negative_prompt=" ",
+                            num_inference_steps=timeline_steps,
+                            true_cfg_scale=timeline_guidance,
+                            generator=torch.Generator(device=PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu").manual_seed(current_seed + seg_idx),
+                        )
+                start_frame = result.images[0]
                 if start_frame.size != current_frame.size:
                     start_frame = start_frame.resize(current_frame.size, Image.LANCZOS)
             
@@ -2068,23 +2079,25 @@ def _generate_timeline_with_durations(
             seg_prompt = segment_prompts[seg_idx].strip()
             current_input = keyframes[-1]  # Always edit from the previous keyframe
             
-            # Build ref_images for MageFlow
+            images_for_qwen = [current_input]
             if additional_pil:
-                ref = [current_input] + additional_pil
-            else:
-                ref = current_input
+                images_for_qwen.extend(additional_pil)
             
             print(f"  📸 Keyframe {seg_idx + 1}: {seg_prompt[:60]}...")
             
-            output = pic_pipe.edit(
-                [seg_prompt],
-                [ref],
-                steps=timeline_steps,
-                cfg=timeline_guidance,
-                seeds=[current_seed + seg_idx],
-                max_size=max(sized.width, sized.height),
-            )
-            new_keyframe = output[0]
+            _kf_ctx = torch.cuda.device(PIC_DEVICE) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+            _kf_ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+            with _kf_ctx:
+                with _kf_ac:
+                    result = pic_pipe(
+                        image=images_for_qwen,
+                        prompt=seg_prompt,
+                        negative_prompt=" ",
+                        num_inference_steps=timeline_steps,
+                        true_cfg_scale=timeline_guidance,
+                        generator=torch.Generator(device=PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu").manual_seed(current_seed + seg_idx),
+                    )
+            new_keyframe = result.images[0]
             if new_keyframe.size != sized.size:
                 new_keyframe = new_keyframe.resize(sized.size, Image.LANCZOS)
             
@@ -2180,83 +2193,245 @@ def _generate_timeline_with_durations(
 
 
 # ---------------------------------------------------------------------------
-# PICGEN MODEL (Mage-Flow-Edit-Turbo — Microsoft, 4B, MIT License)
-# ---------------------------------------------------------------------------
-# Replaces Qwen Image Edit 2511. Mage-Flow-Edit-Turbo is:
-#   - 4B params (vs Qwen's 20B) → ~17.5 GB VRAM total
-#   - 4-step distilled (same speed as old Qwen setup)
-#   - Better benchmark scores (GEdit 8.27 vs 7.88)
-#   - No content filter, no NSFW weight merging needed
-#   - Native resolution 512-2048, any aspect ratio
-#   - Multi-image editing (up to 3 references)
+# PICGEN MODEL (Qwen Image Edit)
 # ---------------------------------------------------------------------------
 
-PIC_MODEL_REPO = "microsoft/Mage-Flow-Edit-Turbo"
-PIC_STEPS = 4       # Turbo distilled = 4 steps
-PIC_CFG = 1.0       # Turbo = CFG 1.0 (distillation-merged)
-PIC_MAX_SIZE = 1024  # Default max output dimension
+PICGEN_MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
+BASE_MODEL_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "Qwen-Image-Edit-2511")
+NSFW_WEIGHTS_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "rapid-aio", "v23", "Qwen-Rapid-AIO-NSFW-v23.safetensors")
+
+# 🚀 PRIMARY MODEL LOADING
 
 
-def _load_mageflow(device="cuda"):
+def _load_qwen_to_cpu():
     """
-    Load MageFlow-Edit-Turbo pipeline.
-
-    MageFlow manages its own internal device placement — just pass the target
-    device string. Returns a ready-to-use MageFlowPipeline instance.
+    Load Qwen to CPU with NSFW weights merged.
+    Returns a fresh pipeline ready for enable_sequential_cpu_offload().
     """
-    print(f"🚀 Loading Mage-Flow-Edit-Turbo ({PIC_MODEL_REPO})...")
-    t = time.time()
-    pipe = MageFlowPipeline.from_pretrained(PIC_MODEL_REPO, device=device)
-    print(f"✅ MageFlow ready on {device} in {time.time()-t:.1f}s")
+    model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
+    repo = BASE_MODEL_LOCAL_PATH if os.path.exists(model_index_path) else "Qwen/Qwen-Image-Edit-2511"
+    kwargs = {"local_files_only": True} if os.path.exists(model_index_path) else {}
+
+    pipe = QwenImageEditPlusPipeline.from_pretrained(
+        repo,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        use_safetensors=True,
+        **kwargs,
+    )
+
+    v23 = NSFW_WEIGHTS_LOCAL_PATH
+    if not os.path.exists(v23):
+        os.makedirs(os.path.dirname(v23), exist_ok=True)
+        v23 = hf_hub_download(
+            repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
+            filename="v23/Qwen-Rapid-AIO-NSFW-v23.safetensors",
+            cache_dir=PICGEN_MODELS_DIR,
+            local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
+        )
+
+    sd = load_file(v23, device="cpu")
+    tw, vw, ew = {}, {}, {}
+    for k, v in sd.items():
+        if k.startswith("model.diffusion_model."):   tw[k.replace("model.diffusion_model.", "")] = v
+        elif k.startswith("transformer."):           tw[k.replace("transformer.", "")] = v
+        elif k.startswith("first_stage_model."):     vw[k.replace("first_stage_model.", "")] = v
+        elif k.startswith("vae."):                   vw[k.replace("vae.", "")] = v
+        elif "text_encoder" in k or "conditioner" in k:
+            if "conditioner.embedders.0." in k:      ew[k.replace("conditioner.embedders.0.", "")] = v
+            elif "text_encoder." in k:               ew[k.replace("text_encoder.", "")] = v
+    if tw: pipe.transformer.load_state_dict(tw, strict=False)
+    if vw: pipe.vae.load_state_dict(vw, strict=False)
+    if ew: pipe.text_encoder.load_state_dict(ew, strict=False)
+    del sd, tw, vw, ew
+
+    pipe.vae.enable_tiling()
+    pipe.vae.enable_slicing()
+
+    # NOTE: SageAttention + fp16 VAE decode were both briefly enabled here to
+    # match Wan, but both were only ever validated against Wan's
+    # model/hardware combo and produced all-black output on Qwen. Testing
+    # them one at a time on real hardware to isolate which (if either) is
+    # actually safe for Qwen — see TESTING NOTE below for current state.
+    #
+    # - SageAttention (enable_sage): apply_sage_attention() patches whatever
+    #   pipe.transformer it's given — on Qwen that runs sageattn() against
+    #   Qwen's Q/K/V tensor layout, which has never been verified
+    #   (tensor_layout HND vs NHD, GQA handling). It also sits inside the
+    #   denoising loop, so a subtle mismatch could degrade prompt adherence
+    #   without an obvious crash. Left OFF until independently verified.
+    #
+    # - fp16 VAE decode (enable_vae_fp16): TESTING NOW. Runs only after
+    #   denoising is done (pure latent-to-pixel conv net), so it cannot
+    #   affect prompt adherence — it's decode-only. Failure mode is binary
+    #   and obvious (all-black on overflow, fine otherwise), unlike Sage's
+    #   silent-degradation risk. Turned ON here to test in isolation with
+    #   Sage OFF — if generations come back correct, keep it; if black,
+    #   revert this one flag back to False.
+    #
+    # torch.compile is deliberately OFF for Qwen. Wan pre-buckets every input
+    # to one of a small set of fixed resolutions (resize_image_for_wan), so
+    # torch.compile only ever compiles ~2 shapes, once. Qwen picgen takes
+    # whatever dimensions the user uploads, unbucketed — every differently
+    # sized photo is a new shape, forcing Dynamo to recompile (~20-30s) on
+    # close to every generation instead of once. That's a net slowdown, not
+    # a speedup, and it's what was showing up as the "Inductor Compilation"
+    # progress-bar spam instead of clean diffusion steps.
+    apply_all_optimizations(
+        pipe, "Qwen (picgen)",
+        enable_compile=False,
+        enable_teacache=False,
+        enable_sage=False,
+        enable_vae_fp16=True,
+    )
     return pipe
-
-
-# ---------------------------------------------------------------------------
-# MODEL STARTUP — Load both models based on GPU mode
-# ---------------------------------------------------------------------------
-
-pic_pipe = None
-
 if DUAL_GPU:
-    # CONCURRENT MODE — both models GPU-resident simultaneously
+    # CONCURRENT MODE — either two dedicated GPUs or one 95 GB Blackwell
     if _SINGLE_CARD_CONCURRENT:
-        print(f"🚀 SINGLE-CARD CONCURRENT: Both Wan and MageFlow fit on {WAN_DEVICE} (~75 GB combined)")
+        print(f"🚀 SINGLE-CARD CONCURRENT: Loading Wan fully to {WAN_DEVICE}, Qwen with model-offload...")
     else:
-        print(f"🚀 DUAL GPU: Loading Wan → {WAN_DEVICE} and MageFlow → {PIC_DEVICE} simultaneously...")
+        print(f"🚀 DUAL GPU: Loading Wan → {WAN_DEVICE} and Qwen → {PIC_DEVICE} simultaneously...")
 
     def _load_wan_thread():
+        global wan_pipe_primary
         t = time.time()
         torch.cuda.set_device(WAN_DEVICE)
-        _load_wan(WAN_DEVICE)
+        wan_pipe_primary = _load_wan(WAN_DEVICE)
         print(f"✅ WAN ready on {WAN_DEVICE} in {time.time()-t:.1f}s")
 
-    def _load_pic_thread():
+    def _load_qwen_thread():
         global pic_pipe
         t = time.time()
-        pic_pipe = _load_mageflow(PIC_DEVICE)
-        print(f"✅ MageFlow ready on {PIC_DEVICE} in {time.time()-t:.1f}s")
+        torch.cuda.set_device(PIC_DEVICE)
+        print("🚀 Loading Qwen Image Edit pipeline...")
+        model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
+        if not os.path.exists(model_index_path):
+            print(f"Downloading Qwen base model to {BASE_MODEL_LOCAL_PATH}...")
+            os.makedirs(PICGEN_MODELS_DIR, exist_ok=True)
+            pipe = QwenImageEditPlusPipeline.from_pretrained(
+                "Qwen/Qwen-Image-Edit-2511",
+                torch_dtype=torch.bfloat16,
+                cache_dir=BASE_MODEL_LOCAL_PATH,
+                use_safetensors=True
+            )
+        else:
+            pipe = QwenImageEditPlusPipeline.from_pretrained(
+                BASE_MODEL_LOCAL_PATH,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+                local_files_only=True,
+                use_safetensors=True
+            )
+        print("Loading NSFW weights for Qwen...")
+        if not os.path.exists(NSFW_WEIGHTS_LOCAL_PATH):
+            print("Downloading NSFW weights...")
+            os.makedirs(os.path.dirname(NSFW_WEIGHTS_LOCAL_PATH), exist_ok=True)
+            v23_path = hf_hub_download(
+                repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
+                filename="v23/Qwen-Rapid-AIO-NSFW-v23.safetensors",
+                cache_dir=PICGEN_MODELS_DIR,
+                local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
+            )
+        else:
+            v23_path = NSFW_WEIGHTS_LOCAL_PATH
+        state_dict = load_file(v23_path)
+        transformer_weights, vae_weights, text_encoder_weights = {}, {}, {}
+        for k, v in state_dict.items():
+            if k.startswith("model.diffusion_model."):
+                transformer_weights[k.replace("model.diffusion_model.", "")] = v
+            elif k.startswith("transformer."):
+                transformer_weights[k.replace("transformer.", "")] = v
+            elif k.startswith("first_stage_model."):
+                vae_weights[k.replace("first_stage_model.", "")] = v
+            elif k.startswith("vae."):
+                vae_weights[k.replace("vae.", "")] = v
+            elif "text_encoder" in k or "conditioner" in k:
+                if "conditioner.embedders.0." in k:
+                    text_encoder_weights[k.replace("conditioner.embedders.0.", "")] = v
+                elif "text_encoder." in k:
+                    text_encoder_weights[k.replace("text_encoder.", "")] = v
+        if transformer_weights:
+            pipe.transformer.load_state_dict(transformer_weights, strict=False)
+        if vae_weights:
+            pipe.vae.load_state_dict(vae_weights, strict=False)
+        if text_encoder_weights:
+            pipe.text_encoder.load_state_dict(text_encoder_weights, strict=False)
+        del state_dict, transformer_weights, vae_weights, text_encoder_weights
+        pipe.vae.enable_tiling()
+        pipe.vae.enable_slicing()
+
+        if _SINGLE_CARD_CONCURRENT:
+            # enable_model_cpu_offload: streams each top-level submodule (text_encoder,
+            # transformer, vae) onto cuda:0 only while it is executing, then moves it
+            # back to CPU immediately. Peak resident VRAM = largest single submodule
+            # (~20 GB transformer) rather than all 35 GB at once. Wan's 57 GB stays
+            # pinned at all times. Total peak: ~57 + ~20 = ~77 GB — fits 95 GB easily
+            # IN THEORY. In practice the exact Wan checkpoint size varies (custom
+            # merges, driver/CUDA-context overhead, etc.), so rather than trust that
+            # math blindly we measure the real free VRAM left after Wan is pinned and
+            # only use the faster whole-submodule offload if there's real headroom.
+            # Otherwise fall back to enable_sequential_cpu_offload (layer-by-layer,
+            # ~2-4 GB peak, slower but immune to this OOM) so the app stays usable
+            # instead of crashing on the first Photo Editor generation.
+            global _QWEN_CUDA_GENERATOR
+            torch.cuda.synchronize(WAN_DEVICE)
+            torch.cuda.empty_cache()
+            _free_bytes, _total_bytes = torch.cuda.mem_get_info(0)
+            _free_gb = _free_bytes / (1024 ** 3)
+            _QWEN_SUBMODULE_SAFETY_GB = 30  # largest Qwen submodule (~20-25 GB) + margin
+            if _free_gb >= _QWEN_SUBMODULE_SAFETY_GB:
+                pipe.enable_model_cpu_offload(gpu_id=0)
+                _QWEN_CUDA_GENERATOR = True
+                print(f"✅ Qwen ready with model-cpu-offload on cuda:0 in {time.time()-t:.1f}s "
+                      f"({_free_gb:.1f} GB free after Wan)")
+            else:
+                pipe.enable_sequential_cpu_offload(gpu_id=0)
+                _QWEN_CUDA_GENERATOR = False
+                print(f"⚠️  Only {_free_gb:.1f} GB free after Wan (< {_QWEN_SUBMODULE_SAFETY_GB} GB safety "
+                      f"margin) — Qwen falling back to sequential-cpu-offload (slower, OOM-safe) "
+                      f"in {time.time()-t:.1f}s")
+        else:
+            # Two GPUs: pin Qwen fully to its dedicated card for maximum throughput
+            pipe.to(PIC_DEVICE)
+            print(f"✅ Qwen ready on {PIC_DEVICE} in {time.time()-t:.1f}s")
+
+        # Same optimization stack as _load_qwen_to_cpu() — SageAttention OFF,
+        # fp16 VAE decode ON for isolated testing; see the TESTING NOTE in
+        # that function for why (decode-only, can't affect prompt adherence,
+        # binary black/fine failure mode). torch.compile stays OFF for the
+        # unbucketed-input-shape reason noted there as well. This pipe is
+        # built inline here rather than via _load_qwen_to_cpu(), so it needs
+        # its own call.
+        apply_all_optimizations(
+            pipe, "Qwen (picgen)",
+            enable_compile=False,
+            enable_teacache=False,
+            enable_sage=False,
+            enable_vae_fp16=True,
+        )
+        pic_pipe = pipe
 
     if _SINGLE_CARD_CONCURRENT:
-        # Single card: load Wan first (larger), then MageFlow (smaller).
+        # On a single card, load Wan first (it pins 57 GB), then Qwen.
+        # Loading both in parallel would cause a transient OOM during weight init.
         _load_wan_thread()
-        _load_pic_thread()
+        _load_qwen_thread()
     else:
-        # Two GPUs: load in parallel.
         t_wan = threading.Thread(target=_load_wan_thread, daemon=False)
-        t_pic = threading.Thread(target=_load_pic_thread, daemon=False)
+        t_qwen = threading.Thread(target=_load_qwen_thread, daemon=False)
         t_wan.start()
-        t_pic.start()
+        t_qwen.start()
         t_wan.join()
-        t_pic.join()
+        t_qwen.join()
 
     _active_model = "both"
     if _SINGLE_CARD_CONCURRENT:
-        print(f"✅ SINGLE-CARD CONCURRENT READY — Wan + MageFlow both on cuda:0")
+        print(f"✅ SINGLE-CARD CONCURRENT READY — Wan pinned, Qwen offloaded (both on cuda:0)")
     else:
         print(f"✅ DUAL GPU READY — Vidgen on {WAN_DEVICE}, Picgen on {PIC_DEVICE}")
 
-    # Apply inference optimizations to Wan
-    print("⚡ Applying inference optimizations to Wan...")
+    # Apply inference optimizations to both pipelines
+    print("⚡ Applying inference optimizations...")
     _wan_opt = apply_all_optimizations(
         wan_pipe, "WAN (vidgen)",
         enable_compile=True,
@@ -2269,6 +2444,9 @@ elif STARTUP_MODE == "vidgen":
     print("🚀 VIDGEN DEFAULT: Loading Wan to GPU first for immediate use...")
     start_primary = time.time()
     _build_wan_pipeline("cpu")
+    # Swap mode: Wan gets the WHOLE card while it's active (Qwen is fully
+    # parked on CPU), so pick the fastest tier that actually fits instead of
+    # always defaulting to the slowest layer-by-layer offload.
     _apply_offload_tier(wan_pipe, "wan", 0, full_weight_gb=60, submodule_gb=32)
     _active_model = "wan"
     print(f"✅ WAN READY in {time.time()-start_primary:.1f}s - Vidgen functional!")
@@ -2280,22 +2458,32 @@ elif STARTUP_MODE == "vidgen":
         enable_vae_fp16=True,
     )
 
-    # Load MageFlow in background
-    def _bg_pic_load():
+    # Load Qwen to CPU in background so first tab-switch is fast
+    pic_pipe = None
+    def _bg_qwen_load():
         global pic_pipe
-        print("📦 Background: Loading MageFlow...")
-        pic_pipe = _load_mageflow("cpu")
-    threading.Thread(target=_bg_pic_load, daemon=True).start()
+        print("📦 Background: Loading Qwen to CPU...")
+        t = time.time()
+        pic_pipe = _load_qwen_to_cpu()
+        print(f"✅ Qwen on CPU in {time.time()-t:.1f}s — tab switching ready!")
+    threading.Thread(target=_bg_qwen_load, daemon=True).start()
 
 else:
-    # PICGEN MODE — MageFlow first
-    print("🚀 PICGEN MODE: Loading MageFlow to GPU first for immediate use...")
-    start_pic = time.time()
-    pic_pipe = _load_mageflow(PIC_DEVICE)
+    # PICGEN MODE
+    print("🚀 PICGEN MODE: Loading Qwen to GPU first for immediate use...")
+    start_qwen = time.time()
+    pic_pipe = _load_qwen_to_cpu()
+    # Swap mode: Qwen gets the WHOLE card while it's active (Wan is fully
+    # parked on CPU) — same reasoning as the Wan branch above.
+    _qwen_tier = _apply_offload_tier(pic_pipe, "pic", 0, full_weight_gb=42, submodule_gb=26)
+    # Only "sequential" routes activations through CPU; "full" and
+    # "model_offload" keep the active submodule resident on CUDA, so the
+    # generator can (and for correctness, must) live on CUDA too.
+    _QWEN_CUDA_GENERATOR = (_qwen_tier != "sequential")
     _active_model = "pic"
-    print(f"✅ MAGEFLOW READY in {time.time()-start_pic:.1f}s - Picgen functional!")
+    print(f"✅ QWEN READY in {time.time()-start_qwen:.1f}s - Picgen functional!")
 
-    # Load WAN to CPU in background
+    # Load WAN to CPU in background so first tab-switch is fast
     def _bg_wan_load():
         print("📦 Background: Loading Wan to CPU...")
         t = time.time()
@@ -2304,15 +2492,21 @@ else:
     threading.Thread(target=_bg_wan_load, daemon=True).start()
 
 _swap_lock = threading.Lock()
-_pic_dropped = False
+# Set True once activate_wan() drops pic_pipe for the first time. Lets
+# activate_pic() tell "still doing the one-time startup background load"
+# apart from "was loaded, then evicted by a swap" — the latter needs a
+# fresh rebuild, not another wait on a load that already finished.
+_qwen_dropped = False
 
 
 def activate_wan():
     """Ensure Wan is active on GPU."""
-    global _active_model, pic_pipe, wan_pipe, _wan_loaded, _pic_dropped
+    global _active_model, pic_pipe, wan_pipe, _wan_loaded, _qwen_dropped
 
     if DUAL_GPU:
-        # Concurrent mode — Wan is always GPU-resident.
+        # Concurrent mode — Wan is always GPU-resident (fully pinned).
+        # On a single 95 GB card Qwen uses enable_model_cpu_offload so it
+        # never permanently occupies Wan's VRAM; no swap is ever needed.
         if not _wan_loaded or wan_pipe is None:
             _load_wan(WAN_DEVICE)
         return
@@ -2327,17 +2521,21 @@ def activate_wan():
         if _active_model == "wan":
             return
 
-        # Drop MageFlow from GPU
+        # Drop Qwen from GPU: delete the offload-hooked pipeline and free memory.
+        # enable_sequential_cpu_offload() hooks can't be undone — deletion is the
+        # only clean path.
         if pic_pipe is not None:
-            del pic_pipe
             pic_pipe = None
-            _pic_dropped = True
+            _qwen_dropped = True
             gc.collect()
             torch.cuda.empty_cache()
 
-        # Load WAN
+        # Load WAN to CPU (weights already cached — fast), then stream to GPU.
         if not _wan_loaded or wan_pipe is None:
             _build_wan_pipeline("cpu")
+            # Apply optimizations to the freshly loaded pipeline.
+            # (If the pipeline was already built and cached, optimizations were
+            # applied at build time and survive in the CPU-side weights.)
             apply_all_optimizations(
                 wan_pipe, "WAN (swap-in)",
                 enable_compile=True,
@@ -2345,6 +2543,8 @@ def activate_wan():
                 enable_sage=True,
                 enable_vae_fp16=True,
             )
+        # Whole card is free for Wan right now (Qwen just got dropped above) —
+        # use the fastest tier that fits rather than always the slowest one.
         _apply_offload_tier(wan_pipe, "wan", 0, full_weight_gb=60, submodule_gb=32)
 
         _active_model = "wan"
@@ -2352,64 +2552,130 @@ def activate_wan():
 
 
 def activate_pic():
-    """Ensure MageFlow is active on GPU."""
-    global _active_model, pic_pipe, wan_pipe, _wan_loaded, _pic_dropped
+    """Ensure Qwen is active on GPU."""
+    global _active_model, pic_pipe, wan_pipe, _wan_loaded, _qwen_dropped, _QWEN_CUDA_GENERATOR
 
     if DUAL_GPU:
-        # Concurrent mode — MageFlow is always ready.
+        # Concurrent mode — Qwen is always ready.
+        # On a single 95 GB card its enable_model_cpu_offload hooks stream
+        # submodules to GPU only during inference and free them immediately
+        # after, so no manual management is needed here.
         if pic_pipe is None:
-            raise RuntimeError("MageFlow pipeline not loaded.")
+            raise RuntimeError("Qwen pipeline not loaded.")
         return
 
     if _active_model == "pic":
         return
 
+    # pic_pipe is None either because the one-time startup background load
+    # hasn't finished yet, or because a previous activate_wan() call dropped
+    # it (it always deletes the offload-hooked pipeline outright — those
+    # hooks can't be undone in place). Only the first case should wait;
+    # the second needs a fresh rebuild, since nothing else will ever
+    # repopulate pic_pipe on its own.
     if pic_pipe is None:
-        if _pic_dropped:
-            print("🔁 Rebuilding MageFlow (was dropped on a previous swap)...")
+        if _qwen_dropped:
+            print("🔁 Rebuilding Qwen (was dropped on a previous swap)...")
             rebuild_start = time.time()
-            pic_pipe = _load_mageflow(PIC_DEVICE)
-            print(f"✅ MageFlow rebuilt in {time.time()-rebuild_start:.1f}s")
+            pic_pipe = _load_qwen_to_cpu()
+            print(f"✅ Qwen rebuilt in {time.time()-rebuild_start:.1f}s")
         else:
-            print("⏳ Waiting for MageFlow background load...")
+            print("⏳ Waiting for Qwen background load...")
             wait_start = time.time()
             while pic_pipe is None:
                 time.sleep(0.5)
                 if time.time() - wait_start > 300:
-                    raise RuntimeError("MageFlow failed to load within 300 seconds")
-            print("✅ MageFlow background load complete")
+                    raise RuntimeError("Qwen failed to load within 300 seconds")
+            print("✅ Qwen background load complete")
 
-    print("🔄 Swapping to MageFlow...")
+    print("🔄 Swapping to Qwen...")
     t = time.time()
 
     with _swap_lock:
         if _active_model == "pic":
             return
 
-        # Drop WAN from GPU
+        # Drop WAN from GPU: same pattern — delete and free.
         if wan_pipe is not None:
             wan_pipe = None
             _wan_loaded = False
-            _wan_cache_clear()
+            _wan_cache_clear()   # free GPU tensors held in text/image caches
             gc.collect()
             torch.cuda.empty_cache()
 
-        # MageFlow just needs to be on the right device
-        # If it was loaded to CPU (background load), move it
-        if pic_pipe is not None and not _pic_dropped:
-            # Already loaded, might need device move
-            pass
-        elif pic_pipe is None:
-            pic_pipe = _load_mageflow(PIC_DEVICE)
-        _pic_dropped = False
+        # pic_pipe is already on CPU (loaded in startup, previous swap, or
+        # just rebuilt above). Whole card is free for it right now (Wan just
+        # got dropped) — use the fastest tier that fits.
+        _qwen_tier = _apply_offload_tier(pic_pipe, "pic", 0, full_weight_gb=42, submodule_gb=26)
+        _QWEN_CUDA_GENERATOR = (_qwen_tier != "sequential")
+        _qwen_dropped = False
 
         _active_model = "pic"
-        print(f"🎯 MageFlow active in {time.time()-t:.1f}s")
+        print(f"🎯 Qwen active in {time.time()-t:.1f}s")
 
 PICGEN_MAX_SEED = np.iinfo(np.int32).max
 
 # Thread pool for async base64 decoding (CPU-bound operation)
 _decode_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="b64decode")
+
+# Cache for VAE latents and prompt embeddings to speed up repeated generations
+_picgen_cache = {
+    "vae_latents": {},      # keyed by image hash
+    "prompt_embeds": {},    # keyed by (prompt, neg_prompt, images_hash)
+}
+_picgen_cache_lock = threading.Lock()
+MAX_CACHE_ENTRIES = 20  # Keep last 20 to avoid memory bloat
+
+
+def _hash_images(images):
+    """Create a stable hash from a list of PIL images."""
+    hasher = hashlib.sha256()
+    for img in images:
+        # Hash image size and a sample of pixels for speed
+        hasher.update(f"{img.size}".encode())
+        img_array = np.array(img.resize((64, 64), Image.LANCZOS))
+        hasher.update(img_array.tobytes())
+    return hasher.hexdigest()
+
+
+def _get_cached_vae_latents(images):
+    """Get cached VAE latents for images if available."""
+    img_hash = _hash_images(images)
+    with _picgen_cache_lock:
+        return _picgen_cache["vae_latents"].get(img_hash)
+
+
+def _cache_vae_latents(images, latents):
+    """Cache VAE latents for images."""
+    img_hash = _hash_images(images)
+    with _picgen_cache_lock:
+        cache = _picgen_cache["vae_latents"]
+        if len(cache) >= MAX_CACHE_ENTRIES:
+            # Remove oldest entry
+            cache.pop(next(iter(cache)))
+        cache[img_hash] = latents
+
+
+def _get_cached_prompt_embeds(prompt, negative_prompt, images, num_images_per_prompt):
+    """Get cached prompt embeddings if available."""
+    img_hash = _hash_images(images)
+    # Cache key includes num_images_per_prompt since that affects the output shape
+    key = (prompt, negative_prompt or "", img_hash, num_images_per_prompt)
+    with _picgen_cache_lock:
+        return _picgen_cache["prompt_embeds"].get(key)
+
+
+def _cache_prompt_embeds(prompt, negative_prompt, images, num_images_per_prompt, embeds_data):
+    """Cache prompt embeddings."""
+    img_hash = _hash_images(images)
+    key = (prompt, negative_prompt or "", img_hash, num_images_per_prompt)
+    with _picgen_cache_lock:
+        cache = _picgen_cache["prompt_embeds"]
+        if len(cache) >= MAX_CACHE_ENTRIES:
+            # Remove oldest entry
+            cache.pop(next(iter(cache)))
+        cache[key] = embeds_data
+
 
 STARTER_IMAGE_EXTS = ("jpg", "jpeg", "png", "webp")
 
@@ -2508,61 +2774,118 @@ def infer(
     activate_pic()
     _t_active = time.time()
 
+    # Pin to PIC_DEVICE — prevents cross-device leakage in dual GPU mode.
+    # Generator device must match Qwen's actual offload strategy, not just the
+    # nominal GPU_MODE:
+    # - enable_model_cpu_offload (whole submodules pinned during use): CUDA generator
+    # - enable_sequential_cpu_offload (layer-by-layer, incl. single-card concurrent's
+    #   low-VRAM fallback, and swap mode): activations route through CPU, so the
+    #   generator must be CPU or diffusers raises a device mismatch.
+    torch.cuda.set_device(PIC_DEVICE)
+    _pic_gen_device = PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu"
+    generator = torch.Generator(device=_pic_gen_device).manual_seed(seed)
     pil_images = b64_to_pil_list(images_b64_json)
     if not pil_images:
         raise gr.Error("Please upload at least one image.")
     _t_decoded = time.time()
 
-    # MageFlow accepts native resolution — if user didn't specify dimensions,
-    # use the source image size (capped at PIC_MAX_SIZE)
     if height == 256 and width == 256:
         height, width = None, None
 
     print(f"Prompt: '{prompt}' | Seed: {seed} | Steps: {num_inference_steps}")
     print(f"  input images: {[im.size for im in pil_images]}")
-    print(f"  timing: activate {_t_active - _t_enter:.2f}s, "
-          f"decode {_t_decoded - _t_active:.2f}s")
+
+    # ---- Prompt embedding cache -------------------------------------------
+    # The previous approach monkey-patched pic_pipe.encode_prompt so it could
+    # return cached values. The problem: accelerate's sequential offload hooks
+    # fire at pre_forward time, BEFORE encode_prompt runs, moving the
+    # text_encoder to GPU regardless of whether we'd return early. That's what
+    # caused the 14.5 GB + 1.02 GB OOM.
+    #
+    # Fix: call encode_prompt once here (outside the pipeline), cache the
+    # result tensor, and on subsequent calls pass prompt_embeds directly as a
+    # pipeline kwarg — which causes the pipeline to skip the encode_prompt call
+    # entirely, so the offload hook for text_encoder never fires.
+    cached_embeds = _get_cached_prompt_embeds(prompt, negative_prompt, pil_images, num_images_per_prompt)
+
+    if cached_embeds is not None:
+        print(f"  timing: activate {_t_active - _t_enter:.2f}s, "
+              f"decode {_t_decoded - _t_active:.2f}s, embeds: cache hit "
+              f"(active model: {_active_model}, dual_gpu: {DUAL_GPU}, qwen_cuda_gen: {_QWEN_CUDA_GENERATOR})")
+        pic_kwargs = dict(
+            image=pil_images,
+            prompt_embeds=cached_embeds["prompt_embeds"],
+            prompt_embeds_mask=cached_embeds["prompt_embeds_mask"],
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            generator=generator,
+            true_cfg_scale=true_guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+        )
+    else:
+        print(f"  timing: activate {_t_active - _t_enter:.2f}s, "
+              f"decode {_t_decoded - _t_active:.2f}s, embeds: computing "
+              f"(active model: {_active_model}, dual_gpu: {DUAL_GPU}, qwen_cuda_gen: {_QWEN_CUDA_GENERATOR})")
+        pic_kwargs = dict(
+            image=pil_images,
+            prompt=prompt,
+            height=height,
+            width=width,
+            negative_prompt=negative_prompt,
+            num_inference_steps=num_inference_steps,
+            generator=generator,
+            true_cfg_scale=true_guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+        )
 
     _t_pipe = time.time()
 
-    # MageFlow edit API:
-    # - prompts: list of strings (one per output image)
-    # - ref_images: list of (image or list-of-images) — multi-image edits pass a list
-    # - steps, cfg, seeds, heights, widths, max_size, neg_prompts
-    results = []
-    for i in range(num_images_per_prompt):
-        img_seed = seed + i if num_images_per_prompt > 1 else seed
+    _pic_ctx2 = torch.cuda.device(PIC_DEVICE) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+    _pic_autocast2 = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
+    with _pic_ctx2:
+        with _pic_autocast2:
+            result = pic_pipe(**pic_kwargs)
+            image = result.images
 
-        # Build ref_images — if single image, pass it directly; if multiple, pass as list
-        ref = pil_images if len(pil_images) > 1 else pil_images[0]
-
-        edit_kwargs = dict(
-            steps=int(num_inference_steps),
-            cfg=float(true_guidance_scale),
-            seeds=[img_seed],
-            max_size=PIC_MAX_SIZE,
-        )
-
-        # Add explicit dimensions if user specified them
-        if height and width and height > 256 and width > 256:
-            edit_kwargs["heights"] = [int(height)]
-            edit_kwargs["widths"] = [int(width)]
-            edit_kwargs.pop("max_size", None)
-
-        # Add negative prompt if non-empty
-        neg = (negative_prompt or "").strip()
-        if neg and neg != " ":
-            edit_kwargs["neg_prompts"] = [neg]
-
-        output = pic_pipe.edit([prompt], [ref], **edit_kwargs)
-        results.extend(output)
+    # Cache the embeddings for next time if this was a fresh encode.
+    # QwenImageEditPlusPipeline stores the last-computed embeds on the result
+    # under various attribute names depending on diffusers version — try them.
+    if cached_embeds is None:
+        try:
+            pe = getattr(result, 'prompt_embeds', None)
+            pe_mask = getattr(result, 'prompt_embeds_mask', None)
+            if pe is not None and pe_mask is not None:
+                _cache_prompt_embeds(
+                    prompt, negative_prompt, pil_images, num_images_per_prompt,
+                    {"prompt_embeds": pe, "prompt_embeds_mask": pe_mask},
+                )
+            else:
+                # Encode directly and cache; runs only once per unique prompt.
+                with torch.no_grad(), torch.cuda.device(PIC_DEVICE):
+                    enc_result = pic_pipe.encode_prompt(
+                        prompt=prompt,
+                        image=pil_images,
+                        device=PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu",
+                        num_images_per_prompt=num_images_per_prompt,
+                    )
+                if isinstance(enc_result, (list, tuple)) and len(enc_result) >= 2:
+                    _cache_prompt_embeds(
+                        prompt, negative_prompt, pil_images, num_images_per_prompt,
+                        {"prompt_embeds": enc_result[0], "prompt_embeds_mask": enc_result[1]},
+                    )
+        except Exception as _ce:
+            # Non-fatal — cache miss just means next call re-encodes
+            print(f"  embed cache fill skipped (non-fatal): {_ce}")
 
     print(f"  pipeline call took {time.time() - _t_pipe:.2f}s")
 
-    # Persist each result under a unique, fully-qualified filename.
-    multiple = len(results) > 1
+    # Persist each result under a unique, fully-qualified filename. Returning
+    # real paths (instead of in-memory PIL objects) is what makes the download
+    # button serve a proper .png name.
+    multiple = len(image) > 1
     saved_paths = []
-    for i, img in enumerate(results, start=1):
+    for i, img in enumerate(image, start=1):
         out_path = unique_output_path("picgen", ".png", index=i if multiple else None)
         img.save(out_path, format="PNG")
         saved_paths.append(str(out_path))
@@ -2570,7 +2893,7 @@ def infer(
 
     # Convert saved paths to proper Gradio format with visible labels
     gallery_items = [(path, os.path.basename(path)) for path in saved_paths]
-
+    
     return gallery_items, seed
 
 
@@ -2843,7 +3166,7 @@ with gr.Blocks(css=css) as demo:
     with gr.Tabs(selected=("vidgen-tab" if STARTUP_MODE == "vidgen" else "picgen-tab")):
 
         # ------------------------------------------------------------------ #
-        #  TAB 1 — VIDEO GENERATOR (MageFlow edit -> Wan 2.2 4-step animate)   #
+        #  TAB 1 — VIDEO GENERATOR (Qwen relocate -> Wan 2.2 4-step animate)  #
         # ------------------------------------------------------------------ #
         with gr.Tab("🎬 Video Generator", id="vidgen-tab"):
             gr.Markdown(model_title())
@@ -2891,7 +3214,7 @@ with gr.Blocks(css=css) as demo:
                         placeholder="e.g. remove all clothing, keep everything else identical",
                     )
                     edit_instruction_info = gr.Markdown(
-                        "**Custom Edit** tells MageFlow how to modify the photo *before* animation. "
+                        "**Custom Edit** tells Qwen how to modify the photo *before* animation. "
                         "Example: `remove all clothing` or `add a red dress`. "
                         "The Motion Prompt above separately tells WAN how to *animate* the result.",
                         visible=False,
@@ -3087,16 +3410,16 @@ with gr.Blocks(css=css) as demo:
                 with gr.Row():
                     edit_steps = gr.Slider(
                         1, 20, value=4, step=1,
-                        label="Frame-Edit Steps (MageFlow stage)",
+                        label="Frame-Edit Steps (Qwen stage)",
                     )
                     edit_guidance = gr.Slider(
                         1.0, 10.0, value=1.0, step=0.1,
-                        label="Frame-Edit Guidance (MageFlow stage)",
+                        label="Frame-Edit Guidance (Qwen stage)",
                     )
                 gr.Markdown(
                     "**WAMU v2 settings:** 4 steps (locked), guidance 1.0 (distillation-merged). "
                     "Flow shift adjustable (default 6.9). "
-                    "MageFlow sliders affect frame-edit stage only, ignored in Keep-scene mode."
+                    "Qwen sliders affect frame-edit stage only, ignored in Keep-scene mode."
                 )
 
             # Vidgen prompt dropdown handlers (change events update prompt textbox)
@@ -3854,7 +4177,7 @@ if __name__ == "__main__":
         if STARTUP_MODE == "vidgen":
             print("🚀 GRADIO LAUNCHING — Wan on GPU, vidgen ready immediately.")
         else:
-            print("🚀 GRADIO LAUNCHING — MageFlow on GPU, picgen ready immediately.")
+            print("🚀 GRADIO LAUNCHING — Qwen on GPU, picgen ready immediately.")
         demo.queue(default_concurrency_limit=1)
 
         # Launch Gradio (blocks forever — background threads already started above)
