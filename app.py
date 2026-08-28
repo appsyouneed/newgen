@@ -3180,18 +3180,13 @@ with gr.Blocks(css=css) as demo:
             def track_image_change(img):
                 """Update tracking whenever reference_image changes (upload, clear, replace)."""
                 global _current_input_image_path
-                print(f"track_image_change called with: {type(img)} = {img}")
                 if img is None or img == "":
                     _current_input_image_path = None
                 elif isinstance(img, str):
                     _current_input_image_path = img
-                    print(f"Input image updated (str): {img}")
                 elif hasattr(img, 'name'):
                     _current_input_image_path = img.name
-                    print(f"Input image updated (obj.name): {img.name}")
                 else:
-                    print(f" Unknown image type, not tracking")
-                print(f"_current_input_image_path is now: {_current_input_image_path}")
                 return None
             
             # Use .change() instead of .upload() - fires AFTER upload completes with filepath
