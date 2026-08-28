@@ -3312,6 +3312,12 @@ with gr.Blocks(css=css) as demo:
                         autoplay=True,
                         interactive=False,
                     )
+                    generate_btn = gr.Button(
+                        "🎬 Generate Video", variant="primary", size="lg"
+                    )
+                    vid_clear_storage_btn = gr.Button(
+                        "🗑 Clear Storage", variant="secondary", size="sm"
+                    )
                     with gr.Row():
                         frame_time_input = gr.Number(
                             label="Frame time (seconds) — auto-updates as video plays",
@@ -3380,10 +3386,6 @@ with gr.Blocks(css=css) as demo:
                             value=None, interactive=True, scale=1,
                         )
                     
-                    # Centered Generate button
-                    generate_btn = gr.Button(
-                        "🎬 Generate Video", variant="primary", size="lg"
-                    )
                     end_image = gr.Image(
                         label="End Frame (optional, first segment only)",
                         type="pil",
@@ -3432,6 +3434,9 @@ with gr.Blocks(css=css) as demo:
             vid_preset_dropdown7.change(fn=update_vid_prompt7, inputs=[vid_preset_dropdown7], outputs=[vid_prompt], scroll_to_output=False)
             vid_preset_dropdown8.change(fn=update_vid_prompt8, inputs=[vid_preset_dropdown8], outputs=[vid_prompt], scroll_to_output=False)
 
+            def _noop_download(f):
+                return f
+
             generate_btn.click(
                 fn=generate_video,
                 inputs=[
@@ -3444,6 +3449,41 @@ with gr.Blocks(css=css) as demo:
                 outputs=[video_output, video_file],
                 concurrency_id=WAN_QUEUE_ID,
                 concurrency_limit=10,
+            ).then(
+                fn=_noop_download,
+                inputs=[video_file],
+                outputs=[video_file],
+                js="""(file) => {
+                    if (file) {
+                        const url = file.url || (typeof file === 'string' ? file : (file.path || file.name || ''));
+                        if (url) {
+                            const a = document.createElement('a');
+                            a.href = file.url ? file.url : '/file=' + url;
+                            a.download = file.orig_name || 'vidgen.mp4';
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
+                        }
+                    }
+                    setTimeout(() => {
+                        const clearBtn = document.querySelector('#clear-storage-btn button, button#clear-storage-btn');
+                        if (clearBtn) {
+                            clearBtn.click();
+                        } else {
+                            const allBtns = document.querySelectorAll('button');
+                            for (const btn of allBtns) {
+                                if (btn.textContent.includes('Clear Storage')) { btn.click(); break; }
+                            }
+                        }
+                    }, 1500);
+                    return [file];
+                }""",
+            )
+
+            vid_clear_storage_btn.click(
+                fn=clear_storage,
+                inputs=[],
+                outputs=[clear_storage_status],
             )
 
             # Timeline generate handler
@@ -3493,6 +3533,35 @@ with gr.Blocks(css=css) as demo:
                 outputs=[video_output, video_file],
                 concurrency_id=WAN_QUEUE_ID,
                 concurrency_limit=10,
+            ).then(
+                fn=_noop_download,
+                inputs=[video_file],
+                outputs=[video_file],
+                js="""(file) => {
+                    if (file) {
+                        const url = file.url || (typeof file === 'string' ? file : (file.path || file.name || ''));
+                        if (url) {
+                            const a = document.createElement('a');
+                            a.href = file.url ? file.url : '/file=' + url;
+                            a.download = file.orig_name || 'vidgen_timeline.mp4';
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
+                        }
+                    }
+                    setTimeout(() => {
+                        const clearBtn = document.querySelector('#clear-storage-btn button, button#clear-storage-btn');
+                        if (clearBtn) {
+                            clearBtn.click();
+                        } else {
+                            const allBtns = document.querySelectorAll('button');
+                            for (const btn of allBtns) {
+                                if (btn.textContent.includes('Clear Storage')) { btn.click(); break; }
+                            }
+                        }
+                    }, 1500);
+                    return [file];
+                }""",
             )
 
             # Frame extraction functions
