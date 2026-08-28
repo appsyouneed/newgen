@@ -500,7 +500,6 @@ def load_lora_config():
         with open(LORA_CONFIG_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     except Exception as e:
-        print(f"Error loading LoRA config: {e}")
         return {}
 
 def save_lora_config(config):
@@ -510,7 +509,6 @@ def save_lora_config(config):
             json.dump(config, f, indent=2, ensure_ascii=False)
         return True
     except Exception as e:
-        print(f"Error saving LoRA config: {e}")
         return False
 
 def download_lora_file(url, filename, progress_callback=None):
@@ -667,12 +665,12 @@ def load_loras_to_pipeline(pipe, selected_loras):
         if hasattr(pipe, 'unload_lora_weights'):
             pipe.unload_lora_weights()
     except Exception as e:
-        print(f"Warning: Could not unload previous LoRAs: {e}")
+
     
     _active_loras = {}
     
     if not selected_loras:
-        print("No LoRAs selected")
+
         return
     
     # Load selected LoRAs
@@ -683,23 +681,19 @@ def load_loras_to_pipeline(pipe, selected_loras):
         try:
             # Load high-noise LoRA to transformer (high-noise expert)
             if high_path and hasattr(pipe, 'transformer'):
-                print(f"Loading high-noise LoRA: {Path(high_path).name}")
                 pipe.load_lora_weights(high_path, adapter_name=f"{base_name}_high")
                 pipe.set_adapters([f"{base_name}_high"], adapter_weights=[1.0])
             
             # Load low-noise LoRA to transformer_2 (low-noise expert)
             if low_path and hasattr(pipe, 'transformer_2'):
-                print(f"Loading low-noise LoRA: {Path(low_path).name}")
                 # Note: diffusers may need specific API for dual-transformer LoRA loading
                 # This is a simplified approach - may need adjustment based on actual API
                 
             _active_loras[base_name] = lora_info
-            print(f" LoRA '{base_name}' loaded successfully")
             
         except Exception as e:
-            print(f"Failed to load LoRA '{base_name}': {e}")
     
-    print(f"Active LoRAs: {list(_active_loras.keys())}")
+
 
 def apply_lora_prompt_modifications(base_prompt, selected_loras_info):
     """Apply trigger prompts from selected LoRAs to the base prompt."""
@@ -833,12 +827,10 @@ LORA_CONFIG = load_lora_config()
 AVAILABLE_LORAS = discover_loras()
 LORA_STATUS = check_lora_status(LORA_CONFIG)
 
-print(f"Found {len(AVAILABLE_LORAS)} LoRA(s) in {LORA_DIR}")
 for lora_id, info in AVAILABLE_LORAS.items():
     status = LORA_STATUS.get(lora_id, {})
     high_status = "OK" if info['high'] else ("DL" if status.get('high_downloadable') else "X")
     low_status = "OK" if info['low'] else ("DL" if status.get('low_downloadable') else "X")
-    print(f"  - {info['display_name']}: high={high_status}, low={low_status}")
 
 # ---------------------------------------------------------------------------
 
@@ -925,10 +917,8 @@ def _from_pretrained_cached(repo: str, **kwargs):
         pipe = WanImageToVideoPipeline.from_pretrained(
             repo, local_files_only=True, **kwargs
         )
-        print(f"Loaded {repo} from local cache.")
         return pipe
     except Exception:
-        print(f"Fetching {repo}...")
         return WanImageToVideoPipeline.from_pretrained(repo, **kwargs)
 
 
@@ -1213,7 +1203,7 @@ def animate_frame(
     if lora_selections:
         selected = {k: v for k, v in AVAILABLE_LORAS.items() if lora_selections.get(k, False)}
         if selected:
-            print(f"Applying {len(selected)} LoRA(s): {list(selected.keys())}")
+
             load_loras_to_pipeline(wan_pipe, selected)
             
             # Apply trigger prompt modifications
@@ -1221,7 +1211,7 @@ def animate_frame(
                 original_prompt = prompt
                 prompt = apply_lora_prompt_modifications(prompt, selected_loras_info)
                 if prompt != original_prompt:
-                    print(f"Prompt modified by LoRAs: {prompt}")
+        
     else:
         # No LoRAs selected, make sure any previous LoRAs are unloaded
         load_loras_to_pipeline(wan_pipe, {})
@@ -1235,7 +1225,7 @@ def animate_frame(
         _set_flow_shift(wan_pipe, flow_shift if flow_shift is not None else WAN_FLOW_SHIFT)
 
         print(f"[2/2] Wan animating {num_frames} frames at {frame.size}...")
-        print(f"Prompt: {prompt!r} | Seed: {seed} | Steps: {steps}")
+        print(f"Seed: {seed} | Steps: {steps}")
 
         kwargs = dict(
             image=frame,
@@ -1257,7 +1247,7 @@ def animate_frame(
         try:
             return wan_pipe(last_image=last_frame, **kwargs).frames[0]
         except TypeError as e:
-            print(f"End frame not supported by this pipeline ({e})  ignoring it.")
+            print(f"End frame not supported by this pipeline ({e}); ignoring it.")
             return wan_pipe(**kwargs).frames[0]
 
 
@@ -1447,13 +1437,11 @@ def generate_video(
             if is_enabled:
                 selected_loras_info[lora_id] = lora_info
     
-    # Apply LoRA-recommended settings (with user override support)
-    if selected_loras_info:
+    # Apply LoRA-recommended settings (with user override support)        if selected_loras_info:
         edit_steps, flow_shift, lora_settings_msg = apply_lora_settings(
             selected_loras_info, edit_steps, flow_shift, flow_shift_auto
         )
         if lora_settings_msg:
-            print(lora_settings_msg)
     
     # Track the current input image path if it's a filepath (for clear_storage exclusion)
     if isinstance(reference_image, str):
@@ -1507,10 +1495,14 @@ def generate_video(
     segment_paths = []
 
     try:
+        if progress:
+            progress(0.02, desc="Preparing reference frame")
         sized = resize_image_for_wan(reference_image, resolution)
-        print(f"Resized image to {sized.size} for VAE compatibility")
+
 
         # ---- Stage 1: optional frame preparation --------------------------
+        if progress:
+            progress(0.10, desc="Preparing reference frame")
         start_frame = edit_reference_frame(
             sized, scene_mode, prompt,
             current_seed, edit_steps, edit_guidance,
@@ -1533,6 +1525,8 @@ def generate_video(
             seg_index += 1
 
             seg_end = processed_end if seg_index == 1 else None
+            if progress:
+                progress(min(0.15 + 0.75 * (seg_index - 1) / max(1, int(duration_seconds / SEGMENT_DURATION + 1)), 0.90), desc=f"Generating segment {seg_index}")
             raw_frames = animate_frame(
                 current_frame, seg_end, prompt, negative_prompt,
                 num_frames, seg_seed, flow_shift, edit_steps,
@@ -1605,7 +1599,9 @@ def generate_video(
 
         print(f"Done in {time.time() - started:.1f}s  {seg_index} segment(s), "
               f"seed {current_seed} -> {os.path.basename(final_path)}")
-        return final_path, final_path
+        if progress:
+            progress(1.0, desc="Generation complete")
+        return final_path, final_path, gr.update(visible=False, value="")
 
     except gr.Error:
         raise
@@ -2204,7 +2200,7 @@ def infer(
     if height == 256 and width == 256:
         height, width = None, None
 
-    print(f"Prompt: '{prompt}' | Seed: {seed} | Steps: {num_inference_steps}")
+    print(f"Seed: {seed} | Steps: {num_inference_steps}")
     print(f"  input images: {[im.size for im in pil_images]}")
     
     # Check cache for prompt embeddings (cache key includes num_images_per_prompt)
@@ -2504,10 +2500,6 @@ with gr.Blocks(css=css) as demo:
         deleted = []
         errors = []
 
-        print(f"Starting clear_storage at {time.time()}")
-        print(f"_current_input_image_path = {repr(_current_input_image_path)}")
-        if _current_input_image_path:
-            print(f"Protecting current input image: {_current_input_image_path}")
 
         # BACKUP METHOD 1: Try relative path from current working directory
         gradio_dir_cwd = Path.cwd() / "tmp" / "gradio"
@@ -2521,7 +2513,6 @@ with gr.Blocks(css=css) as demo:
         # Try all possible paths for tmp/gradio
         for gradio_dir in [gradio_dir_cwd, gradio_dir_script, gradio_dir_abs]:
             if gradio_dir.exists():
-                print(f"Found gradio dir at: {gradio_dir}")
                 for item in gradio_dir.iterdir():
                     if item.name == "vibe_edit_history":
                         continue
@@ -2534,7 +2525,6 @@ with gr.Blocks(css=css) as demo:
                         
                         # Skip if this IS the protected file
                         if item == protected_path:
-                            print(f"   Skipping protected file: {item}")
                             should_skip = True
                         
                         # Skip if this directory CONTAINS the protected file
@@ -2542,7 +2532,6 @@ with gr.Blocks(css=css) as demo:
                             try:
                                 # Check if protected path is inside this directory
                                 protected_path.relative_to(item)
-                                print(f"   Skipping directory containing protected file: {item}")
                                 should_skip = True
                             except ValueError:
                                 # Not a parent directory, can delete
@@ -2556,31 +2545,25 @@ with gr.Blocks(css=css) as demo:
                         if item.is_dir():
                             try:
                                 _shutil.rmtree(item)
-                                print(f"  Deleted dir: {item}")
                             except Exception as e1:
                                 # Backup: try subprocess rm
                                 result = subprocess.run(["rm", "-rf", str(item)], capture_output=True)
                                 if result.returncode == 0:
-                                    print(f"  Deleted dir (subprocess): {item}")
                         else:
                             try:
                                 item.unlink()
-                                print(f"  Deleted file: {item}")
                             except Exception as e2:
                                 # Backup: try subprocess rm
                                 result = subprocess.run(["rm", "-f", str(item)], capture_output=True)
                                 if result.returncode == 0:
-                                    print(f"  Deleted file (subprocess): {item}")
                         deleted.append(str(item))
                     except Exception as e:
-                        print(f"  Failed to delete {item}: {e}")
                         errors.append(f"{item.name}: {e}")
                 break  # Only process first found directory
 
         # Also clean up loose files in tmp root folder (INCLUDING .mp4 files)
         for tmp_dir in [Path.cwd() / "tmp", Path(SCRIPT_DIR) / "tmp", Path("/root/newgen/tmp")]:
             if tmp_dir.exists():
-                print(f"Checking tmp root at: {tmp_dir}")
                 for item in tmp_dir.iterdir():
                     # Skip the gradio subdirectory (already handled above)
                     if item.is_dir() and item.name == "gradio":
@@ -2591,28 +2574,23 @@ with gr.Blocks(css=css) as demo:
                     
                     # Skip current input image
                     if _current_input_image_path and str(item) in str(_current_input_image_path):
-                        print(f"  Skipping current input: {item}")
                         continue
                     
                     # Delete ALL loose files (including .mp4, .png, etc)
                     try:
                         try:
                             item.unlink()
-                            print(f"  Deleted tmp file: {item}")
                         except Exception as e3:
                             result = subprocess.run(["rm", "-f", str(item)], capture_output=True)
                             if result.returncode == 0:
-                                print(f"  Deleted tmp file (subprocess): {item}")
                         deleted.append(str(item))
                     except Exception as e:
-                        print(f"  Failed to delete tmp file {item}: {e}")
                         errors.append(f"{item.name}: {e}")
                 break
 
         # ADDITIONAL BACKUP: Force delete all .mp4 files in tmp using find command
         for tmp_dir in [Path.cwd() / "tmp", Path(SCRIPT_DIR) / "tmp", Path("/root/newgen/tmp")]:
             if tmp_dir.exists():
-                print(f"Force cleaning .mp4 files in: {tmp_dir}")
                 subprocess.run(
                     ["find", str(tmp_dir), "-maxdepth", "1", "-name", "*.mp4", "-type", "f", "-delete"],
                     capture_output=True, check=False
@@ -2628,19 +2606,16 @@ with gr.Blocks(css=css) as demo:
         # Try multiple paths
         for images_dir in [IMAGE_OUTPUT_DIR, Path.cwd() / "outputs" / "images", Path("/root/newgen/outputs/images")]:
             if images_dir.exists():
-                print(f"Found images dir at: {images_dir}")
                 for item in images_dir.iterdir():
                     try:
                         if item.is_dir():
                             try:
                                 _shutil.rmtree(item)
-                                print(f"  Deleted images dir: {item}")
                             except:
                                 subprocess.run(["rm", "-rf", str(item)], check=False)
                         else:
                             try:
                                 item.unlink()
-                                print(f"  Deleted image file: {item}")
                             except:
                                 subprocess.run(["rm", "-f", str(item)], check=False)
                         deleted.append(str(item))
@@ -2651,19 +2626,16 @@ with gr.Blocks(css=css) as demo:
         # 3. outputs/videos  delete contents, keep folder
         for videos_dir in [VIDEO_OUTPUT_DIR, Path.cwd() / "outputs" / "videos", Path("/root/newgen/outputs/videos")]:
             if videos_dir.exists():
-                print(f"Found videos dir at: {videos_dir}")
                 for item in videos_dir.iterdir():
                     try:
                         if item.is_dir():
                             try:
                                 _shutil.rmtree(item)
-                                print(f"  Deleted videos dir: {item}")
                             except:
                                 subprocess.run(["rm", "-rf", str(item)], check=False)
                         else:
                             try:
                                 item.unlink()
-                                print(f"  Deleted video file: {item}")
                             except:
                                 subprocess.run(["rm", "-f", str(item)], check=False)
                         deleted.append(str(item))
@@ -2671,7 +2643,6 @@ with gr.Blocks(css=css) as demo:
                         errors.append(f"{item.name}: {e}")
                 break
 
-        print(f"Finished clear_storage. Deleted {len(deleted)} items, {len(errors)} errors")
         if errors:
             return gr.update(visible=True, value=f" Done with errors: {'; '.join(errors[:5])}")
         return gr.update(visible=True, value=f" Cleared {len(deleted)} items.")
@@ -2774,6 +2745,9 @@ with gr.Blocks(css=css) as demo:
                         )
 
                 with gr.Column(scale=1):
+                    vidgen_progress = gr.Markdown(
+                        "", visible=False, elem_id="vidgen-progress"
+                    )
                     video_output = gr.Video(
                         label="Generated Video",
                         elem_id="generated-video",
@@ -3209,7 +3183,6 @@ with gr.Blocks(css=css) as demo:
                 print(f"track_image_change called with: {type(img)} = {img}")
                 if img is None or img == "":
                     _current_input_image_path = None
-                    print("Input image cleared, no longer protected")
                 elif isinstance(img, str):
                     _current_input_image_path = img
                     print(f"Input image updated (str): {img}")
