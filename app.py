@@ -70,14 +70,9 @@ import numpy as np
 import torch
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
-# 'highest' forces full-precision FP32 matmul kernels, which silently defeats
-# the allow_tf32 flags set right below — those only take effect at 'high' or
-# lower. The main denoising math runs in bf16 either way (unaffected), but any
-# fp32 matmul in the pipeline (text-encoder bits, RIFE, misc ops) was paying
-# the slow-path tax for no accuracy benefit. 'high' enables TF32 tensor-core
-# matmul for fp32 inputs — the same numerics class already opted into via
-# allow_tf32 two lines down, just no longer silently overridden here.
-torch.set_float32_matmul_precision('high')
+# Use 'highest' to preserve strict dtype consistency — 'high' causes bfloat16/float32
+# mismatches in Qwen's text encoder during concurrent dual-GPU inference
+torch.set_float32_matmul_precision('highest')
 # Do NOT enable cudnn.benchmark — Blackwell GPUs (GB202) fail on conv3d engine search
 torch.backends.cudnn.benchmark = False
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -91,24 +86,10 @@ logging.getLogger("absl").setLevel(logging.ERROR)
 logging.getLogger("diffusers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-# Suppress torchao import warning from diffusers
-import io as _io
-import contextlib as _ctx
-
 from huggingface_hub import hf_hub_download
 from torch.nn import functional as F
 from PIL import Image
 from safetensors.torch import load_file
-
-# ---------------------------------------------------------------------------
-# SAGEATTENTION — 2-3x faster attention kernels (optional, auto-detected)
-# ---------------------------------------------------------------------------
-_SAGE_ATTENTION_AVAILABLE = False
-try:
-    from sageattention import sageattn
-    _SAGE_ATTENTION_AVAILABLE = True
-except ImportError:
-    pass
 
 import gradio as gr
 from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
@@ -248,119 +229,39 @@ if not os.path.exists("train_log/RIFE_HDv3.py"):
         ], check=True)
     subprocess.run(["unzip", "-n", "RIFEv4.26_0921.zip"], check=True)
 
-# The RIFE zip only contains train_log/ (flownet.pkl + .py wrappers).
-# RIFE_HDv3.py imports from "model.warplayer" and "model.IFNet_HDv3" which are
-# part of the Practical-RIFE repo's model/ directory. If model/ doesn't exist
-# at cwd, clone just that folder from the repo.
-if not os.path.exists("model") or not os.path.exists("model/warplayer.py"):
-    print("Downloading RIFE model/ package (warplayer, IFNet)...")
-    subprocess.run([
-        "git", "clone", "--depth=1", "--filter=blob:none", "--sparse",
-        "https://github.com/hzwer/Practical-RIFE.git", "_rife_tmp"
-    ], check=True)
-    subprocess.run(["git", "sparse-checkout", "set", "model"], check=True, cwd="_rife_tmp")
-    # Move model/ to cwd and clean up
-    if os.path.exists("_rife_tmp/model"):
-        shutil.move("_rife_tmp/model", "model")
-    shutil.rmtree("_rife_tmp", ignore_errors=True)
-
 sys.path.append(os.path.join(os.getcwd(), "train_log"))
 from train_log.RIFE_HDv3 import Model
 
 # ---------------------------------------------------------------------------
-# HARDWARE DETECTION & EXECUTION MODE SELECTION
+# DEVICE PLACEMENT
 #
-# Automatically detects GPU configuration and selects optimal execution mode:
-#   CONCURRENT  — Both models fully GPU-resident simultaneously, no swapping.
-#                 Requires enough total VRAM for both models + activation headroom.
-#   SINGLE      — One model on GPU at a time (spread across all available GPUs),
-#                 the other stays on CPU. Swaps on tab switch.
-#
-# Model VRAM requirements (bfloat16):
-#   WAN 2.2 I2V A14B : ~57 GB
-#   Qwen Image Edit  : ~35 GB
-#   Combined         : ~92 GB
-#   Headroom needed  : ~15 GB (activations, KV cache, intermediates)
-#   Safe concurrent  : ≥107 GB total VRAM
-#
-# Override: NEWGEN_FORCE_SINGLE_GPU=1 forces swap mode on any box.
+# One GPU  : Qwen and Wan share cuda:0 and are swapped in and out of VRAM.
+# Two GPUs : Qwen pins to cuda:0, Wan to cuda:1. Nothing is ever swapped, and
+#            both tabs can be used concurrently.
+# Override with NEWGEN_FORCE_SINGLE_GPU=1 to force swapping on a multi-GPU box.
 # ---------------------------------------------------------------------------
+
+# FAST SWAPPING MODE - one model at a time, optimized swaps
+FORCE_DUAL_RESIDENT = False
+AGGRESSIVE_OPTIMIZATION = True
 
 _gpu_count = torch.cuda.device_count()
 if _gpu_count < 1:
     raise RuntimeError("No CUDA device visible — this app requires a GPU.")
 
-# Gather GPU info
-_gpu_info = []
-_total_vram_mb = 0
-for i in range(_gpu_count):
-    props = torch.cuda.get_device_properties(i)
-    vram_mb = props.total_memory // (1024 * 1024)
-    _gpu_info.append({
-        "index": i,
-        "name": props.name,
-        "vram_mb": vram_mb,
-        "compute": f"{props.major}.{props.minor}",
-    })
-    _total_vram_mb += vram_mb
+DUAL_GPU = _gpu_count >= 2 and os.environ.get("NEWGEN_FORCE_SINGLE_GPU") != "1"
+PIC_DEVICE = "cuda:0"
+WAN_DEVICE = "cuda:1" if DUAL_GPU else "cuda:0"
 
-# Concurrent (dual-resident) mode keeps BOTH models loaded on the GPU(s) at
-# once, with no swapping. That only works when there are two separate
-# physical GPUs — one per model — so each has its own fully uncontended VRAM.
-#
-# A single GPU, even a 95 GB Blackwell card, does NOT reliably fit both
-# models resident at once. The optimistic math below (Wan ~57 GB + Qwen peak
-# ~20-25 GB via enable_model_cpu_offload = ~82 GB, "fits" in 95 GB) does not
-# hold in practice: Wan alone has been observed pinning ~94 GB by itself,
-# leaving no room for Qwen and crashing with a CUDA OOM on the very first
-# Photo Editor generation. So concurrent mode now requires >= 2 GPUs, full
-# stop — a single card always uses swap mode (one model on GPU, the other
-# parked on CPU, swapped in on tab switch / first use of that model).
-_force_single = os.environ.get("NEWGEN_FORCE_SINGLE_GPU") == "1"
+if DUAL_GPU:
+    print(f"Dual GPU: Qwen → {PIC_DEVICE}, Wan → {WAN_DEVICE}. Both load at startup, no swapping.")
 
-if _force_single or _gpu_count < 2:
-    GPU_MODE = "single"
-else:
-    # Two or more GPUs: each model gets its own dedicated card.
-    GPU_MODE = "concurrent"
+# Separate queues in dual GPU mode so both tabs run concurrently
+PIC_QUEUE_ID = "pic-gpu" if DUAL_GPU else "gpu"
+WAN_QUEUE_ID = "wan-gpu" if DUAL_GPU else "gpu"
 
-# Legacy alias — stacked no longer exists, everything is either concurrent or single.
-DUAL_GPU = (GPU_MODE == "concurrent")
-
-# Device assignments based on mode
-if GPU_MODE == "concurrent":
-    # Always >= 2 GPUs here (see gating above) — each model gets its own card.
-    PIC_DEVICE = "cuda:0"
-    WAN_DEVICE = "cuda:1"
-    PIC_QUEUE_ID = "pic-gpu"
-    WAN_QUEUE_ID = "wan-gpu"
-else:  # single — one model on GPU (all cards), other on CPU, swapped on demand
-    PIC_DEVICE = "cuda:0"
-    WAN_DEVICE = "cuda:0"
-    PIC_QUEUE_ID = "gpu"
-    WAN_QUEUE_ID = "gpu"
-
-# Flag: True when both models share a single physical GPU in concurrent mode.
-# Structurally always False now (concurrent mode requires >= 2 GPUs) — kept
-# only so the single-card-concurrent code paths below remain valid dead code
-# rather than needing to be ripped out, in case a future card genuinely has
-# the headroom to justify reviving this path.
-_SINGLE_CARD_CONCURRENT = (GPU_MODE == "concurrent" and _gpu_count == 1)
-
-# Whether Qwen's generator/execution device should be treated as CUDA.
-# True for: two-GPU concurrent (Qwen pinned), and single-card concurrent
-# IF there's enough free VRAM after Wan loads to use enable_model_cpu_offload.
-# Set to False (forcing a CPU generator, matching swap-mode's requirement)
-# if single-card concurrent falls back to enable_sequential_cpu_offload for
-# Qwen because Wan alone leaves too little headroom — see _load_qwen_thread.
-_QWEN_CUDA_GENERATOR = DUAL_GPU
-
-# Auxiliary models (RIFE interpolation, MMAudio) run on the last GPU.
-# In single/swap mode cuda:0 is shared by both primary models, so putting
-# RIFE there eats ~500 MB of headroom that Qwen's text_encoder needs. Using
-# the last card keeps the swap device clean.
-_rife_device_idx = _gpu_count - 1 if _gpu_count > 1 else 0
-device = torch.device(f"cuda:{_rife_device_idx}")
+# Auxiliary models (RIFE interpolation, MMAudio) live alongside Qwen.
+device = torch.device(PIC_DEVICE)
 
 rife_model = Model()
 rife_model.load_model("train_log", -1)
@@ -557,314 +458,6 @@ def add_audio_to_video(video_path: str, audio_prompt: str, duration_sec: float) 
 
 
 # ---------------------------------------------------------------------------
-# INFERENCE ACCELERATION UTILITIES
-#
-# These are applied to pipelines after loading to maximize generation speed.
-# All optimizations are optional and degrade gracefully if unavailable.
-# ---------------------------------------------------------------------------
-
-_TORCH_COMPILE_AVAILABLE = hasattr(torch, 'compile')
-_TEACACHE_ENABLED = False  # Set True after pipeline load if successful
-_SAGE_PATCHED = False  # Only patch once globally
-
-
-def apply_sage_attention(pipe):
-    """
-    Patch SageAttention into Wan's transformer attention modules directly.
-
-    Previous approach patched F.scaled_dot_product_attention globally, which
-    broke Qwen's text encoder (all-black images). This approach replaces only
-    the forward methods on Wan's WanAttention blocks, leaving every other model
-    completely untouched.
-
-    SageAttention gives a true 2-3x speedup on attention compute — the dominant
-    cost in the denoising loop — with numerically equivalent output (it's a
-    flash-attention variant, not an approximation).
-    """
-    if not _SAGE_ATTENTION_AVAILABLE:
-        return False
-    try:
-        from sageattention import sageattn
-        patched = 0
-
-        def _make_sage_forward(original_forward):
-            """
-            Wrap a module's forward so SDPA calls inside it use sageattn.
-            We temporarily swap F.scaled_dot_product_attention on the torch.nn.functional
-            module that the attention class already has a reference to, but only
-            for the duration of that one forward call — thread-local would be
-            ideal, but since generation is serialised by the queue, a brief
-            monkeypatch+restore is safe and avoids class-level surgery.
-            """
-            _orig_sdpa = F.scaled_dot_product_attention
-
-            def _sage_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
-                           is_causal=False, scale=None, enable_gqa=False, **kwargs):
-                # Parameter names MUST match torch.nn.functional's real
-                # signature (query/key/value) rather than shorthand (q/k/v).
-                # Some call sites (e.g. diffusers' newer attention_dispatch
-                # path used by Qwen) call this by keyword using the real
-                # names — with mismatched names those keywords fall through
-                # to **kwargs and query/key/value are left unfilled, raising
-                # "missing 3 required positional arguments". Positional
-                # callers (Wan) work under either naming, so matching the
-                # real signature is strictly safer and fixes both.
-                try:
-                    return sageattn(query, key, value, attn_mask=attn_mask,
-                                     is_causal=is_causal, sm_scale=scale)
-                except Exception:
-                    return _orig_sdpa(query, key, value, attn_mask=attn_mask,
-                                      dropout_p=dropout_p, is_causal=is_causal,
-                                      scale=scale, enable_gqa=enable_gqa)
-
-            def _forward_with_sage(*args, **kwargs):
-                F.scaled_dot_product_attention = _sage_sdpa
-                try:
-                    return original_forward(*args, **kwargs)
-                finally:
-                    F.scaled_dot_product_attention = _orig_sdpa
-
-            return _forward_with_sage
-
-        # Patch every attention block inside the transformer(s).
-        # WanImageToVideoPipeline has .transformer and .transformer_2 (MoE pair).
-        transformers_to_patch = []
-        if hasattr(pipe, 'transformer') and pipe.transformer is not None:
-            transformers_to_patch.append(pipe.transformer)
-        if hasattr(pipe, 'transformer_2') and pipe.transformer_2 is not None:
-            transformers_to_patch.append(pipe.transformer_2)
-
-        for xfmr in transformers_to_patch:
-            for module in xfmr.modules():
-                # Target the named attention classes used by Wan's diffusers impl.
-                cls_name = type(module).__name__
-                if "Attention" in cls_name and hasattr(module, 'forward'):
-                    module.forward = _make_sage_forward(module.forward)
-                    patched += 1
-
-        if patched:
-            print(f"  SageAttention: patched {patched} attention modules (Wan transformers only)")
-            return True
-        return False
-    except Exception as e:
-        print(f"  SageAttention patch failed: {e}")
-        return False
-
-
-def apply_torch_compile(pipe, mode="default"):
-    """
-    Compile the pipeline's transformer forward pass(es) for kernel fusion.
-
-    Previous attempt used the default mode on the whole pipeline object, which
-    triggered infinite recompilation because Wan's MoE pair (transformer +
-    transformer_2) alternates mid-inference — the graph tracer saw dynamic
-    control flow and re-traced on every step.
-
-    Fix: compile each transformer independently with dynamic=True (handles
-    varying sequence lengths without retracing) and fullgraph=False (allows the
-    Python-level MoE switching to remain outside the compiled region). The
-    compiled kernels cover the heavy attention + MLP compute inside each
-    transformer's forward, which is where the time actually goes.
-
-    Mode is 'default', NOT 'reduce-overhead'. 'reduce-overhead' captures a
-    CUDA Graph to cut Python/launch overhead — but CUDA Graphs need the
-    allocator to support a live-allocation-pool check, and this process runs
-    with PYTORCH_CUDA_ALLOC_CONF=...backend:cudaMallocAsync (chosen deliberately
-    for the offload hooks' constant alloc/free churn as models stream on and
-    off GPU). cudaMallocAsync does not implement that check at all, so
-    'reduce-overhead' crashes hard the first time a compiled forward actually
-    runs — not a flaky failure, a guaranteed one, and torch._dynamo's
-    suppress_errors does NOT catch it (it's a runtime crash inside the
-    compiled graph's execution, not a trace/compile-time error). 'default'
-    still gets the real win — TorchInductor kernel fusion of the attention +
-    MLP compute — it just skips the incompatible graph-capture step. Given the
-    bottleneck here is GPU compute (large matmuls/attention), not CPU
-    dispatch overhead, 'default' captures nearly all of the available speedup
-    with none of the crash risk.
-
-    First call triggers a ~30s JIT compilation; all subsequent calls are fast.
-    """
-    if not _TORCH_COMPILE_AVAILABLE:
-        return False
-    try:
-        compiled = 0
-        for attr in ('transformer', 'transformer_2'):
-            xfmr = getattr(pipe, attr, None)
-            if xfmr is None:
-                continue
-            # compile the forward method, not the module itself, to avoid
-            # issues with accelerate hooks wrapping the module
-            xfmr.forward = torch.compile(
-                xfmr.forward,
-                mode=mode,
-                dynamic=True,       # handles varying S/B without retrace
-                fullgraph=False,    # allows Python control flow at MoE switch
-            )
-            compiled += 1
-        if compiled:
-            print(f"  torch.compile: compiled {compiled} transformer(s) "
-                  f"(mode={mode}, dynamic=True) — first run triggers JIT warmup")
-            return True
-        return False
-    except Exception as e:
-        print(f"  torch.compile failed: {e}")
-        return False
-
-
-def apply_vae_fp16(pipe):
-    """
-    Cast the VAE to fp16 for decode.
-
-    RTX 4070 Ti Super (Ada Lovelace) has the same fp16 tensor-core throughput
-    as bf16 but with faster memory bandwidth on sub-16-bit ops. More importantly,
-    diffusers' VAE tiling already splits frames into chunks, so precision
-    differences are invisible in the output. bfloat16 is kept for the main
-    denoising loop (better dynamic range for diffusion math); fp16 is only
-    applied to the VAE encoder+decoder which are pure conv nets.
-    """
-    try:
-        if hasattr(pipe, 'vae') and pipe.vae is not None:
-            pipe.vae = pipe.vae.to(dtype=torch.float16)
-            print("  VAE → fp16 (faster decode on Ada, imperceptible quality delta)")
-            return True
-    except Exception as e:
-        print(f"  VAE fp16 cast failed: {e}")
-    return False
-
-
-def apply_teacache(pipe, threshold=0.05):
-    """
-    Enable TeaCache for video diffusion — training-free timestep caching.
-
-    TeaCache skips redundant transformer evaluations at timesteps where the
-    residual L1 distance between consecutive hidden states falls below
-    `threshold`. At 0.05 it typically skips ~40% of forward passes with
-    negligible visual difference. Lower = fewer skips = slower but safer.
-    """
-    global _TEACACHE_ENABLED
-    try:
-        if hasattr(pipe, 'enable_teacache'):
-            pipe.enable_teacache(
-                cache_interval=2,
-                rel_l1_thresh=threshold,
-            )
-            _TEACACHE_ENABLED = True
-            return True
-    except Exception as e:
-        print(f"  TeaCache enable failed: {e}")
-    return False
-
-
-def apply_all_optimizations(pipe, pipe_name="model", enable_compile=True,
-                            enable_teacache=False, teacache_thresh=0.05,
-                            enable_sage=True, enable_vae_fp16=False):
-    """Apply all available inference accelerations to a pipeline."""
-    results = {}
-
-    # SageAttention — per-module patch, safe for mixed-model setups
-    if enable_sage:
-        results["SageAttention"] = apply_sage_attention(pipe)
-
-    # TeaCache — timestep skip for video transformers
-    if enable_teacache:
-        results["TeaCache"] = apply_teacache(pipe, threshold=teacache_thresh)
-
-    # VAE fp16 — faster decode on Ada/Ampere, no visible quality change
-    if enable_vae_fp16:
-        results["VAE-fp16"] = apply_vae_fp16(pipe)
-
-    # torch.compile — kernel fusion, applied last to capture optimized graph
-    if enable_compile:
-        results["torch.compile"] = apply_torch_compile(pipe)
-
-    applied = [k for k, v in results.items() if v]
-    skipped = [k for k, v in results.items() if not v]
-    if applied:
-        print(f"  ✅ {pipe_name}: {', '.join(applied)}")
-    if skipped:
-        print(f"  ⏭️  {pipe_name} skipped: {', '.join(skipped)}")
-    return results
-
-
-# ---------------------------------------------------------------------------
-# VRAM-TIERED OFFLOAD STRATEGY
-#
-# In single-GPU "swap" mode, only ONE model is ever resident on the card at a
-# time — the other is fully parked on CPU. That means whichever model is
-# active gets the ENTIRE card's VRAM to itself, not a shared slice. Despite
-# that, the previous code unconditionally called
-# enable_sequential_cpu_offload() for every swap — the slowest of the three
-# available strategies (it streams weights onto the GPU one individual layer
-# at a time, for every single layer, on every single forward pass). That
-# tier exists to survive tight-VRAM situations; it is massive overkill on any
-# card with enough free memory to hold the model outright.
-#
-# This picks the fastest tier that will actually fit, fastest first:
-#   "full"          — pipe.to(device): fully resident, zero offload overhead
-#   "model_offload" — enable_model_cpu_offload: whole-submodule streaming
-#                      (submodule moves to GPU only while executing, then
-#                      back to CPU — peak VRAM = size of the largest single
-#                      submodule, not the whole model)
-#   "sequential"    — enable_sequential_cpu_offload: layer-by-layer (safest,
-#                      slowest — reserved for genuinely tight VRAM)
-#
-# The winning tier is cached per model so repeat swaps skip the measurement
-# and jump straight to it. If a cached tier ever OOMs anyway (fragmentation,
-# another process, etc.) the call transparently falls back a tier, retries,
-# and re-caches the safe result — generation never crashes because of this,
-# it can only get faster than the old always-slowest default.
-# ---------------------------------------------------------------------------
-
-_offload_tier_cache = {}
-_OFFLOAD_TIERS = ("full", "model_offload", "sequential")
-
-
-def _apply_offload_tier(pipe, model_key, device_idx, full_weight_gb, submodule_gb, safety_gb=5):
-    """Pick + apply the fastest offload strategy for `pipe` that fits in free VRAM."""
-    device = f"cuda:{device_idx}"
-    cached = _offload_tier_cache.get(model_key)
-
-    if cached is None:
-        torch.cuda.synchronize(device_idx)
-        torch.cuda.empty_cache()
-        free_bytes, _ = torch.cuda.mem_get_info(device_idx)
-        free_gb = free_bytes / (1024 ** 3)
-        if free_gb >= full_weight_gb + safety_gb:
-            candidates = ["full", "model_offload", "sequential"]
-        elif free_gb >= submodule_gb + safety_gb:
-            candidates = ["model_offload", "sequential"]
-        else:
-            candidates = ["sequential"]
-        print(f"  offload tier probe ({model_key}): {free_gb:.1f} GB free on {device} "
-              f"→ trying {candidates[0]}")
-    else:
-        start = _OFFLOAD_TIERS.index(cached)
-        candidates = list(_OFFLOAD_TIERS[start:])
-
-    last_err = None
-    for tier in candidates:
-        try:
-            if tier == "full":
-                pipe.to(device)
-            elif tier == "model_offload":
-                pipe.enable_model_cpu_offload(gpu_id=device_idx)
-            else:
-                pipe.enable_sequential_cpu_offload(gpu_id=device_idx)
-            if tier != cached:
-                _offload_tier_cache[model_key] = tier
-                print(f"  ✅ {model_key}: offload tier = {tier}")
-            return tier
-        except torch.cuda.OutOfMemoryError as e:
-            last_err = e
-            print(f"  ⚠️  {model_key}: tier '{tier}' OOM'd, falling back...")
-            torch.cuda.empty_cache()
-            continue
-    # "sequential" is always last in the chain and has the smallest footprint
-    # of the three — if even that raises, something else is wrong.
-    raise last_err
-
-
-# ---------------------------------------------------------------------------
 # WAN 2.2 I2V A14B — MERGED 4-STEP DISTILL (BF16, no LoRA)
 #
 # Weights: lightx2v/Wan2.2-Distill-Models
@@ -897,7 +490,7 @@ print(f"Video model: WAMU v2 — Wan 2.2 I2V Lightning merge (NSFW-capable)")
 FIXED_FPS = 16
 
 # WAMU v2 is distillation-merged, so guidance must stay at 1.0.
-WAN_STEPS = 3
+WAN_STEPS = 3  # Default fallback, actual steps come from UI slider
 WAN_FLOW_SHIFT = 6.9
 WAN_GUIDANCE = 1.0
 
@@ -916,76 +509,6 @@ MULTIPLE_OF = 16
 wan_pipe = None
 _wan_loaded = False
 _wan_scheduler_config = None
-
-# ---------------------------------------------------------------------------
-# WAN INFERENCE CACHES
-#
-# Two LRU-style caches that survive across calls in the same process:
-#
-#   _wan_text_cache  — T5 text embeddings keyed by (prompt, negative_prompt).
-#                      Encoding a ~100-token prompt through T5-XXL takes ~0.3s
-#                      and produces identical outputs for the same text, so
-#                      caching is pure win. Invalidated on model swap because
-#                      the text_encoder moves off GPU and may be reloaded.
-#
-#   _wan_image_cache — VAE image latents keyed by (image_hash, resolution).
-#                      The VAE encode of the reference frame is identical for
-#                      the same image every time. Saving it avoids a ~0.5s
-#                      encode + GPU round-trip per generation.
-#
-# Both caches store GPU tensors (on WAN_DEVICE). They are cleared in
-# activate_wan() only when a model swap actually happens, so they persist
-# across repeated same-model calls.
-# ---------------------------------------------------------------------------
-
-_wan_cache_lock = threading.Lock()
-_wan_text_cache: dict = {}   # (prompt, neg) -> (encoder_hidden_states, attention_mask)
-_wan_image_cache: dict = {}  # (img_hash, res) -> image_latents tensor
-_WAN_CACHE_MAX = 16
-
-
-def _wan_hash_image(pil_img):
-    """Fast perceptual hash of a PIL image for cache keying."""
-    arr = np.array(pil_img.resize((64, 64), Image.LANCZOS))
-    h = hashlib.sha256()
-    h.update(f"{pil_img.size}".encode())
-    h.update(arr.tobytes())
-    return h.hexdigest()
-
-
-def _wan_cache_clear():
-    """Drop all Wan-side caches (call after a model swap to free GPU tensors)."""
-    with _wan_cache_lock:
-        _wan_text_cache.clear()
-        _wan_image_cache.clear()
-
-
-def _wan_text_cache_get(prompt, negative_prompt):
-    key = (prompt, negative_prompt or "")
-    with _wan_cache_lock:
-        return _wan_text_cache.get(key)
-
-
-def _wan_text_cache_put(prompt, negative_prompt, value):
-    key = (prompt, negative_prompt or "")
-    with _wan_cache_lock:
-        if len(_wan_text_cache) >= _WAN_CACHE_MAX:
-            _wan_text_cache.pop(next(iter(_wan_text_cache)))
-        _wan_text_cache[key] = value
-
-
-def _wan_image_cache_get(pil_img, resolution):
-    key = (_wan_hash_image(pil_img), resolution)
-    with _wan_cache_lock:
-        return _wan_image_cache.get(key)
-
-
-def _wan_image_cache_put(pil_img, resolution, value):
-    key = (_wan_hash_image(pil_img), resolution)
-    with _wan_cache_lock:
-        if len(_wan_image_cache) >= _WAN_CACHE_MAX:
-            _wan_image_cache.pop(next(iter(_wan_image_cache)))
-        _wan_image_cache[key] = value
 
 
 def _set_flow_shift(pipe, flow_shift):
@@ -1062,28 +585,20 @@ def _build_wan_pipeline(target_device="cpu"):
             use_safetensors=True
         )
         print(f"🎯 WAMU v2 loaded to CPU (ready for fast swapping)")
-    elif target_device == "balanced":
-        # No longer used — kept for safety, treated same as a direct GPU load
-        pipeline = WanImageToVideoPipeline.from_pretrained(
-            WAN_MODEL_REPO,
-            torch_dtype=torch.bfloat16,
-            device_map="balanced",
-            max_memory={i: 10 * 1024 for i in range(torch.cuda.device_count())},
-            use_safetensors=True
-        )
-        print(f"🎯 WAMU v2 loaded BALANCED across {_gpu_count} GPUs (≤10 GB/card) — pipeline parallelism active!")
     else:
-        # Load to CPU then spread across all GPUs via balanced device_map.
-        # This is used when the model is the active one at startup (single/swap mode
-        # with multiple GPUs). Each card contributes its share; total must fit.
+        # Load to CPU then move to target GPU.
+        # device_map doesn't support specific device indices in this diffusers version.
+        # The .to() call is a fast VRAM transfer — no computation, just memory copy.
         pipeline = WanImageToVideoPipeline.from_pretrained(
             WAN_MODEL_REPO,
             torch_dtype=torch.bfloat16,
-            device_map="balanced",
+            low_cpu_mem_usage=True,
+            device_map=None,
             use_safetensors=True
         )
-        torch.cuda.synchronize()
-        print(f"🎯 WAMU v2 loaded across {torch.cuda.device_count()} GPUs (balanced) - Ready for video generation!")
+        pipeline = pipeline.to(target_device)
+        torch.cuda.synchronize(target_device)
+        print(f"🎯 WAMU v2 loaded directly to {target_device} - Ready for video generation!")
 
     _wan_scheduler_config = dict(pipeline.scheduler.config)
     pipeline.vae.enable_slicing()
@@ -1211,8 +726,7 @@ def get_num_frames(duration_seconds: float) -> int:
 MODE_KEEP = "Keep original scene"
 MODE_REPLACE = "Replace background / environment"
 MODE_CUSTOM = "Custom edit instruction"
-MODE_TIMELINE = "Timeline (per-segment prompts)"
-SCENE_MODES = [MODE_KEEP, MODE_REPLACE, MODE_CUSTOM, MODE_TIMELINE]
+SCENE_MODES = [MODE_KEEP, MODE_REPLACE, MODE_CUSTOM]
 
 RELOCATE_INSTRUCTION = (
     "Keep the people exactly as they are — identical faces, facial features, "
@@ -1274,16 +788,12 @@ def edit_reference_frame(
     seed: int,
     steps: int,
     guidance: float,
-    additional_images: list = None,
 ) -> Image.Image:
     """
     Optional stage 1 — Qwen Image Edit prepares the starting frame.
 
     Returns the image untouched in keep-scene mode, so nothing is repainted and
     the original background and bodies survive exactly as shot.
-    
-    When additional_images are provided (Custom/Replace modes), all images are
-    passed to Qwen as multi-reference input for better context.
     """
     if mode == MODE_KEEP:
         print("[1/2] Keep-scene mode — reference frame used as-is.")
@@ -1302,28 +812,16 @@ def edit_reference_frame(
     activate_pic()
     print(f"[1/2] Qwen editing frame -> {instruction[:80]}...")
 
-    # Build image list — primary image first, then any additional references
-    images_list = [image]
-    if additional_images:
-        for ref in additional_images:
-            pil_ref = _ensure_pil(ref)
-            if pil_ref is not None:
-                images_list.append(pil_ref)
-        if len(images_list) > 1:
-            print(f"  Multi-reference: {len(images_list)} images provided to Qwen")
-
     torch.cuda.set_device(PIC_DEVICE)
-    _pic_ctx = torch.cuda.device(PIC_DEVICE) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
-    _pic_autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
-    with _pic_ctx:
-        with _pic_autocast:
+    with torch.cuda.device(PIC_DEVICE):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             result = pic_pipe(
-                image=images_list,
+                image=[image],
                 prompt=instruction,
                 negative_prompt=" ",
                 num_inference_steps=int(steps),
                 true_cfg_scale=float(guidance),
-                generator=torch.Generator(device=PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu").manual_seed(seed),
+                generator=torch.Generator(device=PIC_DEVICE).manual_seed(seed),
             )
     edited = result.images[0]
     if edited.size != image.size:
@@ -1339,109 +837,44 @@ def animate_frame(
     num_frames: int,
     seed: int,
     flow_shift: float = None,
+    wan_steps: int = None,
 ):
-    """
-    Stage 2 — animate a frame with WAMU v2 merged model.
-
-    Caches T5 text embeddings and VAE image latents across calls so that
-    repeated generations with the same prompt / reference image skip those
-    encode steps entirely. On a 6×4070 Ti Super rig this saves ~0.4-0.8s
-    per generation after the first warm call.
-    """
+    """Stage 2 — animate a frame with WAMU v2 merged model."""
     activate_wan()
 
-    # In concurrent/dual mode pin computation to WAN_DEVICE.
-    # In swap mode enable_sequential_cpu_offload manages device routing
-    # internally — wrapping with torch.cuda.device() confuses it and causes
-    # "Expected all tensors to be on the same device" crashes.
-    _cuda_ctx = torch.cuda.device(WAN_DEVICE) if DUAL_GPU else contextlib.nullcontext()
-    with _cuda_ctx:
+    # Use provided wan_steps, or fall back to WAN_STEPS constant
+    steps = wan_steps if wan_steps is not None else WAN_STEPS
+
+    # Pin to WAN_DEVICE — prevents cross-device leakage in dual GPU mode
+    with torch.cuda.device(WAN_DEVICE):
         # Apply flow shift if provided, otherwise use WAMU v2 default (6.9)
         _set_flow_shift(wan_pipe, flow_shift if flow_shift is not None else WAN_FLOW_SHIFT)
 
         print(f"[2/2] Wan animating {num_frames} frames at {frame.size}...")
-        print(f"Prompt: {prompt!r} | Seed: {seed} | Steps: {WAN_STEPS}")
+        print(f"Prompt: {prompt!r} | Seed: {seed} | Steps: {steps}")
 
-        # ---- Text embedding cache ----------------------------------------
-        # WanImageToVideoPipeline accepts prompt_embeds + negative_prompt_embeds
-        # as direct kwargs, bypassing the T5 encoder entirely on cache hits.
-        neg = negative_prompt or ""
-        cached_text = _wan_text_cache_get(prompt, neg)
-        text_kwargs = {}
-        if cached_text is not None:
-            pe, pe_mask, npe, npe_mask = cached_text
-            text_kwargs = dict(
-                prompt_embeds=pe,
-                negative_prompt_embeds=npe,
-                prompt_attention_mask=pe_mask,
-                negative_prompt_attention_mask=npe_mask,
-            )
-            print("  text embeds: cache hit")
-        else:
-            print("  text embeds: computing (will cache)")
-
-        # ---- Base kwargs ---------------------------------------------------
-        # When enable_sequential_cpu_offload is active the pipeline's internal
-        # device is CPU, so the generator must also be CPU — passing a CUDA
-        # generator to a CPU pipeline raises "Cannot generate a cpu tensor from
-        # a generator of type cuda". In concurrent/dual mode Wan is pinned to
-        # WAN_DEVICE so a CUDA generator is correct there.
-        _wan_gen_device = "cpu" if not DUAL_GPU else WAN_DEVICE
-        base_kwargs = dict(
+        kwargs = dict(
             image=frame,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
             height=frame.height,
             width=frame.width,
             num_frames=num_frames,
-            num_inference_steps=WAN_STEPS,
+            num_inference_steps=steps,
             guidance_scale=WAN_GUIDANCE,
             guidance_scale_2=WAN_GUIDANCE,
-            generator=torch.Generator(device=_wan_gen_device).manual_seed(seed),
+            generator=torch.Generator(device=WAN_DEVICE).manual_seed(seed),
             output_type="np",
-            **text_kwargs,
         )
 
-        # Only pass prompt/negative_prompt when we don't have cached embeds
-        if not text_kwargs:
-            base_kwargs["prompt"] = prompt
-            base_kwargs["negative_prompt"] = neg
-
-        # ---- Run pipeline & capture text embeds on first call --------------
         if last_frame is None:
-            result = wan_pipe(**base_kwargs)
-        else:
-            try:
-                result = wan_pipe(last_image=last_frame, **base_kwargs)
-            except TypeError as e:
-                print(f"End frame not supported by this pipeline ({e}) — ignoring it.")
-                result = wan_pipe(**base_kwargs)
+            return wan_pipe(**kwargs).frames[0]
 
-        # Cache the text embeddings for next call (if we just computed them)
-        if cached_text is None and hasattr(result, '_text_embeds_cache'):
-            # Some diffusers versions expose this on the result object
-            _wan_text_cache_put(prompt, neg, result._text_embeds_cache)
-        elif cached_text is None:
-            # Fallback: encode explicitly and cache for next time.
-            # This runs only once per unique prompt; after that it's instant.
-            try:
-                with torch.no_grad():
-                    _enc_out = wan_pipe.encode_prompt(
-                        prompt=prompt,
-                        negative_prompt=neg,
-                        device=WAN_DEVICE if DUAL_GPU else "cpu",
-                        do_classifier_free_guidance=False,
-                    )
-                    # encode_prompt returns varying shapes depending on version;
-                    # unpack safely
-                    if isinstance(_enc_out, (list, tuple)) and len(_enc_out) >= 4:
-                        _wan_text_cache_put(prompt, neg, tuple(_enc_out[:4]))
-                    elif isinstance(_enc_out, (list, tuple)) and len(_enc_out) == 2:
-                        # (prompt_embeds, attention_mask) only — store with None placeholders
-                        _wan_text_cache_put(prompt, neg, (_enc_out[0], _enc_out[1], None, None))
-            except Exception as _cache_err:
-                # Non-fatal — next call will just re-encode
-                print(f"  text embed cache fill failed (non-fatal): {_cache_err}")
-
-        return result.frames[0]
+        try:
+            return wan_pipe(last_image=last_frame, **kwargs).frames[0]
+        except TypeError as e:
+            print(f"End frame not supported by this pipeline ({e}) — ignoring it.")
+            return wan_pipe(**kwargs).frames[0]
 
 
 def concatenate_videos(video_paths: list, output_path: str):
@@ -1594,7 +1027,6 @@ def generate_video(
     prompt,
     scene_mode,
     edit_instruction="",
-    additional_refs=None,
     end_image=None,
     duration_seconds=3.5,
     resolution="480p",
@@ -1603,7 +1035,7 @@ def generate_video(
     seed=42,
     randomize_seed=True,
     add_audio_cb=False,
-    audio_prompt_tb="natural ambient sound",
+    audio_prompt_tb="realistic female vocalizations and breathing that match the woman's physical characteristics visible in the video, natural voice pitch and tone corresponding to her body size and appearance, intimate sounds, soft ambient atmosphere",
     negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
@@ -1620,10 +1052,6 @@ def generate_video(
     
     No interpolation by default (frame_multiplier=16 = native 16fps).
     """
-    # If Timeline mode, the user should use the Timeline Generate button instead
-    if scene_mode == MODE_TIMELINE:
-        raise gr.Error("Timeline mode selected — use the '🎬 Generate Timeline Video' button instead.")
-    
     # Gradio can hand back "" instead of None for an untouched optional image
     # component — normalize both reference_image and end_image so a stray
     # empty string never reaches PIL-only code (that's what caused
@@ -1671,23 +1099,10 @@ def generate_video(
         sized = resize_image_for_wan(reference_image, resolution)
         print(f"Resized image to {sized.size} for VAE compatibility")
 
-        # Process additional reference images if provided
-        additional_pil = None
-        if additional_refs and scene_mode != MODE_KEEP:
-            additional_pil = []
-            for ref_file in additional_refs:
-                ref_path = ref_file.name if hasattr(ref_file, 'name') else str(ref_file)
-                pil_ref = _ensure_pil(ref_path)
-                if pil_ref:
-                    additional_pil.append(pil_ref)
-            if additional_pil:
-                print(f"  {len(additional_pil)} additional reference image(s) for Qwen edit")
-
         # ---- Stage 1: optional frame preparation --------------------------
         start_frame = edit_reference_frame(
             sized, scene_mode, prompt, edit_instruction,
             current_seed, edit_steps, edit_guidance,
-            additional_images=additional_pil,
         )
 
         # End-frame conditioning applies to the first segment only.
@@ -1709,7 +1124,7 @@ def generate_video(
             seg_end = processed_end if seg_index == 1 else None
             raw_frames = animate_frame(
                 current_frame, seg_end, prompt, negative_prompt,
-                num_frames, seg_seed, flow_shift,
+                num_frames, seg_seed, flow_shift, edit_steps,
             )
 
             # RIFE interpolation, per segment, before export.
@@ -1760,7 +1175,7 @@ def generate_video(
         if add_audio_cb and _MMAUDIO_AVAILABLE:
             try:
                 final_path = add_audio_to_video(
-                    final_path, audio_prompt, float(duration_seconds)
+                    final_path, audio_prompt_tb, float(duration_seconds)
                 )
             except Exception as e:
                 print(f"MMAudio error: {e}")
@@ -1791,408 +1206,6 @@ def generate_video(
 
 
 # ---------------------------------------------------------------------------
-# TIMELINE VIDEO GENERATION
-#
-# Generates a multi-segment video where each segment has its own Qwen edit
-# instruction. Each segment's starting frame is generated by editing the
-# previous segment's last frame with the next prompt.
-# ---------------------------------------------------------------------------
-
-def generate_timeline_video(
-    reference_image,
-    segment_prompts_json,
-    motion_prompt,
-    resolution="480p",
-    frame_multiplier=16,
-    export_quality=7,
-    seed=42,
-    randomize_seed=True,
-    add_audio_cb=False,
-    audio_prompt_tb="natural ambient sound",
-    negative_prompt=None,
-    edit_steps=4,
-    edit_guidance=1.0,
-    flow_shift_auto=True,
-    flow_shift=None,
-    additional_refs=None,
-    progress=gr.Progress(track_tqdm=True),
-):
-    """
-    Timeline video generation — each segment gets its own Qwen edit instruction.
-    
-    Flow: reference_image → Qwen edit (prompt 1) → Wan animate → last frame
-         → Qwen edit (prompt 2) → Wan animate → last frame → ... → final video
-    """
-    reference_image = _ensure_pil(reference_image)
-    if reference_image is None:
-        raise gr.Error("Please upload a reference photo.")
-    
-    # Parse segment prompts
-    try:
-        segment_prompts = json.loads(segment_prompts_json) if segment_prompts_json else []
-    except (json.JSONDecodeError, TypeError):
-        segment_prompts = []
-    
-    if not segment_prompts:
-        raise gr.Error("No segment prompts provided. Add at least one segment prompt.")
-    
-    # Use motion prompt for animation if provided
-    if not motion_prompt or not motion_prompt.strip():
-        motion_prompt = default_video_prompt
-    
-    if not negative_prompt or not str(negative_prompt).strip():
-        negative_prompt = default_negative_prompt
-    
-    # Flow shift
-    num_segments = len(segment_prompts)
-    total_duration = num_segments * SEGMENT_DURATION
-    
-    if flow_shift_auto:
-        if total_duration <= 6.0:
-            flow_shift = 6.9
-        elif total_duration <= 10.0:
-            flow_shift = 5.5
-        elif total_duration <= 20.0:
-            flow_shift = 4.5
-        else:
-            flow_shift = 4.0
-        print(f"🎯 Timeline auto flow_shift: {flow_shift:.1f} ({num_segments} segments, {total_duration:.1f}s)")
-    else:
-        if flow_shift is None:
-            flow_shift = WAN_FLOW_SHIFT
-    
-    current_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
-    started = time.time()
-    segment_paths = []
-    
-    # Process additional reference images
-    additional_pil = None
-    if additional_refs:
-        additional_pil = []
-        for ref_file in additional_refs:
-            ref_path = ref_file.name if hasattr(ref_file, 'name') else str(ref_file)
-            pil_ref = _ensure_pil(ref_path)
-            if pil_ref:
-                additional_pil.append(pil_ref)
-
-    try:
-        sized = resize_image_for_wan(reference_image, resolution)
-        current_frame = sized
-        
-        for seg_idx, seg_prompt in enumerate(segment_prompts):
-            seg_num = seg_idx + 1
-            seg_prompt = seg_prompt.strip()
-            
-            if not seg_prompt:
-                print(f"⚠️  Segment {seg_num}: empty prompt, using previous frame as-is")
-                start_frame = current_frame
-            else:
-                # Qwen edits the current frame with this segment's prompt
-                print(f"🎬 Segment {seg_num}/{num_segments}: Qwen editing → {seg_prompt[:60]}...")
-                
-                # Build image list for Qwen
-                images_for_qwen = [current_frame]
-                if additional_pil:
-                    images_for_qwen.extend(additional_pil)
-                
-                # Timeline needs stronger guidance to make visible changes between segments
-                timeline_guidance = max(float(edit_guidance), 3.0)
-                timeline_steps = max(int(edit_steps), 6)
-                
-                activate_pic()
-                torch.cuda.set_device(PIC_DEVICE)
-                _tl_ctx = torch.cuda.device(PIC_DEVICE) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
-                _tl_ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
-                with _tl_ctx:
-                    with _tl_ac:
-                        result = pic_pipe(
-                            image=images_for_qwen,
-                            prompt=seg_prompt,
-                            negative_prompt=" ",
-                            num_inference_steps=timeline_steps,
-                            true_cfg_scale=timeline_guidance,
-                            generator=torch.Generator(device=PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu").manual_seed(current_seed + seg_idx),
-                        )
-                start_frame = result.images[0]
-                if start_frame.size != current_frame.size:
-                    start_frame = start_frame.resize(current_frame.size, Image.LANCZOS)
-            
-            # Animate this segment with Wan
-            num_frames = get_num_frames(SEGMENT_DURATION)
-            seg_seed = current_seed + seg_idx * 100
-            
-            raw_frames = animate_frame(
-                start_frame, None, motion_prompt, negative_prompt,
-                num_frames, seg_seed, flow_shift,
-            )
-            
-            # RIFE interpolation
-            factor = max(1, int(frame_multiplier) // FIXED_FPS)
-            if factor > 1:
-                seg_frames = interpolate_bits(raw_frames, multiplier=factor)
-            else:
-                seg_frames = list(raw_frames)
-            seg_fps = FIXED_FPS * factor
-            
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-                seg_path = f.name
-            export_to_video(seg_frames, seg_path, fps=seg_fps, quality=int(export_quality))
-            segment_paths.append(seg_path)
-            
-            print(f"  ✅ Segment {seg_num} complete ({SEGMENT_DURATION:.1f}s, {len(seg_frames)} frames)")
-            
-            # Get last frame for next segment's Qwen edit
-            nxt = _last_frame_of(seg_path)
-            if nxt is not None:
-                current_frame = nxt
-            
-            current_seed = random.randint(0, MAX_SEED)
-        
-        if not segment_paths:
-            raise gr.Error("No video segments were produced.")
-        
-        # Assemble final video
-        if len(segment_paths) > 1:
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-                final_path = f.name
-            concatenate_videos(segment_paths, final_path)
-            for p in segment_paths:
-                try: os.unlink(p)
-                except OSError: pass
-        else:
-            final_path = segment_paths[0]
-        
-        # Optional audio
-        if add_audio_cb and _MMAUDIO_AVAILABLE:
-            try:
-                final_path = add_audio_to_video(final_path, audio_prompt_tb, total_duration)
-            except Exception as e:
-                print(f"MMAudio error: {e}")
-        
-        # Rename to proper output path
-        named_path = unique_output_path("vidgen_timeline", ".mp4")
-        try:
-            shutil.move(final_path, named_path)
-            final_path = str(named_path)
-        except Exception:
-            pass
-        
-        print(f"🎬 Timeline done in {time.time() - started:.1f}s — {num_segments} segments")
-        return final_path, final_path
-    
-    except gr.Error:
-        raise
-    except Exception as e:
-        for p in segment_paths:
-            try: os.unlink(p)
-            except OSError: pass
-        print(f"Timeline generation error: {e}")
-        raise gr.Error(f"Timeline generation failed: {e}")
-
-
-def _generate_timeline_with_durations(
-    reference_image, prompts_json, durations_json, motion_prompt,
-    resolution="480p", frame_multiplier=16, export_quality=7,
-    seed=42, randomize_seed=True, add_audio_cb=False,
-    audio_prompt_tb="natural ambient sound", negative_prompt=None,
-    edit_steps=4, edit_guidance=1.0, flow_shift_auto=True,
-    flow_shift=None, additional_refs=None,
-):
-    """
-    Timeline video generation with the two-phase approach:
-    
-    Phase 1 — Generate keyframe images sequentially with Picgen (Qwen):
-      Image 0 = user's reference photo
-      Image 1 = Qwen edits Image 0 with Segment 1 prompt
-      Image 2 = Qwen edits Image 1 with Segment 2 prompt
-      ...
-    
-    Phase 2 — Generate video between each pair of keyframes with Vidgen (Wan):
-      Video 1 = animate Image 0 → Image 1, motion = Segment 1 prompt
-      Video 2 = animate Image 1 → Image 2, motion = Segment 2 prompt
-      ...
-    
-    Phase 3 — Stitch all segment videos into one final video.
-    """
-    reference_image = _ensure_pil(reference_image)
-    if reference_image is None:
-        raise gr.Error("Please upload a reference photo.")
-    
-    segment_prompts = json.loads(prompts_json)
-    segment_durations = json.loads(durations_json)
-    
-    if not segment_prompts:
-        raise gr.Error("No segment prompts provided.")
-    
-    if not negative_prompt or not str(negative_prompt).strip():
-        negative_prompt = default_negative_prompt
-    
-    num_segments = len(segment_prompts)
-    total_duration = sum(segment_durations)
-    
-    # Flow shift
-    if flow_shift_auto:
-        if total_duration <= 6.0:
-            flow_shift = 6.9
-        elif total_duration <= 10.0:
-            flow_shift = 5.5
-        elif total_duration <= 20.0:
-            flow_shift = 4.5
-        else:
-            flow_shift = 4.0
-    else:
-        if flow_shift is None:
-            flow_shift = WAN_FLOW_SHIFT
-    
-    print(f"🎬 Timeline: {num_segments} segments, {total_duration:.1f}s total, flow_shift={flow_shift}")
-    
-    current_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
-    started = time.time()
-    
-    # Process additional reference images
-    additional_pil = None
-    if additional_refs:
-        additional_pil = []
-        for ref_file in additional_refs:
-            ref_path = ref_file.name if hasattr(ref_file, 'name') else str(ref_file)
-            pil_ref = _ensure_pil(ref_path)
-            if pil_ref:
-                additional_pil.append(pil_ref)
-    
-    try:
-        sized = resize_image_for_wan(reference_image, resolution)
-        
-        # Timeline guidance — strong enough to make visible changes
-        timeline_guidance = max(float(edit_guidance), 3.0)
-        timeline_steps = max(int(edit_steps), 6)
-        
-        # ==================================================================
-        # PHASE 1: Generate all keyframe images with Picgen (Qwen)
-        # ==================================================================
-        print(f"📸 Phase 1: Generating {num_segments} keyframe images...")
-        keyframes = [sized]  # Image 0 = user's input
-        
-        activate_pic()
-        torch.cuda.set_device(PIC_DEVICE)
-        
-        for seg_idx in range(num_segments):
-            seg_prompt = segment_prompts[seg_idx].strip()
-            current_input = keyframes[-1]  # Always edit from the previous keyframe
-            
-            images_for_qwen = [current_input]
-            if additional_pil:
-                images_for_qwen.extend(additional_pil)
-            
-            print(f"  📸 Keyframe {seg_idx + 1}: {seg_prompt[:60]}...")
-            
-            _kf_ctx = torch.cuda.device(PIC_DEVICE) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
-            _kf_ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
-            with _kf_ctx:
-                with _kf_ac:
-                    result = pic_pipe(
-                        image=images_for_qwen,
-                        prompt=seg_prompt,
-                        negative_prompt=" ",
-                        num_inference_steps=timeline_steps,
-                        true_cfg_scale=timeline_guidance,
-                        generator=torch.Generator(device=PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu").manual_seed(current_seed + seg_idx),
-                    )
-            new_keyframe = result.images[0]
-            if new_keyframe.size != sized.size:
-                new_keyframe = new_keyframe.resize(sized.size, Image.LANCZOS)
-            
-            keyframes.append(new_keyframe)
-            print(f"  ✅ Keyframe {seg_idx + 1} generated")
-        
-        print(f"📸 Phase 1 complete: {len(keyframes)} keyframes (including input)")
-        
-        # ==================================================================
-        # PHASE 2: Generate video between each pair of keyframes with Vidgen (Wan)
-        # ==================================================================
-        print(f"🎬 Phase 2: Generating {num_segments} video segments...")
-        segment_paths = []
-        
-        for seg_idx in range(num_segments):
-            seg_num = seg_idx + 1
-            seg_prompt = segment_prompts[seg_idx].strip()
-            seg_duration = float(segment_durations[seg_idx])
-            seg_duration = max(0.5, min(6.0, seg_duration))
-            seg_seed = current_seed + seg_idx * 100
-            
-            first_frame = keyframes[seg_idx]      # Start image
-            last_frame = keyframes[seg_idx + 1]   # End image (target)
-            
-            print(f"  🎬 Seg {seg_num}/{num_segments} ({seg_duration}s): {seg_prompt[:50]}...")
-            
-            # Wan animates first_frame → last_frame with segment prompt as motion
-            num_frames = get_num_frames(seg_duration)
-            
-            raw_frames = animate_frame(
-                first_frame, last_frame, seg_prompt, negative_prompt,
-                num_frames, seg_seed, flow_shift,
-            )
-            
-            # RIFE interpolation
-            factor = max(1, int(frame_multiplier) // FIXED_FPS)
-            if factor > 1:
-                seg_frames = interpolate_bits(raw_frames, multiplier=factor)
-            else:
-                seg_frames = list(raw_frames)
-            seg_fps = FIXED_FPS * factor
-            
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-                seg_path = f.name
-            export_to_video(seg_frames, seg_path, fps=seg_fps, quality=int(export_quality))
-            segment_paths.append(seg_path)
-            
-            print(f"  ✅ Seg {seg_num} done ({seg_duration:.1f}s, {len(seg_frames)} frames)")
-        
-        # ==================================================================
-        # PHASE 3: Stitch all videos together
-        # ==================================================================
-        print(f"🎬 Phase 3: Stitching {len(segment_paths)} segments...")
-        
-        if not segment_paths:
-            raise gr.Error("No video segments were produced.")
-        
-        if len(segment_paths) > 1:
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-                final_path = f.name
-            concatenate_videos(segment_paths, final_path)
-            for p in segment_paths:
-                try: os.unlink(p)
-                except OSError: pass
-        else:
-            final_path = segment_paths[0]
-        
-        # Audio
-        if add_audio_cb and _MMAUDIO_AVAILABLE:
-            try:
-                final_path = add_audio_to_video(final_path, audio_prompt_tb, total_duration)
-            except Exception as e:
-                print(f"MMAudio error: {e}")
-        
-        # Rename
-        named_path = unique_output_path("vidgen_timeline", ".mp4")
-        try:
-            shutil.move(final_path, named_path)
-            final_path = str(named_path)
-        except Exception:
-            pass
-        
-        print(f"🎬 Timeline done in {time.time() - started:.1f}s — {num_segments} segments, {total_duration:.1f}s")
-        return final_path, final_path
-    
-    except gr.Error:
-        raise
-    except Exception as e:
-        for p in segment_paths:
-            try: os.unlink(p)
-            except OSError: pass
-        raise gr.Error(f"Timeline generation failed: {e}")
-
-
-# ---------------------------------------------------------------------------
 # PICGEN MODEL (Qwen Image Edit)
 # ---------------------------------------------------------------------------
 
@@ -2201,104 +1214,17 @@ BASE_MODEL_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "Qwen-Image-Edit-2511")
 NSFW_WEIGHTS_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "rapid-aio", "v23", "Qwen-Rapid-AIO-NSFW-v23.safetensors")
 
 # 🚀 PRIMARY MODEL LOADING
-
-
-def _load_qwen_to_cpu():
-    """
-    Load Qwen to CPU with NSFW weights merged.
-    Returns a fresh pipeline ready for enable_sequential_cpu_offload().
-    """
-    model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
-    repo = BASE_MODEL_LOCAL_PATH if os.path.exists(model_index_path) else "Qwen/Qwen-Image-Edit-2511"
-    kwargs = {"local_files_only": True} if os.path.exists(model_index_path) else {}
-
-    pipe = QwenImageEditPlusPipeline.from_pretrained(
-        repo,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        use_safetensors=True,
-        **kwargs,
-    )
-
-    v23 = NSFW_WEIGHTS_LOCAL_PATH
-    if not os.path.exists(v23):
-        os.makedirs(os.path.dirname(v23), exist_ok=True)
-        v23 = hf_hub_download(
-            repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
-            filename="v23/Qwen-Rapid-AIO-NSFW-v23.safetensors",
-            cache_dir=PICGEN_MODELS_DIR,
-            local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
-        )
-
-    sd = load_file(v23, device="cpu")
-    tw, vw, ew = {}, {}, {}
-    for k, v in sd.items():
-        if k.startswith("model.diffusion_model."):   tw[k.replace("model.diffusion_model.", "")] = v
-        elif k.startswith("transformer."):           tw[k.replace("transformer.", "")] = v
-        elif k.startswith("first_stage_model."):     vw[k.replace("first_stage_model.", "")] = v
-        elif k.startswith("vae."):                   vw[k.replace("vae.", "")] = v
-        elif "text_encoder" in k or "conditioner" in k:
-            if "conditioner.embedders.0." in k:      ew[k.replace("conditioner.embedders.0.", "")] = v
-            elif "text_encoder." in k:               ew[k.replace("text_encoder.", "")] = v
-    if tw: pipe.transformer.load_state_dict(tw, strict=False)
-    if vw: pipe.vae.load_state_dict(vw, strict=False)
-    if ew: pipe.text_encoder.load_state_dict(ew, strict=False)
-    del sd, tw, vw, ew
-
-    pipe.vae.enable_tiling()
-    pipe.vae.enable_slicing()
-
-    # NOTE: SageAttention + fp16 VAE decode were both briefly enabled here to
-    # match Wan, but both were only ever validated against Wan's
-    # model/hardware combo and produced all-black output on Qwen. Testing
-    # them one at a time on real hardware to isolate which (if either) is
-    # actually safe for Qwen — see TESTING NOTE below for current state.
-    #
-    # - SageAttention (enable_sage): apply_sage_attention() patches whatever
-    #   pipe.transformer it's given — on Qwen that runs sageattn() against
-    #   Qwen's Q/K/V tensor layout, which has never been verified
-    #   (tensor_layout HND vs NHD, GQA handling). It also sits inside the
-    #   denoising loop, so a subtle mismatch could degrade prompt adherence
-    #   without an obvious crash. Left OFF until independently verified.
-    #
-    # - fp16 VAE decode (enable_vae_fp16): TESTING NOW. Runs only after
-    #   denoising is done (pure latent-to-pixel conv net), so it cannot
-    #   affect prompt adherence — it's decode-only. Failure mode is binary
-    #   and obvious (all-black on overflow, fine otherwise), unlike Sage's
-    #   silent-degradation risk. Turned ON here to test in isolation with
-    #   Sage OFF — if generations come back correct, keep it; if black,
-    #   revert this one flag back to False.
-    #
-    # torch.compile is deliberately OFF for Qwen. Wan pre-buckets every input
-    # to one of a small set of fixed resolutions (resize_image_for_wan), so
-    # torch.compile only ever compiles ~2 shapes, once. Qwen picgen takes
-    # whatever dimensions the user uploads, unbucketed — every differently
-    # sized photo is a new shape, forcing Dynamo to recompile (~20-30s) on
-    # close to every generation instead of once. That's a net slowdown, not
-    # a speedup, and it's what was showing up as the "Inductor Compilation"
-    # progress-bar spam instead of clean diffusion steps.
-    apply_all_optimizations(
-        pipe, "Qwen (picgen)",
-        enable_compile=False,
-        enable_teacache=False,
-        enable_sage=False,
-        enable_vae_fp16=True,
-    )
-    return pipe
 if DUAL_GPU:
-    # CONCURRENT MODE — either two dedicated GPUs or one 95 GB Blackwell
-    if _SINGLE_CARD_CONCURRENT:
-        print(f"🚀 SINGLE-CARD CONCURRENT: Loading Wan fully to {WAN_DEVICE}, Qwen with model-offload...")
-    else:
-        print(f"🚀 DUAL GPU: Loading Wan → {WAN_DEVICE} and Qwen → {PIC_DEVICE} simultaneously...")
-
+    # DUAL GPU: Load both models to their dedicated GPUs simultaneously at startup
+    print(f"🚀 DUAL GPU: Loading Wan → {WAN_DEVICE} and Qwen → {PIC_DEVICE} simultaneously...")
+    
     def _load_wan_thread():
         global wan_pipe_primary
         t = time.time()
         torch.cuda.set_device(WAN_DEVICE)
         wan_pipe_primary = _load_wan(WAN_DEVICE)
         print(f"✅ WAN ready on {WAN_DEVICE} in {time.time()-t:.1f}s")
-
+    
     def _load_qwen_thread():
         global pic_pipe
         t = time.time()
@@ -2318,7 +1244,6 @@ if DUAL_GPU:
             pipe = QwenImageEditPlusPipeline.from_pretrained(
                 BASE_MODEL_LOCAL_PATH,
                 torch_dtype=torch.bfloat16,
-                low_cpu_mem_usage=True,
                 local_files_only=True,
                 use_safetensors=True
             )
@@ -2359,154 +1284,205 @@ if DUAL_GPU:
         del state_dict, transformer_weights, vae_weights, text_encoder_weights
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
-
-        if _SINGLE_CARD_CONCURRENT:
-            # enable_model_cpu_offload: streams each top-level submodule (text_encoder,
-            # transformer, vae) onto cuda:0 only while it is executing, then moves it
-            # back to CPU immediately. Peak resident VRAM = largest single submodule
-            # (~20 GB transformer) rather than all 35 GB at once. Wan's 57 GB stays
-            # pinned at all times. Total peak: ~57 + ~20 = ~77 GB — fits 95 GB easily
-            # IN THEORY. In practice the exact Wan checkpoint size varies (custom
-            # merges, driver/CUDA-context overhead, etc.), so rather than trust that
-            # math blindly we measure the real free VRAM left after Wan is pinned and
-            # only use the faster whole-submodule offload if there's real headroom.
-            # Otherwise fall back to enable_sequential_cpu_offload (layer-by-layer,
-            # ~2-4 GB peak, slower but immune to this OOM) so the app stays usable
-            # instead of crashing on the first Photo Editor generation.
-            global _QWEN_CUDA_GENERATOR
-            torch.cuda.synchronize(WAN_DEVICE)
-            torch.cuda.empty_cache()
-            _free_bytes, _total_bytes = torch.cuda.mem_get_info(0)
-            _free_gb = _free_bytes / (1024 ** 3)
-            _QWEN_SUBMODULE_SAFETY_GB = 30  # largest Qwen submodule (~20-25 GB) + margin
-            if _free_gb >= _QWEN_SUBMODULE_SAFETY_GB:
-                pipe.enable_model_cpu_offload(gpu_id=0)
-                _QWEN_CUDA_GENERATOR = True
-                print(f"✅ Qwen ready with model-cpu-offload on cuda:0 in {time.time()-t:.1f}s "
-                      f"({_free_gb:.1f} GB free after Wan)")
-            else:
-                pipe.enable_sequential_cpu_offload(gpu_id=0)
-                _QWEN_CUDA_GENERATOR = False
-                print(f"⚠️  Only {_free_gb:.1f} GB free after Wan (< {_QWEN_SUBMODULE_SAFETY_GB} GB safety "
-                      f"margin) — Qwen falling back to sequential-cpu-offload (slower, OOM-safe) "
-                      f"in {time.time()-t:.1f}s")
-        else:
-            # Two GPUs: pin Qwen fully to its dedicated card for maximum throughput
-            pipe.to(PIC_DEVICE)
-            print(f"✅ Qwen ready on {PIC_DEVICE} in {time.time()-t:.1f}s")
-
-        # Same optimization stack as _load_qwen_to_cpu() — SageAttention OFF,
-        # fp16 VAE decode ON for isolated testing; see the TESTING NOTE in
-        # that function for why (decode-only, can't affect prompt adherence,
-        # binary black/fine failure mode). torch.compile stays OFF for the
-        # unbucketed-input-shape reason noted there as well. This pipe is
-        # built inline here rather than via _load_qwen_to_cpu(), so it needs
-        # its own call.
-        apply_all_optimizations(
-            pipe, "Qwen (picgen)",
-            enable_compile=False,
-            enable_teacache=False,
-            enable_sage=False,
-            enable_vae_fp16=True,
-        )
+        pipe.to(PIC_DEVICE)
         pic_pipe = pipe
+        print(f"✅ Qwen ready on {PIC_DEVICE} in {time.time()-t:.1f}s")
 
-    if _SINGLE_CARD_CONCURRENT:
-        # On a single card, load Wan first (it pins 57 GB), then Qwen.
-        # Loading both in parallel would cause a transient OOM during weight init.
-        _load_wan_thread()
-        _load_qwen_thread()
-    else:
-        t_wan = threading.Thread(target=_load_wan_thread, daemon=False)
-        t_qwen = threading.Thread(target=_load_qwen_thread, daemon=False)
-        t_wan.start()
-        t_qwen.start()
-        t_wan.join()
-        t_qwen.join()
-
+    t_wan = threading.Thread(target=_load_wan_thread, daemon=False)
+    t_qwen = threading.Thread(target=_load_qwen_thread, daemon=False)
+    t_wan.start()
+    t_qwen.start()
+    t_wan.join()
+    t_qwen.join()
     _active_model = "both"
-    if _SINGLE_CARD_CONCURRENT:
-        print(f"✅ SINGLE-CARD CONCURRENT READY — Wan pinned, Qwen offloaded (both on cuda:0)")
-    else:
-        print(f"✅ DUAL GPU READY — Vidgen on {WAN_DEVICE}, Picgen on {PIC_DEVICE}")
-
-    # Apply inference optimizations to both pipelines
-    print("⚡ Applying inference optimizations...")
-    _wan_opt = apply_all_optimizations(
-        wan_pipe, "WAN (vidgen)",
-        enable_compile=True,
-        enable_teacache=True, teacache_thresh=0.05,
-        enable_sage=True,
-        enable_vae_fp16=True,
-    )
+    print(f"✅ DUAL GPU READY — Vidgen on {WAN_DEVICE}, Picgen on {PIC_DEVICE}")
 
 elif STARTUP_MODE == "vidgen":
     print("🚀 VIDGEN DEFAULT: Loading Wan to GPU first for immediate use...")
     start_primary = time.time()
-    _build_wan_pipeline("cpu")
-    # Swap mode: Wan gets the WHOLE card while it's active (Qwen is fully
-    # parked on CPU), so pick the fastest tier that actually fits instead of
-    # always defaulting to the slowest layer-by-layer offload.
-    _apply_offload_tier(wan_pipe, "wan", 0, full_weight_gb=60, submodule_gb=32)
+    
+    # Load Wan directly to GPU
+    wan_pipe_primary = _load_wan(WAN_DEVICE)
     _active_model = "wan"
-    print(f"✅ WAN READY in {time.time()-start_primary:.1f}s - Vidgen functional!")
-    apply_all_optimizations(
-        wan_pipe, "WAN (vidgen)",
-        enable_compile=True,
-        enable_teacache=True, teacache_thresh=0.05,
-        enable_sage=True,
-        enable_vae_fp16=True,
-    )
-
-    # Load Qwen to CPU in background so first tab-switch is fast
+    primary_load_time = time.time() - start_primary
+    print(f"✅ WAN READY ON GPU in {primary_load_time:.1f}s - Vidgen functional!")
+    
+    # Define pic_pipe as None for now - will load in background
     pic_pipe = None
-    def _bg_qwen_load():
-        global pic_pipe
-        print("📦 Background: Loading Qwen to CPU...")
-        t = time.time()
-        pic_pipe = _load_qwen_to_cpu()
-        print(f"✅ Qwen on CPU in {time.time()-t:.1f}s — tab switching ready!")
-    threading.Thread(target=_bg_qwen_load, daemon=True).start()
-
+    
 else:
-    # PICGEN MODE
+    # PICGEN MODE: Load Qwen to GPU first
     print("🚀 PICGEN MODE: Loading Qwen to GPU first for immediate use...")
+    
+    # 🚀 AGGRESSIVE QWEN LOADING with concurrent optimization
+    print("🚀 AGGRESSIVE LOADING: Qwen Image Edit pipeline...")
     start_qwen = time.time()
-    pic_pipe = _load_qwen_to_cpu()
-    # Swap mode: Qwen gets the WHOLE card while it's active (Wan is fully
-    # parked on CPU) — same reasoning as the Wan branch above.
-    _qwen_tier = _apply_offload_tier(pic_pipe, "pic", 0, full_weight_gb=42, submodule_gb=26)
-    # Only "sequential" routes activations through CPU; "full" and
-    # "model_offload" keep the active submodule resident on CUDA, so the
-    # generator can (and for correctness, must) live on CUDA too.
-    _QWEN_CUDA_GENERATOR = (_qwen_tier != "sequential")
-    _active_model = "pic"
-    print(f"✅ QWEN READY in {time.time()-start_qwen:.1f}s - Picgen functional!")
 
-    # Load WAN to CPU in background so first tab-switch is fast
-    def _bg_wan_load():
-        print("📦 Background: Loading Wan to CPU...")
-        t = time.time()
-        _build_wan_pipeline("cpu")
-        print(f"✅ Wan on CPU in {time.time()-t:.1f}s — tab switching ready!")
-    threading.Thread(target=_bg_wan_load, daemon=True).start()
+    model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
+    if not os.path.exists(model_index_path):
+        print(f"Downloading Qwen base model to {BASE_MODEL_LOCAL_PATH}...")
+        os.makedirs(PICGEN_MODELS_DIR, exist_ok=True)
+        pic_pipe = QwenImageEditPlusPipeline.from_pretrained(
+            "Qwen/Qwen-Image-Edit-2511",
+            torch_dtype=torch.bfloat16,
+            cache_dir=BASE_MODEL_LOCAL_PATH,
+            use_safetensors=True
+        )
+    else:
+        pic_pipe = QwenImageEditPlusPipeline.from_pretrained(
+            BASE_MODEL_LOCAL_PATH,
+            torch_dtype=torch.bfloat16,
+            local_files_only=True,
+            use_safetensors=True
+        )
+
+    print("Loading NSFW weights for Qwen...")
+    if not os.path.exists(NSFW_WEIGHTS_LOCAL_PATH):
+        print(f"Downloading NSFW weights...")
+        os.makedirs(os.path.dirname(NSFW_WEIGHTS_LOCAL_PATH), exist_ok=True)
+        v23_path = hf_hub_download(
+            repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
+            filename="v23/Qwen-Rapid-AIO-NSFW-v23.safetensors",
+            cache_dir=PICGEN_MODELS_DIR,
+            local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
+        )
+    else:
+        v23_path = NSFW_WEIGHTS_LOCAL_PATH
+
+    print("Loading NSFW state dict...")
+    state_dict = load_file(v23_path)
+
+    transformer_weights = {}
+    vae_weights = {}
+    text_encoder_weights = {}
+
+    for k, v in state_dict.items():
+        if k.startswith("model.diffusion_model."):
+            transformer_weights[k.replace("model.diffusion_model.", "")] = v
+        elif k.startswith("transformer."):
+            transformer_weights[k.replace("transformer.", "")] = v
+        elif k.startswith("first_stage_model."):
+            vae_weights[k.replace("first_stage_model.", "")] = v
+        elif k.startswith("vae."):
+            vae_weights[k.replace("vae.", "")] = v
+        elif "text_encoder" in k or "conditioner" in k:
+            if "conditioner.embedders.0." in k:
+                text_encoder_weights[k.replace("conditioner.embedders.0.", "")] = v
+            elif "text_encoder." in k:
+                text_encoder_weights[k.replace("text_encoder.", "")] = v
+
+    if transformer_weights:
+        pic_pipe.transformer.load_state_dict(transformer_weights, strict=False)
+    if vae_weights:
+        pic_pipe.vae.load_state_dict(vae_weights, strict=False)
+    if text_encoder_weights:
+        pic_pipe.text_encoder.load_state_dict(text_encoder_weights, strict=False)
+
+    del state_dict, transformer_weights, vae_weights, text_encoder_weights
+    torch.cuda.empty_cache()
+
+    pic_pipe.vae.enable_tiling()
+    pic_pipe.vae.enable_slicing()
+
+    # Load Qwen to GPU for picgen mode
+    pic_pipe.transformer.to(PIC_DEVICE)
+    pic_pipe.text_encoder.to(PIC_DEVICE) 
+    pic_pipe.vae.to(PIC_DEVICE)
+    
+    qwen_time = time.time() - start_qwen
+    print(f"✅ QWEN READY ON GPU in {qwen_time:.1f}s - Picgen functional!")
+    _active_model = "pic"
 
 _swap_lock = threading.Lock()
-# Set True once activate_wan() drops pic_pipe for the first time. Lets
-# activate_pic() tell "still doing the one-time startup background load"
-# apart from "was loaded, then evicted by a swap" — the latter needs a
-# fresh rebuild, not another wait on a load that already finished.
-_qwen_dropped = False
+
+
+# AGGRESSIVE CONCURRENT LOADING
+def _concurrent_component_load(component_loader_fn, device, component_name):
+    """Load a single component to device concurrently."""
+    print(f"    Loading {component_name} to {device}...")
+    start_time = time.time()
+    component_loader_fn()
+    load_time = time.time() - start_time
+    print(f"    {component_name} loaded in {load_time:.1f}s")
+    return component_name, load_time
+
+def _aggressive_pipeline_load(repo_id, device, pipeline_name):
+    """Aggressively load pipeline with concurrent components and memory optimization."""
+    print(f"🚀 AGGRESSIVE LOADING: {pipeline_name} to {device}")
+    start_time = time.time()
+    
+    # Load with maximum optimization parameters
+    if "wan" in pipeline_name.lower():
+        pipeline = WanImageToVideoPipeline.from_pretrained(
+            repo_id,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            device_map=None,
+            use_safetensors=True
+        )
+    else:
+        pipeline = QwenImageEditPlusPipeline.from_pretrained(
+            repo_id,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            device_map=None,
+            use_safetensors=True
+        )
+    
+    # CONCURRENT COMPONENT LOADING with ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix=f"{pipeline_name}_loader") as executor:
+        futures = []
+        
+        # Create component loading tasks
+        if hasattr(pipeline, 'transformer'):
+            futures.append(executor.submit(
+                _concurrent_component_load,
+                lambda: pipeline.transformer.to(device, non_blocking=True),
+                device, "transformer"
+            ))
+        if hasattr(pipeline, 'transformer_2'):
+            futures.append(executor.submit(
+                _concurrent_component_load,
+                lambda: pipeline.transformer_2.to(device, non_blocking=True),
+                device, "transformer_2"
+            ))
+        if hasattr(pipeline, 'text_encoder'):
+            futures.append(executor.submit(
+                _concurrent_component_load,
+                lambda: pipeline.text_encoder.to(device, non_blocking=True),
+                device, "text_encoder"
+            ))
+        if hasattr(pipeline, 'vae'):
+            futures.append(executor.submit(
+                _concurrent_component_load,
+                lambda: pipeline.vae.to(device, non_blocking=True),
+                device, "vae"
+            ))
+        
+        # Wait for all components to load concurrently
+        total_components = len(futures)
+        completed_times = []
+        for future in as_completed(futures):
+            component_name, load_time = future.result()
+            completed_times.append(load_time)
+            print(f"    ✅ {component_name} ready ({len(completed_times)}/{total_components})")
+    
+    # Synchronize all GPU transfers
+    torch.cuda.synchronize()
+    
+    total_time = time.time() - start_time
+    print(f"🎯 {pipeline_name} LOADED in {total_time:.1f}s (concurrent speedup: {sum(completed_times)/total_time:.1f}x)")
+    
+    return pipeline
 
 
 def activate_wan():
-    """Ensure Wan is active on GPU."""
-    global _active_model, pic_pipe, wan_pipe, _wan_loaded, _qwen_dropped
+    """Ensure Wan is on WAN_DEVICE and ready."""
+    global _active_model
 
     if DUAL_GPU:
-        # Concurrent mode — Wan is always GPU-resident (fully pinned).
-        # On a single 95 GB card Qwen uses enable_model_cpu_offload so it
-        # never permanently occupies Wan's VRAM; no swap is ever needed.
+        # Dual GPU: Wan is always on WAN_DEVICE, no swap needed
+        # Just ensure it's loaded (it should be from startup)
         if not _wan_loaded or wan_pipe is None:
             _load_wan(WAN_DEVICE)
         return
@@ -2514,104 +1490,72 @@ def activate_wan():
     if _active_model == "wan":
         return
 
-    print("🔄 Swapping to Wan...")
-    t = time.time()
+    print("🚀 Fast swap to Wan...")
+    start_time = time.time()
 
     with _swap_lock:
         if _active_model == "wan":
             return
 
-        # Drop Qwen from GPU: delete the offload-hooked pipeline and free memory.
-        # enable_sequential_cpu_offload() hooks can't be undone — deletion is the
-        # only clean path.
-        if pic_pipe is not None:
-            pic_pipe = None
-            _qwen_dropped = True
-            gc.collect()
-            torch.cuda.empty_cache()
+        # Only move Qwen to CPU if it's currently on GPU
+        if _active_model == "pic" and pic_pipe is not None:
+            pic_pipe.to("cpu")
 
-        # Load WAN to CPU (weights already cached — fast), then stream to GPU.
-        if not _wan_loaded or wan_pipe is None:
-            _build_wan_pipeline("cpu")
-            # Apply optimizations to the freshly loaded pipeline.
-            # (If the pipeline was already built and cached, optimizations were
-            # applied at build time and survive in the CPU-side weights.)
-            apply_all_optimizations(
-                wan_pipe, "WAN (swap-in)",
-                enable_compile=True,
-                enable_teacache=True, teacache_thresh=0.05,
-                enable_sage=True,
-                enable_vae_fp16=True,
-            )
-        # Whole card is free for Wan right now (Qwen just got dropped above) —
-        # use the fastest tier that fits rather than always the slowest one.
-        _apply_offload_tier(wan_pipe, "wan", 0, full_weight_gb=60, submodule_gb=32)
+        torch.cuda.empty_cache()
+
+        # If already loaded, just move to GPU. Otherwise load fresh.
+        if _wan_loaded and wan_pipe is not None:
+            wan_pipe.to(WAN_DEVICE)
+        else:
+            _load_wan(WAN_DEVICE)
 
         _active_model = "wan"
-        print(f"🎯 Wan active in {time.time()-t:.1f}s")
+        swap_time = time.time() - start_time
+        print(f"🎯 Wan active in {swap_time:.1f}s")
 
 
 def activate_pic():
-    """Ensure Qwen is active on GPU."""
-    global _active_model, pic_pipe, wan_pipe, _wan_loaded, _qwen_dropped, _QWEN_CUDA_GENERATOR
+    """Ensure Qwen is on PIC_DEVICE and ready."""
+    global _active_model
 
     if DUAL_GPU:
-        # Concurrent mode — Qwen is always ready.
-        # On a single 95 GB card its enable_model_cpu_offload hooks stream
-        # submodules to GPU only during inference and free them immediately
-        # after, so no manual management is needed here.
+        # Dual GPU: Qwen is always on PIC_DEVICE, no swap needed
         if pic_pipe is None:
-            raise RuntimeError("Qwen pipeline not loaded.")
+            raise RuntimeError("Qwen pipeline not loaded — dual GPU startup failed.")
         return
 
     if _active_model == "pic":
         return
 
-    # pic_pipe is None either because the one-time startup background load
-    # hasn't finished yet, or because a previous activate_wan() call dropped
-    # it (it always deletes the offload-hooked pipeline outright — those
-    # hooks can't be undone in place). Only the first case should wait;
-    # the second needs a fresh rebuild, since nothing else will ever
-    # repopulate pic_pipe on its own.
+    # If pic_pipe hasn't loaded yet (vidgen background load still running), wait for it
     if pic_pipe is None:
-        if _qwen_dropped:
-            print("🔁 Rebuilding Qwen (was dropped on a previous swap)...")
-            rebuild_start = time.time()
-            pic_pipe = _load_qwen_to_cpu()
-            print(f"✅ Qwen rebuilt in {time.time()-rebuild_start:.1f}s")
-        else:
-            print("⏳ Waiting for Qwen background load...")
-            wait_start = time.time()
-            while pic_pipe is None:
-                time.sleep(0.5)
-                if time.time() - wait_start > 300:
-                    raise RuntimeError("Qwen failed to load within 300 seconds")
-            print("✅ Qwen background load complete")
+        print("⏳ Waiting for Qwen to finish loading in background...")
+        wait_start = time.time()
+        while pic_pipe is None:
+            time.sleep(0.5)
+            if time.time() - wait_start > 120:
+                raise RuntimeError("Qwen failed to load within 120 seconds")
+        print(f"✅ Qwen background load complete, proceeding with swap")
 
-    print("🔄 Swapping to Qwen...")
-    t = time.time()
+    print("🚀 Fast swap to Qwen...")
+    start_time = time.time()
 
     with _swap_lock:
         if _active_model == "pic":
             return
 
-        # Drop WAN from GPU: same pattern — delete and free.
-        if wan_pipe is not None:
-            wan_pipe = None
-            _wan_loaded = False
-            _wan_cache_clear()   # free GPU tensors held in text/image caches
-            gc.collect()
-            torch.cuda.empty_cache()
+        # Only move Wan to CPU if it's currently on GPU
+        if _active_model == "wan" and _wan_loaded and wan_pipe is not None:
+            wan_pipe.to("cpu")
 
-        # pic_pipe is already on CPU (loaded in startup, previous swap, or
-        # just rebuilt above). Whole card is free for it right now (Wan just
-        # got dropped) — use the fastest tier that fits.
-        _qwen_tier = _apply_offload_tier(pic_pipe, "pic", 0, full_weight_gb=42, submodule_gb=26)
-        _QWEN_CUDA_GENERATOR = (_qwen_tier != "sequential")
-        _qwen_dropped = False
+        torch.cuda.empty_cache()
+
+        # Move Qwen to GPU
+        pic_pipe.to(PIC_DEVICE)
 
         _active_model = "pic"
-        print(f"🎯 Qwen active in {time.time()-t:.1f}s")
+        swap_time = time.time() - start_time
+        print(f"🎯 Qwen active in {swap_time:.1f}s")
 
 PICGEN_MAX_SEED = np.iinfo(np.int32).max
 
@@ -2677,29 +1621,14 @@ def _cache_prompt_embeds(prompt, negative_prompt, images, num_images_per_prompt,
         cache[key] = embeds_data
 
 
-STARTER_IMAGE_EXTS = ("jpg", "jpeg", "png", "webp")
-
-
-def _find_starter_image_path(starter_num):
-    """Return (path, ext) for the first matching starter image file, or (None, None)."""
-    starters_dir = os.path.join(SCRIPT_DIR, "starters")
-    for ext in STARTER_IMAGE_EXTS:
-        path = os.path.join(starters_dir, f"start{starter_num}.{ext}")
-        if os.path.exists(path):
-            return path, ext
-    return None, None
-
-
 def add_starter_image(starter_num):
-    """Load a starter image (supports .jpg, .jpeg, .png, .webp) as a base64 data URI."""
-    path, ext = _find_starter_image_path(starter_num)
-    if not path:
+    starter_path = os.path.join(SCRIPT_DIR, f"starters/start{starter_num}.jpg")
+    if not os.path.exists(starter_path):
         return ""
-    with open(path, "rb") as f:
+    with open(starter_path, "rb") as f:
         data = f.read()
     b64 = base64.b64encode(data).decode()
-    mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp"}[ext]
-    return f"data:image/{mime};base64,{b64}"
+    return f"data:image/jpeg;base64,{b64}"
 
 
 def _decode_single_b64(b64_str):
@@ -2774,16 +1703,9 @@ def infer(
     activate_pic()
     _t_active = time.time()
 
-    # Pin to PIC_DEVICE — prevents cross-device leakage in dual GPU mode.
-    # Generator device must match Qwen's actual offload strategy, not just the
-    # nominal GPU_MODE:
-    # - enable_model_cpu_offload (whole submodules pinned during use): CUDA generator
-    # - enable_sequential_cpu_offload (layer-by-layer, incl. single-card concurrent's
-    #   low-VRAM fallback, and swap mode): activations route through CPU, so the
-    #   generator must be CPU or diffusers raises a device mismatch.
+    # Pin to PIC_DEVICE — prevents cross-device leakage in dual GPU mode
     torch.cuda.set_device(PIC_DEVICE)
-    _pic_gen_device = PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu"
-    generator = torch.Generator(device=_pic_gen_device).manual_seed(seed)
+    generator = torch.Generator(device=PIC_DEVICE).manual_seed(seed)
     pil_images = b64_to_pil_list(images_b64_json)
     if not pil_images:
         raise gr.Error("Please upload at least one image.")
@@ -2794,89 +1716,68 @@ def infer(
 
     print(f"Prompt: '{prompt}' | Seed: {seed} | Steps: {num_inference_steps}")
     print(f"  input images: {[im.size for im in pil_images]}")
-
-    # ---- Prompt embedding cache -------------------------------------------
-    # The previous approach monkey-patched pic_pipe.encode_prompt so it could
-    # return cached values. The problem: accelerate's sequential offload hooks
-    # fire at pre_forward time, BEFORE encode_prompt runs, moving the
-    # text_encoder to GPU regardless of whether we'd return early. That's what
-    # caused the 14.5 GB + 1.02 GB OOM.
-    #
-    # Fix: call encode_prompt once here (outside the pipeline), cache the
-    # result tensor, and on subsequent calls pass prompt_embeds directly as a
-    # pipeline kwarg — which causes the pipeline to skip the encode_prompt call
-    # entirely, so the offload hook for text_encoder never fires.
+    
+    # Check cache for prompt embeddings (cache key includes num_images_per_prompt)
     cached_embeds = _get_cached_prompt_embeds(prompt, negative_prompt, pil_images, num_images_per_prompt)
-
-    if cached_embeds is not None:
-        print(f"  timing: activate {_t_active - _t_enter:.2f}s, "
-              f"decode {_t_decoded - _t_active:.2f}s, embeds: cache hit "
-              f"(active model: {_active_model}, dual_gpu: {DUAL_GPU}, qwen_cuda_gen: {_QWEN_CUDA_GENERATOR})")
-        pic_kwargs = dict(
-            image=pil_images,
-            prompt_embeds=cached_embeds["prompt_embeds"],
-            prompt_embeds_mask=cached_embeds["prompt_embeds_mask"],
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            generator=generator,
-            true_cfg_scale=true_guidance_scale,
-            num_images_per_prompt=num_images_per_prompt,
-        )
-    else:
-        print(f"  timing: activate {_t_active - _t_enter:.2f}s, "
-              f"decode {_t_decoded - _t_active:.2f}s, embeds: computing "
-              f"(active model: {_active_model}, dual_gpu: {DUAL_GPU}, qwen_cuda_gen: {_QWEN_CUDA_GENERATOR})")
-        pic_kwargs = dict(
-            image=pil_images,
-            prompt=prompt,
-            height=height,
-            width=width,
-            negative_prompt=negative_prompt,
-            num_inference_steps=num_inference_steps,
-            generator=generator,
-            true_cfg_scale=true_guidance_scale,
-            num_images_per_prompt=num_images_per_prompt,
-        )
-
+    cache_status = "cached" if cached_embeds else "computing"
+    
+    print(f"  timing: activate {_t_active - _t_enter:.2f}s, "
+          f"decode {_t_decoded - _t_active:.2f}s, embeds: {cache_status} "
+          f"(active model: {_active_model}, dual_gpu: {DUAL_GPU})")
     _t_pipe = time.time()
 
-    _pic_ctx2 = torch.cuda.device(PIC_DEVICE) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
-    _pic_autocast2 = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if _QWEN_CUDA_GENERATOR else contextlib.nullcontext()
-    with _pic_ctx2:
-        with _pic_autocast2:
-            result = pic_pipe(**pic_kwargs)
-            image = result.images
-
-    # Cache the embeddings for next time if this was a fresh encode.
-    # QwenImageEditPlusPipeline stores the last-computed embeds on the result
-    # under various attribute names depending on diffusers version — try them.
-    if cached_embeds is None:
-        try:
-            pe = getattr(result, 'prompt_embeds', None)
-            pe_mask = getattr(result, 'prompt_embeds_mask', None)
-            if pe is not None and pe_mask is not None:
-                _cache_prompt_embeds(
-                    prompt, negative_prompt, pil_images, num_images_per_prompt,
-                    {"prompt_embeds": pe, "prompt_embeds_mask": pe_mask},
-                )
-            else:
-                # Encode directly and cache; runs only once per unique prompt.
-                with torch.no_grad(), torch.cuda.device(PIC_DEVICE):
-                    enc_result = pic_pipe.encode_prompt(
-                        prompt=prompt,
-                        image=pil_images,
-                        device=PIC_DEVICE if _QWEN_CUDA_GENERATOR else "cpu",
-                        num_images_per_prompt=num_images_per_prompt,
-                    )
-                if isinstance(enc_result, (list, tuple)) and len(enc_result) >= 2:
-                    _cache_prompt_embeds(
-                        prompt, negative_prompt, pil_images, num_images_per_prompt,
-                        {"prompt_embeds": enc_result[0], "prompt_embeds_mask": enc_result[1]},
-                    )
-        except Exception as _ce:
-            # Non-fatal — cache miss just means next call re-encodes
-            print(f"  embed cache fill skipped (non-fatal): {_ce}")
+    # Temporarily patch pipeline methods to use cache
+    original_encode_prompt = pic_pipe.encode_prompt
+    original_prepare_latents = pic_pipe.prepare_latents
+    
+    encode_called = [False]
+    prepare_called = [False]
+    
+    def cached_encode_prompt(*args, **kwargs):
+        encode_called[0] = True
+        if cached_embeds is not None:
+            return cached_embeds["prompt_embeds"], cached_embeds["prompt_embeds_mask"]
+        result = original_encode_prompt(*args, **kwargs)
+        # Cache the result for next time
+        embeds_data = {
+            "prompt_embeds": result[0],
+            "prompt_embeds_mask": result[1]
+        }
+        _cache_prompt_embeds(prompt, negative_prompt, pil_images, num_images_per_prompt, embeds_data)
+        return result
+    
+    def cached_prepare_latents(images, *args, **kwargs):
+        prepare_called[0] = True
+        # Don't use cache for prepare_latents - too complex with batching
+        # Just call original and cache the result
+        result = original_prepare_latents(images, *args, **kwargs)
+        if images is not None and result[1] is not None:
+            # Cache the image_latents for next time (but we won't use it due to complexity)
+            # Keeping this for future improvement
+            pass
+        return result
+    
+    pic_pipe.encode_prompt = cached_encode_prompt
+    pic_pipe.prepare_latents = cached_prepare_latents
+    
+    try:
+        with torch.cuda.device(PIC_DEVICE):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                image = pic_pipe(
+                    image=pil_images if pil_images else None,
+                    prompt=prompt,
+                    height=height,
+                    width=width,
+                    negative_prompt=negative_prompt,
+                    num_inference_steps=num_inference_steps,
+                    generator=generator,
+                    true_cfg_scale=true_guidance_scale,
+                    num_images_per_prompt=num_images_per_prompt,
+                ).images
+    finally:
+        # Restore original methods
+        pic_pipe.encode_prompt = original_encode_prompt
+        pic_pipe.prepare_latents = original_prepare_latents
 
     print(f"  pipeline call took {time.time() - _t_pipe:.2f}s")
 
@@ -3106,53 +2007,150 @@ with gr.Blocks(css=css) as demo:
     def clear_storage():
         """Delete all generated files — same as running clear.sh."""
         import shutil as _shutil
+        import subprocess
+        import time
         deleted = []
         errors = []
 
-        # 1. tmp/gradio — delete everything except vibe_edit_history
-        gradio_dir = Path(SCRIPT_DIR) / "tmp" / "gradio"
-        if gradio_dir.exists():
-            for item in gradio_dir.iterdir():
-                if item.name == "vibe_edit_history":
-                    continue
-                try:
+        print(f"🗑️ Starting clear_storage at {time.time()}")
+
+        # BACKUP METHOD 1: Try relative path from current working directory
+        gradio_dir_cwd = Path.cwd() / "tmp" / "gradio"
+        
+        # BACKUP METHOD 2: Try relative path from script directory
+        gradio_dir_script = Path(SCRIPT_DIR) / "tmp" / "gradio"
+        
+        # BACKUP METHOD 3: Try absolute path on VPS
+        gradio_dir_abs = Path("/root/newgen/tmp/gradio")
+        
+        # Try all possible paths for tmp/gradio
+        for gradio_dir in [gradio_dir_cwd, gradio_dir_script, gradio_dir_abs]:
+            if gradio_dir.exists():
+                print(f"Found gradio dir at: {gradio_dir}")
+                for item in gradio_dir.iterdir():
+                    if item.name == "vibe_edit_history":
+                        continue
+                    try:
+                        # Try multiple deletion methods
+                        if item.is_dir():
+                            try:
+                                _shutil.rmtree(item)
+                                print(f"  Deleted dir: {item}")
+                            except Exception as e1:
+                                # Backup: try subprocess rm
+                                result = subprocess.run(["rm", "-rf", str(item)], capture_output=True)
+                                if result.returncode == 0:
+                                    print(f"  Deleted dir (subprocess): {item}")
+                        else:
+                            try:
+                                item.unlink()
+                                print(f"  Deleted file: {item}")
+                            except Exception as e2:
+                                # Backup: try subprocess rm
+                                result = subprocess.run(["rm", "-f", str(item)], capture_output=True)
+                                if result.returncode == 0:
+                                    print(f"  Deleted file (subprocess): {item}")
+                        deleted.append(str(item))
+                    except Exception as e:
+                        print(f"  Failed to delete {item}: {e}")
+                        errors.append(f"{item.name}: {e}")
+                break  # Only process first found directory
+
+        # Also clean up loose files in tmp root folder (INCLUDING .mp4 files)
+        for tmp_dir in [Path.cwd() / "tmp", Path(SCRIPT_DIR) / "tmp", Path("/root/newgen/tmp")]:
+            if tmp_dir.exists():
+                print(f"Checking tmp root at: {tmp_dir}")
+                for item in tmp_dir.iterdir():
+                    # Skip the gradio subdirectory (already handled above)
+                    if item.is_dir() and item.name == "gradio":
+                        continue
+                    # Skip other directories
                     if item.is_dir():
-                        _shutil.rmtree(item)
-                    else:
-                        item.unlink()
-                    deleted.append(item.name)
-                except Exception as e:
-                    errors.append(f"{item.name}: {e}")
+                        continue
+                    # Delete ALL loose files (including .mp4, .png, etc)
+                    try:
+                        try:
+                            item.unlink()
+                            print(f"  Deleted tmp file: {item}")
+                        except Exception as e3:
+                            result = subprocess.run(["rm", "-f", str(item)], capture_output=True)
+                            if result.returncode == 0:
+                                print(f"  Deleted tmp file (subprocess): {item}")
+                        deleted.append(str(item))
+                    except Exception as e:
+                        print(f"  Failed to delete tmp file {item}: {e}")
+                        errors.append(f"{item.name}: {e}")
+                break
+
+        # ADDITIONAL BACKUP: Force delete all .mp4 files in tmp using find command
+        for tmp_dir in [Path.cwd() / "tmp", Path(SCRIPT_DIR) / "tmp", Path("/root/newgen/tmp")]:
+            if tmp_dir.exists():
+                print(f"Force cleaning .mp4 files in: {tmp_dir}")
+                subprocess.run(
+                    ["find", str(tmp_dir), "-maxdepth", "1", "-name", "*.mp4", "-type", "f", "-delete"],
+                    capture_output=True, check=False
+                )
+                # Also try with rm for good measure
+                subprocess.run(
+                    f"rm -f {tmp_dir}/*.mp4 2>/dev/null || true",
+                    shell=True, check=False
+                )
+                break
 
         # 2. outputs/images — delete contents, keep folder
-        images_dir = IMAGE_OUTPUT_DIR
-        if images_dir.exists():
-            for item in images_dir.iterdir():
-                try:
-                    if item.is_dir():
-                        _shutil.rmtree(item)
-                    else:
-                        item.unlink()
-                    deleted.append(item.name)
-                except Exception as e:
-                    errors.append(f"{item.name}: {e}")
+        # Try multiple paths
+        for images_dir in [IMAGE_OUTPUT_DIR, Path.cwd() / "outputs" / "images", Path("/root/newgen/outputs/images")]:
+            if images_dir.exists():
+                print(f"Found images dir at: {images_dir}")
+                for item in images_dir.iterdir():
+                    try:
+                        if item.is_dir():
+                            try:
+                                _shutil.rmtree(item)
+                                print(f"  Deleted images dir: {item}")
+                            except:
+                                subprocess.run(["rm", "-rf", str(item)], check=False)
+                        else:
+                            try:
+                                item.unlink()
+                                print(f"  Deleted image file: {item}")
+                            except:
+                                subprocess.run(["rm", "-f", str(item)], check=False)
+                        deleted.append(str(item))
+                    except Exception as e:
+                        errors.append(f"{item.name}: {e}")
+                break
 
         # 3. outputs/videos — delete contents, keep folder
-        videos_dir = VIDEO_OUTPUT_DIR
-        if videos_dir.exists():
-            for item in videos_dir.iterdir():
-                try:
-                    if item.is_dir():
-                        _shutil.rmtree(item)
-                    else:
-                        item.unlink()
-                    deleted.append(item.name)
-                except Exception as e:
-                    errors.append(f"{item.name}: {e}")
+        for videos_dir in [VIDEO_OUTPUT_DIR, Path.cwd() / "outputs" / "videos", Path("/root/newgen/outputs/videos")]:
+            if videos_dir.exists():
+                print(f"Found videos dir at: {videos_dir}")
+                for item in videos_dir.iterdir():
+                    try:
+                        if item.is_dir():
+                            try:
+                                _shutil.rmtree(item)
+                                print(f"  Deleted videos dir: {item}")
+                            except:
+                                subprocess.run(["rm", "-rf", str(item)], check=False)
+                        else:
+                            try:
+                                item.unlink()
+                                print(f"  Deleted video file: {item}")
+                            except:
+                                subprocess.run(["rm", "-f", str(item)], check=False)
+                        deleted.append(str(item))
+                    except Exception as e:
+                        errors.append(f"{item.name}: {e}")
+                break
 
+        print(f"🗑️ Finished clear_storage. Deleted {len(deleted)} items, {len(errors)} errors")
         if errors:
-            return gr.update(visible=True, value=f"⚠️ Done with errors: {'; '.join(errors)}")
+            return gr.update(visible=True, value=f"⚠️ Done with errors: {'; '.join(errors[:5])}")
         return gr.update(visible=True, value=f"✅ Cleared {len(deleted)} items.")
+
+
+
 
     clear_storage_btn.click(
         fn=clear_storage,
@@ -3163,30 +2161,24 @@ with gr.Blocks(css=css) as demo:
     # Tab 0 = Video Generator (vidgen), Tab 1 = Photo Editor (picgen).
     # -vidgen (default) opens on the Video Generator tab; -picgen opens on the
     # Photo Editor tab.
-    with gr.Tabs(selected=("vidgen-tab" if STARTUP_MODE == "vidgen" else "picgen-tab")):
+    with gr.Tabs(selected=(0 if STARTUP_MODE == "vidgen" else 1)):
 
         # ------------------------------------------------------------------ #
         #  TAB 1 — VIDEO GENERATOR (Qwen relocate -> Wan 2.2 4-step animate)  #
         # ------------------------------------------------------------------ #
-        with gr.Tab("🎬 Video Generator", id="vidgen-tab"):
+        with gr.Tab("🎬 Video Generator"):
             gr.Markdown(model_title())
 
             with gr.Row():
                 with gr.Column(scale=1):
                     reference_image = gr.Image(
-                        label="Reference Photo(s)",
+                        label="Reference Photo",
                         type="filepath",
                         elem_id="vidgen-reference",
                     )
-                    additional_refs = gr.File(
-                        label="Additional Reference Images (for Custom/Replace mode)",
-                        file_count="multiple",
-                        file_types=["image"],
-                        visible=False,
-                    )
                     vid_prompt = gr.Textbox(
                         label="Motion & Scene Prompt",
-                        value="",
+                        value=default_video_prompt,
                         lines=4,
                         placeholder=(
                             "Describe the motion, action, lighting and camera. "
@@ -3202,8 +2194,9 @@ with gr.Blocks(css=css) as demo:
                         value=MODE_KEEP,
                         label="Scene Handling",
                         info=(
-                            "Keep = animated untouched. Replace = new environment. "
-                            "Custom = your edit instruction. Timeline = per-segment prompts."
+                            "Keep = photo animated untouched, background and bodies "
+                            "identical. Replace = new environment, subjects preserved. "
+                            "Custom = your own edit instruction."
                         ),
                     )
                     edit_instruction = gr.Textbox(
@@ -3211,56 +2204,17 @@ with gr.Blocks(css=css) as demo:
                         value="",
                         lines=2,
                         visible=False,
-                        placeholder="e.g. remove all clothing, keep everything else identical",
-                    )
-                    edit_instruction_info = gr.Markdown(
-                        "**Custom Edit** tells Qwen how to modify the photo *before* animation. "
-                        "Example: `remove all clothing` or `add a red dress`. "
-                        "The Motion Prompt above separately tells WAN how to *animate* the result.",
-                        visible=False,
+                        placeholder="Applied verbatim to the frame before animation.",
                     )
                     
-                    # Timeline mode UI — 10 segment slots with custom durations
-                    timeline_section = gr.Column(visible=False)
-                    with timeline_section:
-                        gr.Markdown(
-                            "**Timeline:** Each segment prompt is used as both the image edit instruction AND the video motion prompt. "
-                            "Empty segments are skipped. Fill in order."
-                        )
-                        timeline_prompts = []
-                        timeline_durations = []
-                        for i in range(1, 11):
-                            with gr.Row():
-                                tb = gr.Textbox(
-                                    label=f"Seg {i}",
-                                    placeholder=f"What happens in segment {i} (leave empty to skip)",
-                                    lines=1,
-                                    scale=4,
-                                )
-                                dur = gr.Slider(
-                                    0.5, 6.0, value=3.5, step=0.5,
-                                    label="Sec",
-                                    scale=1,
-                                )
-                            timeline_prompts.append(tb)
-                            timeline_durations.append(dur)
-                        timeline_generate_btn = gr.Button("🎬 Generate Timeline Video", variant="primary", size="lg")
-                    
-                    # Show/hide sections based on scene_mode
-                    def _update_scene_visibility(mode):
-                        is_timeline = (mode == MODE_TIMELINE)
-                        return (
-                            gr.update(visible=(mode == MODE_CUSTOM)),           # edit_instruction
-                            gr.update(visible=(mode == MODE_CUSTOM)),           # edit_instruction_info
-                            gr.update(visible=(mode != MODE_KEEP and not is_timeline)),  # additional_refs
-                            gr.update(visible=is_timeline),                     # timeline_section
-                            gr.update(visible=not is_timeline),                 # vid_prompt
-                            gr.update(visible=not is_timeline),                 # vid_negative_prompt
-                            gr.update(visible=not is_timeline),                 # duration_row
-                        )
+                    # Show/hide edit_instruction based on scene_mode
+                    scene_mode.change(
+                        fn=lambda mode: gr.update(visible=(mode == MODE_CUSTOM)),
+                        inputs=[scene_mode],
+                        outputs=[edit_instruction],
+                    )
 
-                    duration_row = gr.Row()
-                    with duration_row:
+                    with gr.Row():
                         duration_seconds = gr.Slider(
                             MIN_DURATION, MAX_DURATION, value=3.5, step=0.5,
                             label="Duration (seconds)",
@@ -3279,13 +2233,6 @@ with gr.Blocks(css=css) as demo:
                                 interactive=False,
                             )
                     
-                    # Connect scene_mode change AFTER duration_row is defined
-                    scene_mode.change(
-                        fn=_update_scene_visibility,
-                        inputs=[scene_mode],
-                        outputs=[edit_instruction, edit_instruction_info, additional_refs, timeline_section, vid_prompt, vid_negative_prompt, duration_row],
-                    )
-                    
                     # Enable/disable flow_shift slider based on auto checkbox
                     def update_flow_shift_interactivity(auto_enabled):
                         if auto_enabled:
@@ -3302,7 +2249,7 @@ with gr.Blocks(css=css) as demo:
                     with gr.Row():
                         add_audio_cb = gr.Checkbox(label="Add Audio (MMAudio)", value=False)
                         audio_prompt_tb = gr.Textbox(
-                            label="Audio Prompt", value="natural ambient sound",
+                            label="Audio Prompt", value="realistic female vocalizations and breathing that match the woman's physical characteristics visible in the video, natural voice pitch and tone corresponding to her body size and appearance, intimate sounds, soft ambient atmosphere",
                         )
 
                 with gr.Column(scale=1):
@@ -3312,12 +2259,18 @@ with gr.Blocks(css=css) as demo:
                         autoplay=True,
                         interactive=False,
                     )
+                    
+                    # Generate button directly under video output
                     generate_btn = gr.Button(
                         "🎬 Generate Video", variant="primary", size="lg"
                     )
-                    vid_clear_storage_btn = gr.Button(
-                        "🗑 Clear Storage", variant="secondary", size="sm"
+                    
+                    # Clear storage button directly under generate button
+                    clear_storage_btn_vid = gr.Button(
+                        "🗑️ Clear Storage", variant="secondary", size="lg",
+                        elem_id="clear-storage-btn-vid"
                     )
+                    
                     with gr.Row():
                         frame_time_input = gr.Number(
                             label="Frame time (seconds) — auto-updates as video plays",
@@ -3392,6 +2345,8 @@ with gr.Blocks(css=css) as demo:
                     )
             # Hidden file component — populated by generate_btn and used for frame extraction
             video_file = gr.File(visible=False)
+            # Download Frame output — gr.File shows a clickable download link when populated
+            download_file_output = gr.File(label="⬇ Click to Download Frame", visible=True)
 
             with gr.Accordion("Advanced Settings", open=False):
                 with gr.Row():
@@ -3411,7 +2366,7 @@ with gr.Blocks(css=css) as demo:
                     )
                 with gr.Row():
                     edit_steps = gr.Slider(
-                        1, 20, value=4, step=1,
+                        1, 20, value=3, step=1,
                         label="Frame-Edit Steps (Qwen stage)",
                     )
                     edit_guidance = gr.Slider(
@@ -3435,133 +2390,55 @@ with gr.Blocks(css=css) as demo:
             vid_preset_dropdown8.change(fn=update_vid_prompt8, inputs=[vid_preset_dropdown8], outputs=[vid_prompt], scroll_to_output=False)
 
             def _noop_download(f):
+                """Pass-through function for download chain."""
                 return f
 
             generate_btn.click(
                 fn=generate_video,
                 inputs=[
                     reference_image, vid_prompt, scene_mode, edit_instruction,
-                    additional_refs, end_image, duration_seconds, resolution, frame_multiplier,
+                    end_image, duration_seconds, resolution, frame_multiplier,
                     export_quality, seed, randomize_seed, add_audio_cb,
                     audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                     flow_shift_auto, flow_shift,
                 ],
                 outputs=[video_output, video_file],
                 concurrency_id=WAN_QUEUE_ID,
-                concurrency_limit=10,
+                concurrency_limit=10,  # Allow multiple in queue, processed sequentially
             ).then(
                 fn=_noop_download,
                 inputs=[video_file],
                 outputs=[video_file],
-                js="""(file) => {
-                    if (file) {
-                        const url = file.url || (typeof file === 'string' ? file : (file.path || file.name || ''));
-                        if (url) {
-                            const a = document.createElement('a');
-                            a.href = file.url ? file.url : '/file=' + url;
-                            a.download = file.orig_name || 'vidgen.mp4';
-                            document.body.appendChild(a);
-                            a.click();
-                            document.body.removeChild(a);
-                        }
-                    }
-                    setTimeout(() => {
-                        const clearBtn = document.querySelector('#clear-storage-btn button, button#clear-storage-btn');
-                        if (clearBtn) {
-                            clearBtn.click();
-                        } else {
-                            const allBtns = document.querySelectorAll('button');
-                            for (const btn of allBtns) {
-                                if (btn.textContent.includes('Clear Storage')) { btn.click(); break; }
-                            }
-                        }
-                    }, 1500);
-                    return [file];
-                }""",
-            )
-
-            vid_clear_storage_btn.click(
+                js="""
+                (videoFile) => {
+                    if (!videoFile || !videoFile.url) return videoFile;
+                    
+                    // Download the video
+                    const a = document.createElement('a');
+                    a.href = videoFile.url;
+                    a.download = videoFile.url.split('/').pop();
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    
+                    return videoFile;
+                }
+                """
+            ).then(
+                fn=lambda: __import__('time').sleep(2),  # Wait 2 seconds for download to start
+                inputs=[],
+                outputs=[],
+            ).then(
                 fn=clear_storage,
                 inputs=[],
                 outputs=[clear_storage_status],
             )
 
-            # Timeline generate handler
-            def _timeline_generate(
-                ref_image,
-                p1, p2, p3, p4, p5, p6, p7, p8, p9, p10,
-                d1, d2, d3, d4, d5, d6, d7, d8, d9, d10,
-                resolution_val, frame_mult, exp_quality,
-                seed_val, rand_seed, audio_cb, audio_prompt,
-                neg_prompt, e_steps, e_guidance,
-                fs_auto, fs_val, add_refs,
-                progress=gr.Progress(track_tqdm=True),
-            ):
-                """Collect filled segments and generate timeline video."""
-                all_prompts = [p1, p2, p3, p4, p5, p6, p7, p8, p9, p10]
-                all_durations = [d1, d2, d3, d4, d5, d6, d7, d8, d9, d10]
-                segments = []
-                for i in range(10):
-                    p = (all_prompts[i] or "").strip()
-                    if p:
-                        d = float(all_durations[i]) if all_durations[i] else 3.5
-                        d = max(0.5, min(6.0, d))
-                        segments.append({"prompt": p, "duration": d})
-                if not segments:
-                    raise gr.Error("Please enter at least one segment prompt.")
-                prompts_json = json.dumps([s["prompt"] for s in segments])
-                durations_json = json.dumps([s["duration"] for s in segments])
-                return _generate_timeline_with_durations(
-                    ref_image, prompts_json, durations_json, None,
-                    resolution_val, frame_mult, exp_quality,
-                    seed_val, rand_seed, audio_cb, audio_prompt,
-                    neg_prompt, e_steps, e_guidance,
-                    fs_auto, fs_val, add_refs,
-                )
-
-            timeline_generate_btn.click(
-                fn=_timeline_generate,
-                inputs=[
-                    reference_image,
-                    *timeline_prompts,
-                    *timeline_durations,
-                    resolution, frame_multiplier, export_quality,
-                    seed, randomize_seed, add_audio_cb, audio_prompt_tb,
-                    vid_negative_prompt, edit_steps, edit_guidance,
-                    flow_shift_auto, flow_shift, additional_refs,
-                ],
-                outputs=[video_output, video_file],
-                concurrency_id=WAN_QUEUE_ID,
-                concurrency_limit=10,
-            ).then(
-                fn=_noop_download,
-                inputs=[video_file],
-                outputs=[video_file],
-                js="""(file) => {
-                    if (file) {
-                        const url = file.url || (typeof file === 'string' ? file : (file.path || file.name || ''));
-                        if (url) {
-                            const a = document.createElement('a');
-                            a.href = file.url ? file.url : '/file=' + url;
-                            a.download = file.orig_name || 'vidgen_timeline.mp4';
-                            document.body.appendChild(a);
-                            a.click();
-                            document.body.removeChild(a);
-                        }
-                    }
-                    setTimeout(() => {
-                        const clearBtn = document.querySelector('#clear-storage-btn button, button#clear-storage-btn');
-                        if (clearBtn) {
-                            clearBtn.click();
-                        } else {
-                            const allBtns = document.querySelectorAll('button');
-                            for (const btn of allBtns) {
-                                if (btn.textContent.includes('Clear Storage')) { btn.click(); break; }
-                            }
-                        }
-                    }, 1500);
-                    return [file];
-                }""",
+            # Clear storage button in vidgen tab - same function as top right
+            clear_storage_btn_vid.click(
+                fn=clear_storage,
+                inputs=[],
+                outputs=[clear_storage_status],
             )
 
             # Frame extraction functions
@@ -3592,84 +2469,24 @@ with gr.Blocks(css=css) as demo:
                 outputs=[reference_image],
             )
 
-            # Download Frame — extracts frame then triggers browser download via JS
-            download_frame_output = gr.File(visible=False, elem_id="download-frame-file")
-            
+            # Download Frame — reads timestamp from number box, puts frame into gr.File for download
             download_frame_btn.click(
                 fn=get_frame_as_file,
                 inputs=[video_file, frame_time_input],
-                outputs=[download_frame_output],
-            ).then(
-                fn=None,
-                inputs=[download_frame_output],
-                outputs=[],
-                js="""(file) => {
-                    if (file && file.url) {
-                        const a = document.createElement('a');
-                        a.href = file.url;
-                        a.download = file.orig_name || 'frame.jpg';
-                        document.body.appendChild(a);
-                        a.click();
-                        document.body.removeChild(a);
-                    } else if (file) {
-                        // Try Gradio file path format
-                        const url = typeof file === 'string' ? file : file.path || file.name || file;
-                        const a = document.createElement('a');
-                        a.href = '/file=' + url;
-                        a.download = 'frame.jpg';
-                        document.body.appendChild(a);
-                        a.click();
-                        document.body.removeChild(a);
-                    }
-                }""",
+                outputs=[download_file_output],
             )
 
         # ------------------------------------------------------------------ #
         #  TAB 2 — PHOTO EDITOR (picgen)                                      #
         # ------------------------------------------------------------------ #
-        with gr.Tab("🖼️ Photo Editor", id="picgen-tab"):
+        with gr.Tab("🖼️ Photo Editor"):
             with gr.Column(elem_id="col-container"):
 
-                # Starter image thumbnails — loaded dynamically on each page load
-                # so images added after app startup appear without a restart.
-                def _get_starter_thumbnails_html():
-                    """
-                    Build thumbnail HTML once at page construction. Images are embedded
-                    as base64 data URIs (reliable — no /file= path/whitelisting issues,
-                    no endpoint round-trip). Thumbnails are clickable — clicking one
-                    fires the corresponding numbered button underneath it.
-                    """
-                    starters_dir = os.path.join(SCRIPT_DIR, "starters")
-                    html_parts = []
-                    found_any = False
-                    for i in range(1, 11):
-                        data_url = add_starter_image(i)
-                        if data_url:
-                            html_parts.append(
-                                f'<div style="flex:1;text-align:center;min-width:0;cursor:pointer;" '
-                                f'title="Starter {i}" '
-                                f'onclick="(function(){{var btns=document.querySelectorAll(\'#starter-btn-row button\');if(btns[{i-1}])btns[{i-1}].click();}})()">'
-                                f'<img src="{data_url}" style="width:100%;aspect-ratio:1;object-fit:cover;'
-                                f'border:1px solid var(--border-color-primary);border-radius:4px;'
-                                f'background:var(--background-fill-secondary);" />'
-                                f'</div>'
-                            )
-                            found_any = True
-                        else:
-                            html_parts.append(
-                                f'<div style="flex:1;min-width:0;text-align:center;'
-                                f'font-size:10px;color:var(--body-text-color-subdued);">{i}</div>'
-                            )
-                    if not found_any:
-                        return (f'<div style="color:var(--body-text-color-subdued);font-size:12px;padding:4px 0;">'
-                                f'No starter images found in {starters_dir}</div>')
-                    return '<div style="display:flex;gap:4px;padding:4px 0;">' + "".join(html_parts) + "</div>"
-
-                starter_thumbnails_html = gr.HTML(_get_starter_thumbnails_html())
-
-                # Real clickable buttons — aligned under each thumbnail
-                with gr.Row(elem_id="starter-btn-row"):
-                    starter_btns = [gr.Button(str(i), size="sm", min_width=30) for i in range(1, 11)]
+                with gr.Row():
+                    start1_btn = gr.Button("Start 1", size="sm")
+                    start2_btn = gr.Button("Start 2", size="sm")
+                    start3_btn = gr.Button("Start 3", size="sm")
+                    start4_btn = gr.Button("Start 4", size="sm")
 
                 with gr.Row():
                     # Left column: input uploader + controls
@@ -3724,7 +2541,6 @@ with gr.Blocks(css=css) as demo:
                             columns=2,
                         )
                         use_output_btn = gr.Button("↗️ Use as input", variant="secondary", size="sm")
-                        use_as_next_seg_btn = gr.Button("📎 Use As Next Segment", variant="secondary", size="sm")
 
                         # Row 1: 4 dropdowns
                         with gr.Row():
@@ -3857,9 +2673,10 @@ with gr.Blocks(css=css) as demo:
 
                 starter_b64_output = gr.Textbox(value="", visible=False, elem_id="starter-b64-output")
 
-                # Each hidden button directly calls add_starter_image (like working backup)
-                for i, btn in enumerate(starter_btns, start=1):
-                    btn.click(fn=lambda num=i: add_starter_image(num), inputs=[], outputs=[starter_b64_output])
+                start1_btn.click(fn=lambda: add_starter_image(1), inputs=[], outputs=[starter_b64_output])
+                start2_btn.click(fn=lambda: add_starter_image(2), inputs=[], outputs=[starter_b64_output])
+                start3_btn.click(fn=lambda: add_starter_image(3), inputs=[], outputs=[starter_b64_output])
+                start4_btn.click(fn=lambda: add_starter_image(4), inputs=[], outputs=[starter_b64_output])
 
                 starter_b64_output.change(
                     fn=None, inputs=[starter_b64_output], outputs=None,
@@ -3892,265 +2709,6 @@ with gr.Blocks(css=css) as demo:
                             if (!document.getElementById('keyboard-style')) document.head.appendChild(style);
                         }, 100);
                     }""",
-                )
-
-            # ==================================================================
-            # PROGRESSION MODE — Timeline at bottom of picgen tab
-            # ==================================================================
-            with gr.Accordion("🎬 Progression Mode (Video Timeline)", open=False):
-                gr.Markdown(
-                    "Build a video timeline by adding images and prompts for each segment. "
-                    "Use the editor above to generate images, then click **📎 Use As Next Segment** to add them here. "
-                    "Each segment animates from its image to the next segment's image using the prompt as motion."
-                )
-                
-                # 10 segment slots — each with image, prompt, duration, and move buttons
-                prog_images = []
-                prog_prompts = []
-                prog_durations = []
-                prog_up_btns = []
-                prog_down_btns = []
-                
-                for i in range(1, 11):
-                    with gr.Row():
-                        with gr.Column(scale=0, min_width=50):
-                            up_btn = gr.Button("↑", size="sm", min_width=30)
-                            down_btn = gr.Button("↓", size="sm", min_width=30)
-                        img = gr.Image(
-                            label=f"Seg {i}",
-                            type="filepath",
-                            scale=1,
-                            height=100,
-                        )
-                        prompt = gr.Textbox(
-                            label=f"Motion/Action",
-                            placeholder=f"What happens in segment {i}",
-                            lines=2,
-                            scale=2,
-                        )
-                        dur = gr.Slider(
-                            0.5, 6.0, value=3.5, step=0.5,
-                            label="Sec",
-                            scale=0,
-                            min_width=80,
-                        )
-                    prog_images.append(img)
-                    prog_prompts.append(prompt)
-                    prog_durations.append(dur)
-                    prog_up_btns.append(up_btn)
-                    prog_down_btns.append(down_btn)
-                
-                prog_generate_btn = gr.Button("🎬 Generate Progression Video", variant="primary", size="lg")
-                
-                # --- Reorder handlers (swap segments up/down) ---
-                def _swap_segments(idx_to_move, direction, *all_values):
-                    """Swap two adjacent segments. Returns all values reordered."""
-                    # all_values = 10 images + 10 prompts + 10 durations = 30 values
-                    images = list(all_values[:10])
-                    prompts = list(all_values[10:20])
-                    durations = list(all_values[20:30])
-                    
-                    idx = int(idx_to_move)
-                    target = idx + (-1 if direction == "up" else 1)
-                    
-                    if 0 <= target <= 9:
-                        images[idx], images[target] = images[target], images[idx]
-                        prompts[idx], prompts[target] = prompts[target], prompts[idx]
-                        durations[idx], durations[target] = durations[target], durations[idx]
-                    
-                    return images + prompts + durations
-                
-                all_prog_components = prog_images + prog_prompts + prog_durations
-                
-                for i in range(10):
-                    prog_up_btns[i].click(
-                        fn=lambda *vals, idx=i: _swap_segments(idx, "up", *vals),
-                        inputs=all_prog_components,
-                        outputs=all_prog_components,
-                    )
-                    prog_down_btns[i].click(
-                        fn=lambda *vals, idx=i: _swap_segments(idx, "down", *vals),
-                        inputs=all_prog_components,
-                        outputs=all_prog_components,
-                    )
-                
-                # --- "Use As Next Segment" handler ---
-                def _add_to_next_segment(gallery_images, *current_images):
-                    """Add the first result image to the next empty segment slot."""
-                    if not gallery_images:
-                        raise gr.Error("No images in result gallery.")
-                    
-                    # Get the first image from gallery
-                    first_item = gallery_images[0]
-                    if isinstance(first_item, (list, tuple)):
-                        img_path = first_item[0]
-                    elif isinstance(first_item, dict):
-                        img_path = first_item.get("name") or first_item.get("path")
-                    else:
-                        img_path = first_item
-                    
-                    # Find next empty slot
-                    images_list = list(current_images)
-                    for idx in range(10):
-                        if not images_list[idx]:
-                            images_list[idx] = img_path
-                            print(f"📎 Added image to segment {idx + 1}")
-                            return images_list
-                    
-                    raise gr.Error("All 10 segment slots are full.")
-                
-                use_as_next_seg_btn.click(
-                    fn=_add_to_next_segment,
-                    inputs=[pic_result] + prog_images,
-                    outputs=prog_images,
-                )
-                
-                # --- Generate Progression Video handler ---
-                def _generate_progression(
-                    *all_inputs,
-                    progress=gr.Progress(track_tqdm=True),
-                ):
-                    """
-                    Generate video from progression timeline.
-                    Each segment animates from its image to the next segment's image.
-                    """
-                    # Parse inputs: 10 images + 10 prompts + 10 durations + settings
-                    images = list(all_inputs[:10])
-                    prompts = list(all_inputs[10:20])
-                    durations = list(all_inputs[20:30])
-                    resolution_val, frame_mult, exp_quality = all_inputs[30], all_inputs[31], all_inputs[32]
-                    seed_val, rand_seed = all_inputs[33], all_inputs[34]
-                    audio_cb, audio_prompt = all_inputs[35], all_inputs[36]
-                    neg_prompt = all_inputs[37]
-                    fs_auto, fs_val = all_inputs[38], all_inputs[39]
-                    
-                    # Collect segments that have both an image and a prompt
-                    segments = []
-                    for i in range(10):
-                        img = images[i]
-                        prompt = (prompts[i] or "").strip()
-                        if img and prompt:
-                            dur = float(durations[i]) if durations[i] else 3.5
-                            dur = max(0.5, min(6.0, dur))
-                            segments.append({"image": img, "prompt": prompt, "duration": dur})
-                    
-                    if len(segments) < 1:
-                        raise gr.Error("Need at least 1 segment with both an image and a prompt.")
-                    
-                    # Build the video: animate from each segment's image to the next
-                    if not neg_prompt or not str(neg_prompt).strip():
-                        neg_prompt = default_negative_prompt
-                    
-                    total_duration = sum(s["duration"] for s in segments)
-                    
-                    # Flow shift
-                    if fs_auto:
-                        if total_duration <= 6.0: flow_shift = 6.9
-                        elif total_duration <= 10.0: flow_shift = 5.5
-                        elif total_duration <= 20.0: flow_shift = 4.5
-                        else: flow_shift = 4.0
-                    else:
-                        flow_shift = float(fs_val) if fs_val else WAN_FLOW_SHIFT
-                    
-                    current_seed = random.randint(0, MAX_SEED) if rand_seed else int(seed_val)
-                    started = time.time()
-                    segment_paths = []
-                    
-                    print(f"🎬 Progression: {len(segments)} segments, {total_duration:.1f}s total")
-                    
-                    try:
-                        for seg_idx in range(len(segments)):
-                            seg = segments[seg_idx]
-                            seg_num = seg_idx + 1
-                            
-                            # Load and resize the start frame
-                            start_img = _ensure_pil(seg["image"])
-                            if start_img is None:
-                                raise gr.Error(f"Segment {seg_num}: could not load image.")
-                            start_frame = resize_image_for_wan(start_img, resolution_val)
-                            
-                            # End frame = next segment's image (if exists)
-                            end_frame = None
-                            if seg_idx + 1 < len(segments):
-                                end_img = _ensure_pil(segments[seg_idx + 1]["image"])
-                                if end_img:
-                                    end_frame = resize_and_crop_to_match(end_img, start_frame)
-                            
-                            # Animate
-                            num_frames = get_num_frames(seg["duration"])
-                            seg_seed = current_seed + seg_idx * 100
-                            
-                            print(f"  🎬 Seg {seg_num} ({seg['duration']}s): {seg['prompt'][:50]}...")
-                            
-                            raw_frames = animate_frame(
-                                start_frame, end_frame, seg["prompt"], neg_prompt,
-                                num_frames, seg_seed, flow_shift,
-                            )
-                            
-                            # RIFE
-                            factor = max(1, int(frame_mult) // FIXED_FPS)
-                            if factor > 1:
-                                seg_frames = interpolate_bits(raw_frames, multiplier=factor)
-                            else:
-                                seg_frames = list(raw_frames)
-                            seg_fps = FIXED_FPS * factor
-                            
-                            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-                                seg_path = f.name
-                            export_to_video(seg_frames, seg_path, fps=seg_fps, quality=int(exp_quality))
-                            segment_paths.append(seg_path)
-                            print(f"  ✅ Seg {seg_num} done")
-                        
-                        # Stitch
-                        if len(segment_paths) > 1:
-                            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-                                final_path = f.name
-                            concatenate_videos(segment_paths, final_path)
-                            for p in segment_paths:
-                                try: os.unlink(p)
-                                except OSError: pass
-                        else:
-                            final_path = segment_paths[0]
-                        
-                        # Audio
-                        if audio_cb and _MMAUDIO_AVAILABLE:
-                            try:
-                                final_path = add_audio_to_video(final_path, audio_prompt, total_duration)
-                            except Exception as e:
-                                print(f"MMAudio error: {e}")
-                        
-                        # Rename
-                        named_path = unique_output_path("vidgen_progression", ".mp4")
-                        try:
-                            shutil.move(final_path, named_path)
-                            final_path = str(named_path)
-                        except Exception:
-                            pass
-                        
-                        print(f"🎬 Progression done in {time.time() - started:.1f}s — {len(segments)} segments")
-                        return final_path
-                    
-                    except gr.Error:
-                        raise
-                    except Exception as e:
-                        for p in segment_paths:
-                            try: os.unlink(p)
-                            except OSError: pass
-                        raise gr.Error(f"Progression generation failed: {e}")
-                
-                # Video output for progression mode
-                prog_video_output = gr.Video(label="Progression Video", interactive=False)
-                
-                prog_generate_btn.click(
-                    fn=_generate_progression,
-                    inputs=all_prog_components + [
-                        resolution, frame_multiplier, export_quality,
-                        seed, randomize_seed, add_audio_cb, audio_prompt_tb,
-                        vid_negative_prompt, flow_shift_auto, flow_shift,
-                    ],
-                    outputs=[prog_video_output],
-                    concurrency_id=WAN_QUEUE_ID,
-                    concurrency_limit=10,
                 )
 
     demo.load(fn=None, js=gallery_js)
@@ -4188,59 +2746,14 @@ with gr.Blocks(css=css) as demo:
 if __name__ == "__main__":
     os.makedirs(os.path.join(SCRIPT_DIR, "tmp"), exist_ok=True)
 
-    # ===== STARTUP DIAGNOSTICS BANNER =====
-    mode_names = {
-        "concurrent": "Dual-GPU Concurrent Mode (Both Models GPU-Resident, no swapping)",
-        "single": f"Swap Mode ({_gpu_count}-GPU — active model streamed to GPU, idle model parked on CPU)",
-    }
-    print("\n" + "=" * 80)
-    print("                    AI ENGINE INITIALIZATION & DIAGNOSTICS")
-    print("=" * 80)
-    gpu_summary = ", ".join([f"{g['name']} ({g['vram_mb']}MB)" for g in _gpu_info])
-    print(f"GPUs: {_gpu_count}x — {gpu_summary}")
-    print(f"Total VRAM: {_total_vram_mb // 1024} GB")
-    print(f"Operational Mode: {mode_names.get(GPU_MODE, GPU_MODE)}")
-    opt_status = []
-    opt_status.append(f"SageAttention ({'Enabled' if _SAGE_ATTENTION_AVAILABLE else 'Not Installed'})")
-    opt_status.append(f"TeaCache ({'Enabled' if _TEACACHE_ENABLED else 'Available'})")
-    opt_status.append(f"torch.compile ({'Available' if _TORCH_COMPILE_AVAILABLE else 'Unavailable'})")
-    print(f"Optimizations: {' | '.join(opt_status)}")
-    print("-" * 80)
-    print("              ESTIMATED GENERATION TIMES (CURRENT SETUP)")
-    print("-" * 80)
-    # Rough estimates based on hardware AND mode — concurrent mode (>=2 GPUs,
-    # both models pinned, no swap penalty) is meaningfully faster than swap
-    # mode (one model streamed layer-by-layer via CPU offload at a time).
-    if GPU_MODE == "concurrent":
-        if _total_vram_mb >= 180000:  # 2x 95GB Blackwell
-            print("  * Photo Editor (1 Image @ 4 Steps)       : ~3 - 5 seconds")
-            print("  * Video Generator (3.5s Clip @ 16 FPS)   : ~8 - 15 seconds")
-        else:  # 2 smaller GPUs, each model still fully pinned to its own card
-            print("  * Photo Editor (1 Image @ 4 Steps)       : ~5 - 8 seconds")
-            print("  * Video Generator (3.5s Clip @ 16 FPS)   : ~15 - 25 seconds")
-    else:  # single — swap mode, one model active at a time via sequential offload
-        if _total_vram_mb >= 80000:  # 1x 95GB Blackwell — plenty of headroom, still layer-streamed
-            print("  * Photo Editor (1 Image @ 4 Steps)       : ~8 - 14 seconds")
-            print("  * Video Generator (3.5s Clip @ 16 FPS)   : ~20 - 35 seconds")
-            print("    (Only the active tab's model is on GPU — the other is parked on CPU)")
-        elif _total_vram_mb >= 40000:  # 2x 24GB
-            print("  * Photo Editor (1 Image @ 4 Steps)       : ~8 - 12 seconds")
-            print("  * Video Generator (3.5s Clip @ 16 FPS)   : ~30 - 50 seconds")
-        else:  # single 24GB or less
-            print("  * Photo Editor (1 Image @ 4 Steps)       : ~10 - 15 seconds")
-            print("  * Video Generator (3.5s Clip @ 16 FPS)   : ~45 - 80 seconds")
-    print("=" * 80 + "\n")
-
     if DUAL_GPU:
-        print(f"🚀 GRADIO LAUNCHING — DUAL-GPU CONCURRENT. Both tabs GPU-resident, no swapping.")
-        # Each model queue allows 1 concurrent job (GPU is serialized per model).
-        # Both queues run independently — Picgen and Vidgen do not block each other.
-        demo.queue(default_concurrency_limit=1)
+        print(f"🚀 GRADIO LAUNCHING — Wan on {WAN_DEVICE}, Qwen on {PIC_DEVICE}. Both tabs ready.")
+        demo.queue(default_concurrency_limit=10)
         demo.launch(
             server_name="0.0.0.0",
             server_port=7860,
             share=False,
-            allowed_paths=[SCRIPT_DIR, str(OUTPUT_DIR), os.path.join(SCRIPT_DIR, "starters")],
+            allowed_paths=[SCRIPT_DIR, str(OUTPUT_DIR)],
         )
     else:
         if STARTUP_MODE == "vidgen":
@@ -4248,11 +2761,73 @@ if __name__ == "__main__":
         else:
             print("🚀 GRADIO LAUNCHING — Qwen on GPU, picgen ready immediately.")
         demo.queue(default_concurrency_limit=1)
-
-        # Launch Gradio (blocks forever — background threads already started above)
         demo.launch(
             server_name="0.0.0.0",
             server_port=7860,
             share=False,
-            allowed_paths=[SCRIPT_DIR, str(OUTPUT_DIR), os.path.join(SCRIPT_DIR, "starters")],
+            allowed_paths=[SCRIPT_DIR, str(OUTPUT_DIR)],
         )
+
+        # Background: load the secondary model to CPU after Gradio is up
+        def _bg_load():
+            try:
+                time.sleep(2.0)
+                if STARTUP_MODE == "vidgen":
+                    print("📦 Background: Loading Qwen to CPU...")
+                    global pic_pipe
+                    start = time.time()
+                    model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
+                    if not os.path.exists(model_index_path):
+                        os.makedirs(PICGEN_MODELS_DIR, exist_ok=True)
+                        pipe = QwenImageEditPlusPipeline.from_pretrained(
+                            "Qwen/Qwen-Image-Edit-2511",
+                            torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
+                            cache_dir=BASE_MODEL_LOCAL_PATH, use_safetensors=True
+                        )
+                    else:
+                        pipe = QwenImageEditPlusPipeline.from_pretrained(
+                            BASE_MODEL_LOCAL_PATH,
+                            torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
+                            local_files_only=True, use_safetensors=True
+                        )
+                    v23 = NSFW_WEIGHTS_LOCAL_PATH
+                    if not os.path.exists(v23):
+                        v23 = hf_hub_download(
+                            repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
+                            filename="v23/Qwen-Rapid-AIO-NSFW-v23.safetensors",
+                            cache_dir=PICGEN_MODELS_DIR,
+                            local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
+                        )
+                    sd = load_file(v23)
+                    tw, vw, ew = {}, {}, {}
+                    for k, v in sd.items():
+                        if k.startswith("model.diffusion_model."):   tw[k.replace("model.diffusion_model.", "")] = v
+                        elif k.startswith("transformer."):           tw[k.replace("transformer.", "")] = v
+                        elif k.startswith("first_stage_model."):     vw[k.replace("first_stage_model.", "")] = v
+                        elif k.startswith("vae."):                   vw[k.replace("vae.", "")] = v
+                        elif "text_encoder" in k or "conditioner" in k:
+                            if "conditioner.embedders.0." in k:      ew[k.replace("conditioner.embedders.0.", "")] = v
+                            elif "text_encoder." in k:               ew[k.replace("text_encoder.", "")] = v
+                    if tw: pipe.transformer.load_state_dict(tw, strict=False)
+                    if vw: pipe.vae.load_state_dict(vw, strict=False)
+                    if ew: pipe.text_encoder.load_state_dict(ew, strict=False)
+                    del sd, tw, vw, ew
+                    torch.cuda.empty_cache()
+                    pipe.vae.enable_tiling()
+                    pipe.vae.enable_slicing()
+                    pipe.transformer.to("cpu")
+                    pipe.text_encoder.to("cpu")
+                    pipe.vae.to("cpu")
+                    pic_pipe = pipe
+                    print(f"✅ Qwen on CPU in {time.time()-start:.1f}s — tab switching ready!")
+                else:
+                    print("📦 Background: Loading Wan to CPU...")
+                    _load_wan("cpu")
+                    print("✅ Wan on CPU — tab switching ready!")
+            except Exception as e:
+                print(f"❌ Background load failed: {e}")
+                import traceback; traceback.print_exc()
+
+        threading.Thread(target=_bg_load, daemon=True).start()
+
+
