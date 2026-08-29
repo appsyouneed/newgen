@@ -1,7 +1,7 @@
 {
   "ultimate_deepthroat": {
-    "display_name": "Ultimate DeepThroat",
-    "description": "Trained on 593 clips with various resolutions. Handles almost every POV. Works best at 4 steps.",
+    "display_name": "Deep Throat",
+    "description": "[wan22-ultimatedeepthroat] Trained on 593 clips with various resolutions. Handles almost every POV. Works best at 4 steps.",
     "high_url": "https://huggingface.co/sergfdgfh/wan2.2ultimatedeepthroat/resolve/main/wan22-ultimatedeepthroat-i2v-102epoc-high-k3nk.safetensors",
     "low_url": "https://huggingface.co/SRodge00/ultimatedeepthroat/resolve/main/wan22-ultimatedeepthroat-I2V-101epoc-low-k3nk.safetensors",
     "high_filename": "wan22-ultimatedeepthroat-i2v-102epoc-high-k3nk.safetensors",
@@ -40,8 +40,8 @@
     "tags": ["deepthroat", "blowjob", "motion", "nsfw"]
   },
   "ulitmate_pussy_asshole": {
-    "display_name": "Ultimate Pussy & Anus Helper",
-    "description": "Helps generating realistic female genitalia. Versatile - doesn't force poses/positions. Trained on ~140 hand-captioned 5-second clips.",
+    "display_name": "Pussy & Anus Helper",
+    "description": "[wan2.2_i2v_ulitmate_pussy_asshole] Helps generating realistic female genitalia. Versatile - doesn't force poses/positions. Trained on ~140 hand-captioned 5-second clips.",
     "high_url": "https://huggingface.co/profpeng/pussyasshelper/resolve/main/wan2.2_i2v_high_ulitmate_pussy_asshole.safetensors",
     "low_url": "https://huggingface.co/profpeng/pussyasshelper/resolve/main/wan2.2_i2v_low_ulitmate_pussy_asshole.safetensors",
     "high_filename": "wan2.2_i2v_high_ulitmate_pussy_asshole.safetensors",
@@ -97,8 +97,8 @@
     ]
   },
   "sex_smash_cut": {
-    "display_name": "Sex Smash Cut",
-    "description": "Creates scene transitions with penetration. Works best on wider aspect ratios. May produce body horror ~20% of time - regenerate if needed.",
+    "display_name": "Smash Cut",
+    "description": "[wan2.2-i2v-sex-smashcut] Creates scene transitions with penetration. Works best on wider aspect ratios. May produce body horror ~20% of time - regenerate if needed.",
     "high_url": "https://huggingface.co/xXPussyD3str0y3rXx/smashcut/resolve/main/wan2.2-i2v-high-sex-smashcut-v1.0.safetensors",
     "low_url": "https://huggingface.co/primalfearfear/smashLOW/resolve/main/wan2.2-i2v-low-sex-smashcut-v1.0.safetensors",
     "high_filename": "sex_smash_cut_high.safetensors",
@@ -136,8 +136,8 @@
     "tags": ["penetration", "transition", "scene-change", "motion", "nsfw"]
   },
   "combo_handjob_blowjob": {
-    "display_name": "Combo Handjob Blowjob",
-    "description": "Hand and mouth used simultaneously on penis. Works well at strength 1 even without general NSFW LoRA. Works even if hand not on phallus initially.",
+    "display_name": "Handjob + Blowjob",
+    "description": "[WAN-2.2-I2V-HandjobBlowjobCombo] Hand and mouth used simultaneously on penis. Works well at strength 1 even without general NSFW LoRA. Works even if hand not on phallus initially.",
     "high_url": "https://huggingface.co/primalfearfear/blowjobHIGH/resolve/main/WAN-2.2-I2V-HandjobBlowjobCombo-HIGH-v1.safetensors",
     "low_url": "https://huggingface.co/primalfearfear/blowjobLOW/resolve/main/WAN-2.2-I2V-HandjobBlowjobCombo-LOW-v1.safetensors",
     "high_filename": "combo_handjob_blowjob_high.safetensors",
@@ -179,8 +179,8 @@
     "tags": ["handjob", "blowjob", "combo", "oral", "motion", "nsfw"]
   },
   "cowgirl_reverse_cowgirl": {
-    "display_name": "Cowgirl & Reverse Cowgirl",
-    "description": "Both cowgirl and reverse cowgirl positions with penetration. Works for T2V and I2V. Supports multiple camera angles and movements. Penises may be elongated.",
+    "display_name": "Cowgirl / Reverse Cowgirl",
+    "description": "[wan22.r3v3rs3_c0wg1rl] Both cowgirl and reverse cowgirl positions with penetration. Works for T2V and I2V. Supports multiple camera angles and movements. Penises may be elongated.",
     "high_url": "https://huggingface.co/profpeng/wancowgirlbest/resolve/main/wan22.r3v3rs3_c0wg1rl-14b-High-i2v_e70.safetensors",
     "low_url": "https://huggingface.co/profpeng/wancowgirlbest/resolve/main/wan22.r3v3rs3_c0wg1rl-14b-Low-i2v_e70.safetensors",
     "high_filename": "cowgirl_reverse_cowgirl_high.safetensors",
@@ -223,7 +223,7 @@
   },
   "anal_sex": {
     "display_name": "Anal Sex",
-    "description": "Anal penetration from various positions. Trained on 63 videos at 16fps. Works for I2V, T2V version coming soon.",
+    "description": "[wan22_i2v_anal_v1] Anal penetration from various positions. Trained on 63 videos at 16fps. Works for I2V, T2V version coming soon.",
     "high_url": "https://huggingface.co/Dylann/anl-wn2-high/resolve/main/wan22_i2v_anal_v1_high_noise.safetensors",
     "low_url": "https://huggingface.co/Dylann/anlside-high/resolve/main/wan22_i2v_anal_v1_low_noise.safetensors",
     "high_filename": "anal_sex_high.safetensors",
@@ -264,8 +264,8 @@
     "tags": ["anal", "penetration", "position", "rear-entry", "nsfw"]
   },
   "pov_cowgirl": {
-    "display_name": "POV Cowgirl",
-    "description": "First-person POV cowgirl position. Works well even without general NSFW LoRA. Updated training for better hip movement. Hip motion may be less aggressive than expected.",
+    "display_name": "Cowgirl (First Person)",
+    "description": "[WAN-2.2-I2V-POV-Cowgirl] First-person POV cowgirl position. Works well even without general NSFW LoRA. Updated training for better hip movement. Hip motion may be less aggressive than expected.",
     "high_url": "https://huggingface.co/Chroma111/CivitAI-Archive-2/resolve/main/1874099/2169837/WAN-2.2-I2V-POV-Cowgirl-HIGH-v1.0-fixed.safetensors",
     "low_url": "https://huggingface.co/Sentinel7/wan/resolve/main/1874099/2169847/WAN-2.2-I2V-POV-Cowgirl-LOW-v1.0-fixed.safetensors",
     "high_filename": "pov_cowgirl_high.safetensors",
@@ -307,7 +307,7 @@
   },
   "doggy_zoom_reveal": {
     "display_name": "Doggy Zoom Reveal",
-    "description": "Camera zooms out to reveal doggy style sex. Works for T2V and I2V. Square outputs (480x480, 720x720) more consistent. Man appears during camera motion.",
+    "description": "[I2V_doggyslider] Camera zooms out to reveal doggy style sex. Works for T2V and I2V. Square outputs (480x480, 720x720) more consistent. Man appears during camera motion.",
     "high_url": "https://huggingface.co/hank87/zoomoutrevealdoggy/resolve/main/I2V_doggyslider_high.safetensors",
     "low_url": "https://huggingface.co/hank87/zoomoutrevealdoggy/resolve/main/I2V_doggyslider_low.safetensors",
     "high_filename": "doggy_zoom_reveal_high.safetensors",
@@ -348,8 +348,8 @@
     "tags": ["doggy", "zoom", "camera-movement", "reveal", "position", "nsfw"]
   },
   "pov_paizuri_titfuck": {
-    "display_name": "POV Paizuri / Titfuck",
-    "description": "POV titfucking/paizuri with detailed motion control. 50% man thrusting, 50% woman moving. Finger interlacing and breast wrapping tagged. smallBoobs tag available but minimal effect.",
+    "display_name": "Titfuck / Paizuri",
+    "description": "[WAN-2.2-I2V-POV-Titfuck-Paizuri] POV titfucking/paizuri with detailed motion control. 50% man thrusting, 50% woman moving. Finger interlacing and breast wrapping tagged.",
     "high_url": "https://huggingface.co/rahul7star/wan2.2Lora/resolve/main/WAN-2.2-I2V-POV-Titfuck-Paizuri-HIGH-v1.0.safetensors",
     "low_url": "https://huggingface.co/rahul7star/wan2.2Lora/resolve/main/WAN-2.2-I2V-POV-Titfuck-Paizuri-LOW-v1.0.safetensors",
     "high_filename": "pov_paizuri_titfuck_high.safetensors",
@@ -390,8 +390,8 @@
     "tags": ["paizuri", "titfuck", "pov", "breast", "titjob", "nsfw"]
   },
   "sex_from_behind_front_facing": {
-    "display_name": "Sex From Behind (Front Facing)",
-    "description": "Front-facing camera showing intimate moments from behind. Ideal for doggystyle, plow, prone, or ¾ front positions. Focuses on facial expressions and dynamic movement. v2.1 corrects over-training.",
+    "display_name": "Sex From Behind",
+    "description": "[sfbehind_v2.1] Front-facing camera showing intimate moments from behind. Ideal for doggystyle, plow, prone, or ¾ front positions. Focuses on facial expressions and dynamic movement. v2.1 corrects over-training.",
     "high_url": "https://huggingface.co/profpeng/sexfrombehind/resolve/main/sfbehind_v2.1_high_noise.safetensors",
     "low_url": "https://huggingface.co/fiojanea/Esan_testi/resolve/main/sfbehind_v2.1_low_noise.safetensors",
     "high_filename": "sex_from_behind_front_facing_high.safetensors",
@@ -432,8 +432,8 @@
     "tags": ["from-behind", "front-facing", "doggystyle", "facial-expression", "dynamic", "nsfw"]
   },
   "perfect_fingering": {
-    "display_name": "Perfect Fingering",
-    "description": "Fingering motion LoRA with realistic in/out finger movement. Creator's first LoRA. Works well at 0.7-1.0 weight. Slight chance for squirting with prompts. Focuses on natural finger sliding motion.",
+    "display_name": "Fingering",
+    "description": "[Sensual_fingering_v1] Fingering motion LoRA with realistic in/out finger movement. Creator's first LoRA. Works well at 0.7-1.0 weight. Slight chance for squirting with prompts.",
     "high_url": "https://huggingface.co/3dn3lt/Wan2.2-nsfw-0.08a/resolve/main/Sensual_fingering_v1_high_noise.safetensors",
     "low_url": "https://huggingface.co/SRodge00/sensualfinger/resolve/main/Sensual_fingering_v1_low_noise(1).safetensors",
     "high_filename": "perfect_fingering_high.safetensors",
@@ -474,8 +474,8 @@
     "tags": ["fingering", "masturbation", "finger-motion", "solo", "nsfw"]
   },
   "anal_side_view": {
-    "display_name": "Anal Sex (Side View)",
-    "description": "SIDE VIEW ONLY anal penetration. Trained on deep & quick penetration. Works T2V & I2V. Challenging training - 'like herding third generation escaped house cats while blindfolded, barefoot and lit on fire.' Penis must be visible in scene.",
+    "display_name": "Anal (Side View)",
+    "description": "[Wan2.2_Anal-v1-I2V_T2V] SIDE VIEW ONLY anal penetration. Trained on deep & quick penetration. Works T2V & I2V. Penis must be visible in scene.",
     "high_url": "https://huggingface.co/profpeng/wananalsideview/resolve/main/Wan2.2_Anal-v1-HighNoise-I2V_T2V.safetensors",
     "low_url": "https://huggingface.co/SR47/Wananalside/resolve/main/Wan2.2_Anal-v1-LowNoise-I2V_T2V.safetensors",
     "high_filename": "anal_side_view_high.safetensors",
@@ -516,8 +516,8 @@
     "tags": ["anal", "side-view", "penetration", "deep", "quick", "nsfw"]
   },
   "pov_missionary": {
-    "display_name": "POV Missionary",
-    "description": "POV missionary position with leg spread. I2V handles penis starting outside vagina, even with no man in frame (though penis quality lower). v1.1 trained at higher res with more movement & bouncing breasts. Breast size controllable.",
+    "display_name": "Missionary (First Person)",
+    "description": "[wan2.2_i2v_pov_missionary] POV missionary position with leg spread. I2V handles penis starting outside vagina. v1.1 trained at higher res with more movement & bouncing breasts. Breast size controllable.",
     "high_url": "https://huggingface.co/SRodge00/missionary/resolve/main/wan2.2_i2v_highnoise_pov_missionary_v1.0.safetensors",
     "low_url": "https://huggingface.co/Fatt-Croll/CivitAI-Archive-2/resolve/main/1331682/2098396/wan2.2_i2v_pov_missionary_v1.0_lownoise.safetensors",
     "high_filename": "pov_missionary_high.safetensors",
@@ -558,8 +558,8 @@
     "tags": ["missionary", "pov", "legs-spread", "penetration", "bouncing", "nsfw"]
   },
   "missionary_multi_angle": {
-    "display_name": "Missionary (Multi-Angle)",
-    "description": "Missionary sex from multiple camera angles: side view, POV, high angle, low angle. Works T2V & I2V. Angle-specific prompting for camera control. Generic trigger + angle modifiers.",
+    "display_name": "Missionary Multi-Angle",
+    "description": "[Wan2.2-I2V-Missionary-Sex-14B] Missionary sex from multiple camera angles: side view, POV, high angle, low angle. Works T2V & I2V. Angle-specific prompting for camera control.",
     "high_url": "https://huggingface.co/3dn3lt/Wan2.2-nsfw-0.08a/resolve/main/Wan2.2%20-%20I2V%20-%20Missionary%20Sex%20-%20HIGH%2014B.safetensors",
     "low_url": "https://huggingface.co/Chroma111/CivitAI-Archive-2/resolve/main/1849369/2176200/Wan2.2%20-%20I2V%20-%20Missionary%20Sex%20-%20LOW%2014B.safetensors",
     "high_filename": "missionary_multi_angle_high.safetensors",
@@ -600,8 +600,8 @@
     "tags": ["missionary", "multi-angle", "side-view", "pov", "high-angle", "low-angle", "nsfw"]
   },
   "assertive_cowgirl": {
-    "display_name": "Assertive Cowgirl (Hip Slammin')",
-    "description": "AGGRESSIVE cowgirl with 'hip slammin' motion. Squatting position, face focus, woman slams hips down while upper body stays still. HIGH=body motion, LOW=genital close-ups only. Landscape orientation best. I2V focused.",
+    "display_name": "Assertive Cowgirl",
+    "description": "[w22_i2v_Assertive-Cowgirl] AGGRESSIVE cowgirl with hip-slamming motion. Squatting position, face focus, woman slams hips down while upper body stays still. HIGH=body motion, LOW=genital close-ups only.",
     "high_url": "https://huggingface.co/marubok/wan/resolve/main/w22_i2v_Assertive-Cowgirl_H.safetensors",
     "low_url": "https://huggingface.co/marubok/wan/resolve/main/w22_i2v_Assertive-Cowgirl_L.safetensors",
     "high_filename": "assertive_cowgirl_high.safetensors",
@@ -642,8 +642,8 @@
     "tags": ["cowgirl", "assertive", "aggressive", "hip-slam", "squatting", "face-focus", "nsfw"]
   },
   "pov_insertion": {
-    "display_name": "POV Insertion",
-    "description": "Captures the moment of INSERTION when penis not initially in frame. Handles missionary AND doggystyle. Perfect for I2V starting with no penetration. Specialized insertion animation.",
+    "display_name": "Insertion (First Person)",
+    "description": "[w22_i2v_POV-Cowgirl-Insertion] Captures the moment of INSERTION when penis not initially in frame. Handles missionary AND doggystyle. Perfect for I2V starting with no penetration.",
     "high_url": "https://huggingface.co/marubok/wan/resolve/main/w22_i2v_POV-Cowgirl-Insertion-v1-B_H.safetensors",
     "low_url": "https://huggingface.co/primalfearfear/POVCowgirlLOW/resolve/main/W22_POV_Cowgirl_Insertion_i2v_LN_v1.safetensors",
     "high_filename": "pov_insertion_high.safetensors",
@@ -685,7 +685,7 @@
   },
   "deepthroat_face_fuck": {
     "display_name": "Deepthroat & Face Fuck",
-    "description": "Advanced deepthroat/face fuck with detailed motion, gagging, saliva, struggling. v3 improved POV, mixed with cum/big cock datasets. Works with/without man in initial frame. More detailed than basic deepthroat.",
+    "description": "[Wan22_Throat_V1] Advanced deepthroat/face fuck with detailed motion, gagging, saliva, struggling. v3 improved POV, mixed with cum/big cock datasets. Works with/without man in initial frame.",
     "high_url": "https://huggingface.co/SRodge00/deepthroat2/resolve/main/Wan22_Throat_V1_high_noise.safetensors",
     "low_url": "https://huggingface.co/SRodge00/deepthroat2/resolve/main/Wan22_Throat_V1_low_noise.safetensors",
     "high_filename": "deepthroat_face_fuck_high.safetensors",
@@ -726,8 +726,8 @@
     "tags": ["deepthroat", "face-fuck", "gagging", "saliva", "blowjob", "oral", "nsfw"]
   },
   "gagging_deepthroat": {
-    "display_name": "Gagging Deepthroat (Rough)",
-    "description": "EXTREME gagging/coughing reactions during deepthroat. Woman holds penis in throat, nose smashed against hips. Trained on 756 clips (1-3sec) showing discomfort, nausea, strong gag reflex. Rough/intense focus.",
+    "display_name": "Gagging Deepthroat",
+    "description": "[wan22-G4GG1NGv6-i2v] EXTREME gagging/coughing reactions during deepthroat. Woman holds penis in throat, nose smashed against hips. Trained on 756 clips showing discomfort, nausea, strong gag reflex.",
     "high_url": "https://huggingface.co/HectorUnai/test/resolve/main/acciones/blowjob/wan22-G4GG1NGv6-11epoc-high-i2v-k3nk.safetensors",
     "low_url": "https://huggingface.co/HectorUnai/test/resolve/main/acciones/blowjob/wan22-G4GG1NGv6-11epoc-low-i2v-k3nk.safetensors",
     "high_filename": "gagging_deepthroat_high.safetensors",
