@@ -665,12 +665,11 @@ def load_loras_to_pipeline(pipe, selected_loras):
         if hasattr(pipe, 'unload_lora_weights'):
             pipe.unload_lora_weights()
     except Exception as e:
-
+        pass
     
     _active_loras = {}
     
     if not selected_loras:
-
         return
     
     # Load selected LoRAs
@@ -688,11 +687,12 @@ def load_loras_to_pipeline(pipe, selected_loras):
             if low_path and hasattr(pipe, 'transformer_2'):
                 # Note: diffusers may need specific API for dual-transformer LoRA loading
                 # This is a simplified approach - may need adjustment based on actual API
-                
+                pass
+            
             _active_loras[base_name] = lora_info
             
         except Exception as e:
-    
+            pass
 
 
 def apply_lora_prompt_modifications(base_prompt, selected_loras_info):
@@ -1203,7 +1203,6 @@ def animate_frame(
     if lora_selections:
         selected = {k: v for k, v in AVAILABLE_LORAS.items() if lora_selections.get(k, False)}
         if selected:
-
             load_loras_to_pipeline(wan_pipe, selected)
             
             # Apply trigger prompt modifications
@@ -1211,6 +1210,7 @@ def animate_frame(
                 original_prompt = prompt
                 prompt = apply_lora_prompt_modifications(prompt, selected_loras_info)
                 if prompt != original_prompt:
+                    pass
         
     else:
         # No LoRAs selected, make sure any previous LoRAs are unloaded
@@ -1437,11 +1437,13 @@ def generate_video(
             if is_enabled:
                 selected_loras_info[lora_id] = lora_info
     
-    # Apply LoRA-recommended settings (with user override support)        if selected_loras_info:
+    # Apply LoRA-recommended settings (with user override support)
+    if selected_loras_info:
         edit_steps, flow_shift, lora_settings_msg = apply_lora_settings(
             selected_loras_info, edit_steps, flow_shift, flow_shift_auto
         )
         if lora_settings_msg:
+            pass
     
     # Track the current input image path if it's a filepath (for clear_storage exclusion)
     if isinstance(reference_image, str):
@@ -2479,6 +2481,21 @@ body, .gradio-container { margin: 0 !important; padding: 0 !important; max-width
 /* Constrain reference photo and generated video to fit on screen */
 #vidgen-reference img, #vidgen-reference video { max-height: 320px !important; width: 100% !important; object-fit: contain !important; }
 #generated-video video { max-height: 320px !important; width: 100% !important; object-fit: contain !important; }
+/* LoRA cards grid - 3 per row, compact */
+.lora-grid { display: grid !important; grid-template-columns: repeat(3, 1fr) !important; gap: 10px !important; padding: 4px 0 !important; }
+.lora-card { border: 1px solid var(--border-color-primary) !important; border-radius: 8px !important; padding: 10px 12px !important; background: var(--background-fill-secondary) !important; display: flex !important; flex-direction: column !important; gap: 4px !important; }
+.lora-card-header { display: flex !important; align-items: center !important; justify-content: space-between !important; gap: 6px !important; }
+.lora-status-badges { display: flex !important; gap: 4px !important; flex-shrink: 0 !important; }
+.lora-badge { font-size: 10px !important; padding: 1px 5px !important; border-radius: 3px !important; font-weight: 600 !important; white-space: nowrap !important; }
+.lora-badge-ok { background: #22543d !important; color: #9ae6b4 !important; }
+.lora-badge-dl { background: #744210 !important; color: #fbd38d !important; }
+.lora-badge-miss { background: #742a2a !important; color: #feb2b2 !important; }
+.lora-desc { font-size: 12px !important; color: var(--body-text-color-subdued) !important; line-height: 1.4 !important; margin: 2px 0 !important; }
+.lora-notes { font-size: 11px !important; color: var(--body-text-color-subdued) !important; line-height: 1.35 !important; border-top: 1px solid var(--border-color-primary) !important; padding-top: 5px !important; margin-top: 2px !important; }
+.lora-notes summary { cursor: pointer !important; font-size: 11px !important; font-weight: 500 !important; user-select: none !important; margin-bottom: 3px !important; }
+.lora-card .gr-checkbox-label { font-size: 13px !important; font-weight: 600 !important; }
+@media (max-width: 900px) { .lora-grid { grid-template-columns: repeat(2, 1fr) !important; } }
+@media (max-width: 600px) { .lora-grid { grid-template-columns: 1fr !important; } }
 /* Make picgen prompt textareas manually resizable */
 #col-container textarea { resize: vertical !important; min-height: 60px !important; touch-action: pan-y !important; }
 """
@@ -2846,74 +2863,137 @@ with gr.Blocks(css=css) as demo:
             with gr.Accordion("LoRA Models (Optional)", open=False):
                 if AVAILABLE_LORAS:
                     gr.Markdown(
-                        "**Select LoRAs to apply:**  \n"
-                        "Enable checkboxes to use LoRAs. Download missing files with DL buttons. "
-                        "Example prompts available for configured LoRAs."
+                        "**Select LoRAs to apply.** "
+                        "Checkboxes enable/disable. Download missing files. "
+                        "Select example prompt to load it into the prompt box."
                     )
                     
-                    for lora_id, lora_info in AVAILABLE_LORAS.items():
+                    # Sort LoRAs alphabetically by display name
+                    sorted_loras = sorted(
+                        AVAILABLE_LORAS.items(),
+                        key=lambda x: x[1].get('display_name', x[0]).lower()
+                    )
+                    
+                    # Download status display (shared across all cards)
+                    lora_download_status = gr.Markdown("", visible=False)
+                    
+                    # Download handlers
+                    def download_lora_handler(lora_id):
+                        """Download missing LoRA files for a specific LoRA."""
+                        global AVAILABLE_LORAS, LORA_STATUS
+                        config = LORA_CONFIG.get(lora_id, {})
+                        results = []
+                        success_count = 0
+                        if config.get('high_url') and config.get('high_filename'):
+                            high_path = LORA_DIR / config['high_filename']
+                            if not high_path.exists():
+                                success, msg = download_lora_file(config['high_url'], config['high_filename'])
+                                results.append(f"**High:** {msg}")
+                                if success:
+                                    success_count += 1
+                            else:
+                                results.append(f"**High:** Already downloaded")
+                        if config.get('low_url') and config.get('low_filename'):
+                            low_path = LORA_DIR / config['low_filename']
+                            if not low_path.exists():
+                                success, msg = download_lora_file(config['low_url'], config['low_filename'])
+                                results.append(f"**Low:** {msg}")
+                                if success:
+                                    success_count += 1
+                            else:
+                                results.append(f"**Low:** Already downloaded")
+                        if not results:
+                            return gr.update(visible=True, value="Nothing to download")
+                        AVAILABLE_LORAS = discover_loras()
+                        LORA_STATUS = check_lora_status(LORA_CONFIG)
+                        status_msg = "\n".join(results)
+                        if success_count > 0:
+                            status_msg += f"\n\n**{success_count} file(s) downloaded.** Refresh page to enable checkbox."
+                        return gr.update(visible=True, value=status_msg)
+                    
+                    # Render cards in rows of 3
+                    card_index = 0
+                    current_row = None
+                    for lora_id, lora_info in sorted_loras:
                         status = LORA_STATUS.get(lora_id, {})
                         display_name = lora_info.get('display_name', lora_id)
+                        description = lora_info.get('description', '')
+                        notes = lora_info.get('notes', '')
+                        trigger = lora_info.get('trigger_prompt', '')
                         
-                        # Determine download status
                         high_exists = bool(lora_info['high'])
                         low_exists = bool(lora_info['low'])
                         high_downloadable = status.get('high_downloadable', False)
                         low_downloadable = status.get('low_downloadable', False)
-                        
                         needs_download = (not high_exists and high_downloadable) or (not low_exists and low_downloadable)
                         can_use = high_exists or low_exists
                         
-                        with gr.Group():
-                            with gr.Row():
-                                # Enable checkbox
-                                lora_checkboxes[lora_id] = gr.Checkbox(
-                                    label=f"{display_name}",
-                                    value=False,
-                                    interactive=can_use,
-                                    scale=3,
+                        high_status = "✓" if high_exists else ("↓" if high_downloadable else "✗")
+                        low_status = "✓" if low_exists else ("↓" if low_downloadable else "✗")
+                        high_cls = "lora-badge-ok" if high_exists else ("lora-badge-dl" if high_downloadable else "lora-badge-miss")
+                        low_cls = "lora-badge-ok" if low_exists else ("lora-badge-dl" if low_downloadable else "lora-badge-miss")
+                        
+                        # Build notes HTML - escape for HTML display
+                        notes_html = ""
+                        if notes:
+                            import html as _html
+                            notes_escaped = _html.escape(notes)
+                            notes_html = f'<details class="lora-notes"><summary>Notes</summary><span>{notes_escaped}</span></details>'
+                        
+                        trigger_html = ""
+                        if trigger:
+                            import html as _html
+                            trigger_escaped = _html.escape(trigger[:80] + ("..." if len(trigger) > 80 else ""))
+                            trigger_html = f'<div class="lora-desc" style="font-size:10px;opacity:0.7;">Trigger: <code>{trigger_escaped}</code></div>'
+                        
+                        # Open new row every 3 cards
+                        if card_index % 3 == 0:
+                            current_row = gr.Row(elem_classes="lora-grid-row")
+                            current_row.__enter__()
+                        
+                        with gr.Column(elem_classes="lora-card", min_width=200):
+                            # Status badges + description header (HTML)
+                            gr.HTML(
+                                f'<div class="lora-status-badges" style="margin-bottom:2px;">'
+                                f'<span class="lora-badge {high_cls}">H:{high_status}</span>'
+                                f'<span class="lora-badge {low_cls}">L:{low_status}</span>'
+                                f'</div>'
+                                f'<div class="lora-desc">{description}</div>'
+                                f'{trigger_html}'
+                                f'{notes_html}'
+                            )
+                            
+                            # Checkbox (enable/disable)
+                            lora_checkboxes[lora_id] = gr.Checkbox(
+                                label=display_name,
+                                value=False,
+                                interactive=can_use,
+                            )
+                            
+                            # Download button if needed
+                            if needs_download:
+                                dl_parts = []
+                                if not high_exists and high_downloadable:
+                                    dl_parts.append("High")
+                                if not low_exists and low_downloadable:
+                                    dl_parts.append("Low")
+                                lora_download_btns[lora_id] = gr.Button(
+                                    f"↓ Download {' + '.join(dl_parts)}",
+                                    size="sm",
+                                    variant="secondary",
                                 )
-                                
-                                # Download button (if needed)
-                                if needs_download:
-                                    download_label = []
-                                    if not high_exists and high_downloadable:
-                                        download_label.append("High")
-                                    if not low_exists and low_downloadable:
-                                        download_label.append("Low")
-                                    
-                                    lora_download_btns[lora_id] = gr.Button(
-                                        f"Download {' + '.join(download_label)}",
-                                        size="sm",
-                                        scale=1,
-                                    )
                             
-                            # Status and info in collapsible accordion
-                            high_status = "OK" if high_exists else ("DL" if high_downloadable else "X")
-                            low_status = "OK" if low_exists else ("DL" if low_downloadable else "X")
-                            
-                            with gr.Accordion(f"Status: High {high_status} | Low {low_status}", open=False):
-                                info_parts = []
-                                if lora_info.get('description'):
-                                    info_parts.append(f"**Description:** {lora_info['description']}")
-                                if lora_info.get('notes'):
-                                    info_parts.append(f"**Notes:** {lora_info['notes']}")
-                                
-                                if info_parts:
-                                    gr.Markdown("\n\n".join(info_parts), elem_classes="lora-info")
-                            
-                            # Example prompts dropdown (if available)
+                            # Example prompts dropdown
                             example_prompts = lora_info.get('example_prompts', [])
                             if example_prompts:
                                 prompt_choices = {ex['name']: ex['prompt'] for ex in example_prompts}
                                 lora_example_dropdowns[lora_id] = gr.Dropdown(
-                                    label=f"Example Prompts for {display_name}",
+                                    label="Example prompt",
                                     choices=list(prompt_choices.keys()),
                                     value=None,
                                     interactive=True,
                                 )
                                 
-                                # Handler to update main prompt when example selected
                                 def create_example_handler(prompts_dict):
                                     def handler(selected):
                                         if selected and selected in prompts_dict:
@@ -2926,59 +3006,11 @@ with gr.Blocks(css=css) as demo:
                                     inputs=[lora_example_dropdowns[lora_id]],
                                     outputs=[vid_prompt],
                                 )
-                    
-                    # Download status display
-                    lora_download_status = gr.Markdown("", visible=False)
-                    
-                    # Download handlers
-                    def download_lora_handler(lora_id):
-                        """Download missing LoRA files for a specific LoRA."""
-                        global AVAILABLE_LORAS, LORA_STATUS
                         
-                        config = LORA_CONFIG.get(lora_id, {})
-                        results = []
-                        success_count = 0
-                        
-                        # Download high if needed
-                        if config.get('high_url') and config.get('high_filename'):
-                            high_path = LORA_DIR / config['high_filename']
-                            if not high_path.exists():
-                                success, msg = download_lora_file(
-                                    config['high_url'],
-                                    config['high_filename']
-                                )
-                                results.append(f"**High:** {msg}")
-                                if success:
-                                    success_count += 1
-                            else:
-                                results.append(f"**High:** Already downloaded")
-                        
-                        # Download low if needed
-                        if config.get('low_url') and config.get('low_filename'):
-                            low_path = LORA_DIR / config['low_filename']
-                            if not low_path.exists():
-                                success, msg = download_lora_file(
-                                    config['low_url'],
-                                    config['low_filename']
-                                )
-                                results.append(f"**Low:** {msg}")
-                                if success:
-                                    success_count += 1
-                            else:
-                                results.append(f"**Low:** Already downloaded")
-                        
-                        if not results:
-                            return gr.update(visible=True, value="Nothing to download")
-                        
-                        # Refresh global state
-                        AVAILABLE_LORAS = discover_loras()
-                        LORA_STATUS = check_lora_status(LORA_CONFIG)
-                        
-                        status_msg = "\n".join(results)
-                        if success_count > 0:
-                            status_msg += f"\n\n**{success_count} file(s) downloaded successfully!**\n\n**Please refresh the page** to enable the checkbox."
-                        
-                        return gr.update(visible=True, value=status_msg)
+                        card_index += 1
+                        # Close row after every 3rd card or at end
+                        if card_index % 3 == 0 or card_index == len(sorted_loras):
+                            current_row.__exit__(None, None, None)
                     
                     # Attach download handlers
                     for lora_id, btn in lora_download_btns.items():
