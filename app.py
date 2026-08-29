@@ -14,6 +14,7 @@ import json
 import base64
 import hashlib
 import contextlib
+import queue as _queue
 import os
 from pathlib import Path
 from io import BytesIO
@@ -1076,7 +1077,33 @@ def get_num_frames(duration_seconds: float) -> int:
 MODE_KEEP = "Keep original scene"
 MODE_REPLACE = "Replace background / environment"
 MODE_CUSTOM = "Custom edit instruction"
-SCENE_MODES = [MODE_KEEP, MODE_REPLACE, MODE_CUSTOM]
+MODE_AUTORUN = "Autorun"
+SCENE_MODES = [MODE_KEEP, MODE_REPLACE, MODE_CUSTOM, MODE_AUTORUN]
+
+AUTORUN_DIR = Path(SCRIPT_DIR) / "autorun"
+AUTORUN_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def discover_autorun_images():
+    """
+    Return a sorted list of image paths from the autorun folder.
+    Raises gr.Error if the folder is missing or contains no supported images.
+    """
+    if not AUTORUN_DIR.exists():
+        raise gr.Error(
+            f"Autorun folder not found: {AUTORUN_DIR}  "
+            "Create an 'autorun' directory next to app.py and add images."
+        )
+    files = [
+        f for f in AUTORUN_DIR.iterdir()
+        if f.is_file() and f.suffix.lower() in AUTORUN_EXTENSIONS
+    ]
+    if not files:
+        raise gr.Error(
+            f"No supported images found in {AUTORUN_DIR}  "
+            "Add .jpg, .jpeg, .png, or .webp files and try again."
+        )
+    return sorted(files, key=lambda p: p.name.lower())
 
 RELOCATE_INSTRUCTION = (
     "Keep the people exactly as they are  identical faces, facial features, "
@@ -1144,8 +1171,8 @@ def edit_reference_frame(
     Returns the image untouched in keep-scene mode, so nothing is repainted and
     the original background and bodies survive exactly as shot.
     """
-    if mode == MODE_KEEP:
-        print("[1/2] Keep-scene mode  reference frame used as-is.")
+    if mode in (MODE_KEEP, MODE_AUTORUN):
+        print("[1/2] Keep/Autorun-scene mode  reference frame used as-is.")
         return image
 
     # Both MODE_REPLACE and MODE_CUSTOM now use the motion prompt
@@ -1615,6 +1642,97 @@ def generate_video(
                 pass
         print(f"Generation error: {e}")
         raise gr.Error(f"Generation failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# AUTORUN ORCHESTRATION
+# ---------------------------------------------------------------------------
+
+def autorun_generate(
+    prompt,
+    scene_mode,          # will be MODE_AUTORUN but we still accept it for wiring
+    end_image,           # ignored in autorun
+    duration_seconds,
+    resolution,
+    frame_multiplier,
+    export_quality,
+    seed,
+    randomize_seed,
+    add_audio_cb,
+    audio_prompt_tb,
+    vid_negative_prompt,
+    edit_steps,
+    edit_guidance,
+    flow_shift_auto,
+    flow_shift,
+    *lora_args,
+    progress=gr.Progress(track_tqdm=True),
+):
+    """
+    Autorun mode: iterate every image in AUTORUN_DIR exactly once,
+    generate one video per image using the current settings, and yield
+    a (video_path, video_path, status_text) tuple after each generation
+    so the Gradio event chain can download+cleanup between items.
+
+    End frame is intentionally ignored; each autorun image is its own start frame.
+    """
+    global _current_input_image_path
+
+    autorun_files = discover_autorun_images()   # raises gr.Error early if invalid
+    total = len(autorun_files)
+    completed = 0
+
+    for idx, img_path in enumerate(autorun_files, start=1):
+        status = f"Autorun: {idx}/{total} — processing {img_path.name}"
+        print(f"\n[Autorun] {status}")
+
+        _current_input_image_path = str(img_path)
+
+        try:
+            reference_image = Image.open(img_path).convert("RGB")
+        except Exception as e:
+            raise gr.Error(
+                f"Autorun stopped at {idx}/{total}: "
+                f"failed to open {img_path.name} — {e}"
+            )
+
+        try:
+            video_path, _, _ = generate_video(
+                reference_image,
+                prompt,
+                MODE_KEEP,        # Autorun always uses Keep (no Qwen edit)
+                None,             # end_image ignored
+                duration_seconds,
+                resolution,
+                frame_multiplier,
+                export_quality,
+                seed,
+                randomize_seed,
+                add_audio_cb,
+                audio_prompt_tb,
+                vid_negative_prompt,
+                edit_steps,
+                edit_guidance,
+                flow_shift_auto,
+                flow_shift,
+                *lora_args,
+                progress=progress,
+            )
+        except gr.Error:
+            raise
+        except Exception as e:
+            raise gr.Error(
+                f"Autorun stopped at {idx}/{total}: "
+                f"failed to process {img_path.name} — {e}"
+            )
+
+        completed += 1
+        completion_status = (
+            f"Autorun complete: {completed}/{total} videos generated"
+            if completed == total
+            else f"Autorun: {completed}/{total} done, downloading…"
+        )
+        yield video_path, video_path, completion_status
 
 
 # ---------------------------------------------------------------------------
@@ -2481,6 +2599,16 @@ body, .gradio-container { margin: 0 !important; padding: 0 !important; max-width
 /* Constrain reference photo and generated video to fit on screen */
 #vidgen-reference img, #vidgen-reference video { max-height: 320px !important; width: 100% !important; object-fit: contain !important; }
 #generated-video video { max-height: 320px !important; width: 100% !important; object-fit: contain !important; }
+/* Show Media = off: hide actual media pixels but keep every container/upload-zone intact.
+   Uses visibility:hidden so the container box stays; only the rendered image/video disappears. */
+body.hide-media #vidgen-reference img,
+body.hide-media #vidgen-reference video,
+body.hide-media #generated-video video,
+body.hide-media #end-frame-image img,
+body.hide-media #end-frame-image video,
+body.hide-media #image-gallery-grid img,
+body.hide-media #picgen-result-gallery img,
+body.hide-media #picgen-result-gallery video { visibility: hidden !important; }
 /* LoRA cards grid - 3 per row, compact */
 .lora-grid { display: grid !important; grid-template-columns: repeat(3, 1fr) !important; gap: 10px !important; padding: 4px 0 !important; }
 .lora-card { border: 1px solid var(--border-color-primary) !important; border-radius: 8px !important; padding: 10px 12px !important; background: var(--background-fill-secondary) !important; display: flex !important; flex-direction: column !important; gap: 4px !important; }
@@ -2679,6 +2807,15 @@ with gr.Blocks(css=css) as demo:
         outputs=[clear_storage_status],
     )
 
+    # Global Show Media checkbox — hides all input/output media when unchecked.
+    # Default: unchecked (hidden) for privacy / distraction-free use.
+    with gr.Row():
+        show_media_cb = gr.Checkbox(
+            label="Show Media",
+            value=False,
+            info="When checked, displays input images and generated output on screen.",
+        )
+
     # Tab 0 = Video Generator (vidgen), Tab 1 = Photo Editor (picgen).
     # -vidgen (default) opens on the Video Generator tab; -picgen opens on the
     # Photo Editor tab.
@@ -2717,7 +2854,9 @@ with gr.Blocks(css=css) as demo:
                         info=(
                             "Keep = photo animated untouched, background and bodies "
                             "identical. Replace = new environment with motion prompt. "
-                            "Custom = motion prompt applied as direct edit instruction."
+                            "Custom = motion prompt applied as direct edit instruction. "
+                            "Autorun = process all images in the 'autorun' folder "
+                            "sequentially using the current prompt and settings."
                         ),
                     )
 
@@ -2858,6 +2997,7 @@ with gr.Blocks(css=css) as demo:
                     end_image = gr.Image(
                         label="End Frame (optional, first segment only)",
                         type="pil",
+                        elem_id="end-frame-image",
                     )
             # Hidden file component - populated by generate_btn and used for frame extraction
             video_file = gr.File(visible=False)
@@ -3131,45 +3271,133 @@ with gr.Blocks(css=css) as demo:
                 """Pass-through function for download chain."""
                 return f
 
+            # ---- vidgen autorun progress textbox ----
+            autorun_status = gr.Textbox(
+                label="Autorun Status", visible=False, interactive=False,
+            )
+
+            # Push Autorun button — starts waiting for images from local machine via SSH tunnel
+            with gr.Row(visible=False) as push_autorun_row:
+                push_autorun_btn = gr.Button(
+                    "▶ Start Push Autorun (waiting for local feeder)",
+                    variant="primary", size="lg",
+                )
+                push_cancel_btn = gr.Button("■ Cancel", variant="stop", size="lg")
+
+            # Show push_autorun_row only when Autorun mode is selected
+            scene_mode.change(
+                fn=lambda m: (
+                    gr.update(visible=(m == MODE_AUTORUN)),
+                    gr.update(visible=(m == MODE_AUTORUN)),
+                ),
+                inputs=[scene_mode],
+                outputs=[autorun_status, push_autorun_row],
+            )
+
+            _PUSH_AUTORUN_INPUTS = [
+                vid_prompt, duration_seconds, resolution, frame_multiplier,
+                export_quality, seed, randomize_seed, add_audio_cb,
+                audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
+                flow_shift_auto, flow_shift,
+            ] + list(lora_checkboxes.values())
+
+            _VID_DOWNLOAD_JS = """
+            (videoFile) => {
+                if (!videoFile || !videoFile.url) return videoFile;
+                const a = document.createElement('a');
+                a.href = videoFile.url;
+                a.download = videoFile.url.split('/').pop();
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                return videoFile;
+            }
+            """
+
+            def _dispatch_generate(scene_mode_val, ref_image, prompt,
+                                   end_img, dur, res, fmul, qual, sd, rsd,
+                                   audio_cb, audio_pt, neg_pt, esteps, eguid,
+                                   fsa, fs, *lora_args_inner):
+                """Route to normal generate_video or folder-Autorun based on scene mode."""
+                if scene_mode_val == MODE_AUTORUN:
+                    yield from autorun_generate(
+                        prompt, scene_mode_val, None,
+                        dur, res, fmul, qual, sd, rsd,
+                        audio_cb, audio_pt, neg_pt, esteps, eguid, fsa, fs,
+                        *lora_args_inner,
+                    )
+                else:
+                    result = generate_video(
+                        ref_image, prompt, scene_mode_val,
+                        end_img, dur, res, fmul, qual, sd, rsd,
+                        audio_cb, audio_pt, neg_pt, esteps, eguid, fsa, fs,
+                        *lora_args_inner,
+                    )
+                    yield result[0], result[1], ""
+
             generate_btn.click(
-                fn=generate_video,
+                fn=_dispatch_generate,
                 inputs=[
-                    reference_image, vid_prompt, scene_mode,
+                    scene_mode, reference_image, vid_prompt,
                     end_image, duration_seconds, resolution, frame_multiplier,
                     export_quality, seed, randomize_seed, add_audio_cb,
                     audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                     flow_shift_auto, flow_shift,
-                ] + list(lora_checkboxes.values()),  # Add LoRA checkboxes
-                outputs=[video_output, video_file],
+                ] + list(lora_checkboxes.values()),
+                outputs=[video_output, video_file, autorun_status],
                 concurrency_id=WAN_QUEUE_ID,
-                concurrency_limit=10,  # Allow multiple in queue, processed sequentially
+                concurrency_limit=10,
             ).then(
                 fn=_noop_download,
                 inputs=[video_file],
                 outputs=[video_file],
-                js="""
-                (videoFile) => {
-                    if (!videoFile || !videoFile.url) return videoFile;
-                    
-                    // Download the video
-                    const a = document.createElement('a');
-                    a.href = videoFile.url;
-                    a.download = videoFile.url.split('/').pop();
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    
-                    return videoFile;
-                }
-                """
+                js=_VID_DOWNLOAD_JS,
             ).then(
-                fn=lambda: __import__('time').sleep(2),  # Wait 2 seconds for download to start
+                fn=lambda: __import__('time').sleep(2),
                 inputs=[],
                 outputs=[],
             ).then(
                 fn=clear_storage,
                 inputs=[],
                 outputs=[clear_storage_status],
+            )
+
+            # Push Autorun button wiring
+            push_autorun_btn.click(
+                fn=autorun_push_generate,
+                inputs=_PUSH_AUTORUN_INPUTS,
+                outputs=[video_output, video_file, autorun_status],
+                concurrency_id=WAN_QUEUE_ID,
+                concurrency_limit=1,
+            ).then(
+                fn=_noop_download,
+                inputs=[video_file],
+                outputs=[video_file],
+                js=_VID_DOWNLOAD_JS,
+            ).then(
+                fn=lambda: __import__('time').sleep(2),
+                inputs=[],
+                outputs=[],
+            ).then(
+                fn=clear_storage,
+                inputs=[],
+                outputs=[clear_storage_status],
+            )
+
+            push_cancel_btn.click(
+                fn=lambda: (_push_cancel.set() or _set_push_state("idle") or "Cancelled."),
+                inputs=[],
+                outputs=[autorun_status],
+            )
+
+            # ---- Show Media wiring for vidgen ----
+            # Pure JS toggle: adds/removes 'hide-media' class on <body> instantly.
+            # No server round-trip, no page freeze, containers always present.
+            show_media_cb.change(
+                fn=None,
+                inputs=[show_media_cb],
+                outputs=[],
+                js="(show) => { document.body.classList.toggle('hide-media', !show); }",
             )
 
             # Clear storage button in vidgen tab - same function as top right
@@ -3298,6 +3526,7 @@ with gr.Blocks(css=css) as demo:
                             type="filepath",
                             interactive=False,
                             columns=2,
+                            elem_id="picgen-result-gallery",
                         )
                         use_output_btn = gr.Button("Use as input", variant="secondary", size="sm")
 
@@ -3372,7 +3601,55 @@ with gr.Blocks(css=css) as demo:
                     outputs=[pic_result, pic_seed],
                     concurrency_id=PIC_QUEUE_ID,
                     concurrency_limit=10,
+                ).then(
+                    fn=None,
+                    inputs=[],
+                    outputs=[],
+                    js="""
+                    () => {
+                        // Poll up to 3s for gallery images to finish rendering,
+                        // then download each one.
+                        function downloadGalleryImages() {
+                            const gallery = document.querySelector('.gradio-gallery');
+                            const imgs = gallery ? gallery.querySelectorAll('img') : [];
+                            const urls = [];
+                            imgs.forEach(img => {
+                                if (img.src && !img.src.startsWith('data:') &&
+                                    (img.src.includes('/file=') || img.src.includes('/gradio/'))) {
+                                    urls.push(img.src);
+                                }
+                            });
+                            if (urls.length > 0) {
+                                urls.forEach((url, i) => {
+                                    setTimeout(() => {
+                                        const a = document.createElement('a');
+                                        a.href = url;
+                                        a.download = url.split('/').pop().split('?')[0] || ('picgen_' + i + '.png');
+                                        document.body.appendChild(a);
+                                        a.click();
+                                        document.body.removeChild(a);
+                                    }, i * 300);
+                                });
+                            } else {
+                                // Images not rendered yet — retry
+                                setTimeout(downloadGalleryImages, 300);
+                            }
+                        }
+                        setTimeout(downloadGalleryImages, 400);
+                        return [];
+                    }
+                    """
+                ).then(
+                    fn=lambda: __import__('time').sleep(2),
+                    inputs=[],
+                    outputs=[],
+                ).then(
+                    fn=clear_storage,
+                    inputs=[],
+                    outputs=[clear_storage_status],
                 )
+
+                # (Show Media is handled globally via the CSS hide-media class on <body>)
 
                 def output_to_b64(output_images):
                     if not output_images:
@@ -3472,6 +3749,9 @@ with gr.Blocks(css=css) as demo:
 
     demo.load(fn=None, js=gallery_js)
 
+    # Apply hide-media on page load (Show Media checkbox defaults to unchecked)
+    demo.load(fn=None, js="() => { document.body.classList.add('hide-media'); }")
+
     # Auto-sync video currentTime to the frame_time_input number box
     video_time_sync_js = """
 () => {
@@ -3503,7 +3783,214 @@ with gr.Blocks(css=css) as demo:
 """
     demo.load(fn=None, js=video_time_sync_js)
 
+# ---------------------------------------------------------------------------
+# AUTORUN PUSH API
+#
+# A tiny HTTP server on port 7861 that lets your local machine push images
+# into the app one at a time over SSH tunnel, entirely in memory.
+#
+# Protocol (all requests hit 127.0.0.1:7861 via SSH -L tunnel):
+#
+#   GET  /autorun/status   -> JSON {"state": "idle"|"ready"|"busy"|"done"}
+#   POST /autorun/push     -> multipart/form-data with field "file"
+#                             Returns {"accepted": true, "filename": "..."} or error
+#   POST /autorun/cancel   -> abort a running push-mode autorun
+#
+# The local feeder script polls /status, pushes the next image when "ready",
+# waits for "idle" (generation+download+cleanup done), then pushes the next.
+# ---------------------------------------------------------------------------
+
+_PUSH_API_PORT = 7861
+
+# State machine: idle -> ready -> busy -> idle (loops) | done | error
+_push_state = "idle"          # current state string
+_push_lock   = threading.Lock()
+_push_image_queue: "_queue.Queue[tuple]" = _queue.Queue(maxsize=1)  # (filename, PIL.Image)
+_push_cancel = threading.Event()
+
+
+def _set_push_state(s: str):
+    global _push_state
+    with _push_lock:
+        _push_state = s
+    print(f"[AutorunAPI] state -> {s}")
+
+
+def _start_push_api():
+    """Run a minimal HTTP server for the push API in a daemon thread."""
+    import http.server
+    import urllib.parse
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass  # silence default access log
+
+        def _send_json(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/autorun/status":
+                with _push_lock:
+                    s = _push_state
+                self._send_json(200, {"state": s})
+            else:
+                self._send_json(404, {"error": "not found"})
+
+        def do_POST(self):
+            if self.path == "/autorun/cancel":
+                _push_cancel.set()
+                _set_push_state("idle")
+                self._send_json(200, {"cancelled": True})
+                return
+
+            if self.path != "/autorun/push":
+                self._send_json(404, {"error": "not found"})
+                return
+
+            with _push_lock:
+                state = _push_state
+            if state != "ready":
+                self._send_json(409, {"error": f"not ready (state={state})"})
+                return
+
+            # Parse multipart body to extract the image file
+            ctype = self.headers.get("Content-Type", "")
+            if "multipart/form-data" not in ctype:
+                self._send_json(400, {"error": "expected multipart/form-data"})
+                return
+
+            import cgi
+            length = int(self.headers.get("Content-Length", 0))
+            fs = cgi.FieldStorage(
+                fp=self.rfile,
+                headers=self.headers,
+                environ={
+                    "REQUEST_METHOD": "POST",
+                    "CONTENT_TYPE": ctype,
+                    "CONTENT_LENGTH": str(length),
+                },
+            )
+            file_item = fs.getvalue("file")
+            filename   = fs["file"].filename if "file" in fs else "image.jpg"
+
+            if file_item is None:
+                self._send_json(400, {"error": "missing 'file' field"})
+                return
+
+            try:
+                img = Image.open(BytesIO(file_item if isinstance(file_item, bytes) else file_item.read())).convert("RGB")
+            except Exception as e:
+                self._send_json(400, {"error": f"cannot decode image: {e}"})
+                return
+
+            _set_push_state("busy")
+            _push_image_queue.put((filename, img))
+            self._send_json(200, {"accepted": True, "filename": filename})
+
+    server = http.server.HTTPServer(("127.0.0.1", _PUSH_API_PORT), _Handler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    print(f"[AutorunAPI] listening on 127.0.0.1:{_PUSH_API_PORT}  (SSH-tunnel only)")
+
+
+def autorun_push_generate(
+    prompt,
+    duration_seconds,
+    resolution,
+    frame_multiplier,
+    export_quality,
+    seed,
+    randomize_seed,
+    add_audio_cb,
+    audio_prompt_tb,
+    vid_negative_prompt,
+    edit_steps,
+    edit_guidance,
+    flow_shift_auto,
+    flow_shift,
+    *lora_args,
+    progress=gr.Progress(track_tqdm=True),
+):
+    """
+    Push-mode autorun: waits for images sent from the local machine via the
+    push API, processes each one, yields status, then signals ready for next.
+    Runs until cancelled or until the local feeder sends no more images
+    (detected by a 60-second timeout after the last 'ready' signal).
+    """
+    global _current_input_image_path
+    _push_cancel.clear()
+    completed = 0
+
+    _set_push_state("ready")
+
+    while not _push_cancel.is_set():
+        # Wait up to 60 seconds for the next image
+        try:
+            filename, img = _push_image_queue.get(timeout=60)
+        except _queue.Empty:
+            # No image arrived within 60s after signalling ready — assume done
+            _set_push_state("idle")
+            yield None, None, f"Push autorun complete: {completed} video(s) generated (timed out waiting for next image)"
+            return
+
+        if _push_cancel.is_set():
+            _set_push_state("idle")
+            return
+
+        completed += 1
+        status = f"Push autorun: processing {filename} (#{completed})"
+        print(f"\n[AutorunPush] {status}")
+        _current_input_image_path = None  # in-memory image, no path to protect
+
+        try:
+            video_path, _, _ = generate_video(
+                img,
+                prompt,
+                MODE_KEEP,
+                None,
+                duration_seconds,
+                resolution,
+                frame_multiplier,
+                export_quality,
+                seed,
+                randomize_seed,
+                add_audio_cb,
+                audio_prompt_tb,
+                vid_negative_prompt,
+                edit_steps,
+                edit_guidance,
+                flow_shift_auto,
+                flow_shift,
+                *lora_args,
+                progress=progress,
+            )
+        except gr.Error:
+            _set_push_state("idle")
+            raise
+        except Exception as e:
+            _set_push_state("idle")
+            raise gr.Error(f"Push autorun failed on {filename}: {e}")
+
+        yield video_path, video_path, f"Push autorun: {completed} done, downloading {filename}…"
+
+        # After yielding, the Gradio chain will do download + sleep + clear_storage.
+        # We signal ready for the next image only after that chain fires clear_storage,
+        # but since we can't hook into that directly from here we wait briefly then
+        # set ready — the local script's poll loop handles the rest.
+        # The 2s sleep in the chain + network latency gives enough margin.
+        time.sleep(3)
+        _set_push_state("ready")
+
+    _set_push_state("idle")
+
+
 if __name__ == "__main__":
+    _start_push_api()
     os.makedirs(os.path.join(SCRIPT_DIR, "tmp"), exist_ok=True)
 
     if DUAL_GPU:
