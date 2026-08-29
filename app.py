@@ -2559,21 +2559,25 @@ with gr.Blocks(css=css) as demo:
                     
                     try:
                         # Try multiple deletion methods
+                        removed = False
                         if item.is_dir():
                             try:
                                 _shutil.rmtree(item)
+                                removed = True
                             except Exception as e1:
                                 # Backup: try subprocess rm
                                 result = subprocess.run(["rm", "-rf", str(item)], capture_output=True)
-                                if result.returncode == 0:
+                                removed = result.returncode == 0
                         else:
                             try:
                                 item.unlink()
+                                removed = True
                             except Exception as e2:
                                 # Backup: try subprocess rm
                                 result = subprocess.run(["rm", "-f", str(item)], capture_output=True)
-                                if result.returncode == 0:
-                        deleted.append(str(item))
+                                removed = result.returncode == 0
+                        if removed:
+                            deleted.append(str(item))
                     except Exception as e:
                         errors.append(f"{item.name}: {e}")
                 break  # Only process first found directory
@@ -2597,10 +2601,12 @@ with gr.Blocks(css=css) as demo:
                     try:
                         try:
                             item.unlink()
+                            removed = True
                         except Exception as e3:
                             result = subprocess.run(["rm", "-f", str(item)], capture_output=True)
-                            if result.returncode == 0:
-                        deleted.append(str(item))
+                            removed = result.returncode == 0
+                        if removed:
+                            deleted.append(str(item))
                     except Exception as e:
                         errors.append(f"{item.name}: {e}")
                 break
@@ -3219,6 +3225,7 @@ with gr.Blocks(css=css) as demo:
                 elif hasattr(img, 'name'):
                     _current_input_image_path = img.name
                 else:
+                    _current_input_image_path = None
                 return None
             
             # Use .change() instead of .upload() - fires AFTER upload completes with filepath
