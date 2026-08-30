@@ -1,4 +1,4 @@
-import os
+﻿import os
 import shutil
 import subprocess
 import sys
@@ -1083,6 +1083,14 @@ SCENE_MODES = [MODE_KEEP, MODE_REPLACE, MODE_CUSTOM, MODE_AUTORUN]
 AUTORUN_DIR = Path(SCRIPT_DIR) / "autorun"
 AUTORUN_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
+# ---------------------------------------------------------------------------
+# PUSH AUTORUN: local download destination (Windows path via SSH pipe).
+# The SSH tunnel feeder will receive each finished .mp4 over stdin and write
+# it to this folder on the local machine.  Set to None to disable SSH-pipe
+# download and fall back to browser download only.
+# ---------------------------------------------------------------------------
+PUSH_LOCAL_DOWNLOAD_DIR = r"D:\Apps\newgen\downloads"
+
 
 def discover_autorun_images():
     """
@@ -1683,7 +1691,7 @@ def autorun_generate(
     completed = 0
 
     for idx, img_path in enumerate(autorun_files, start=1):
-        status = f"Autorun: {idx}/{total} — processing {img_path.name}"
+        status = f"Autorun: {idx}/{total} â€” processing {img_path.name}"
         print(f"\n[Autorun] {status}")
 
         _current_input_image_path = str(img_path)
@@ -1693,7 +1701,7 @@ def autorun_generate(
         except Exception as e:
             raise gr.Error(
                 f"Autorun stopped at {idx}/{total}: "
-                f"failed to open {img_path.name} — {e}"
+                f"failed to open {img_path.name} â€” {e}"
             )
 
         try:
@@ -1723,7 +1731,7 @@ def autorun_generate(
         except Exception as e:
             raise gr.Error(
                 f"Autorun stopped at {idx}/{total}: "
-                f"failed to process {img_path.name} — {e}"
+                f"failed to process {img_path.name} â€” {e}"
             )
 
         completed += 1
@@ -1732,7 +1740,21 @@ def autorun_generate(
             if completed == total
             else f"Autorun: {completed}/{total} done, downloading…"
         )
+
+        # Yield the video so the browser triggers its download via the JS chain.
         yield video_path, video_path, completion_status
+
+        # ---- Per-video download + storage clear ----
+        # The Gradio .then() chain fires once after the entire generator finishes,
+        # not after each yield.  So for all but the last video we must trigger
+        # clear_storage() here ourselves.  We protect the just-yielded file by
+        # pointing _current_input_image_path at it so clear_storage skips it,
+        # wait long enough for the browser to finish the download, then clear.
+        if completed < total:
+            _current_input_image_path = video_path   # protect from deletion
+            time.sleep(5)                             # let browser fetch the file
+            _current_input_image_path = str(img_path)  # restore to next input
+            clear_storage()        # wipe tmp/gradio + outputs so VPS stays clean
 
 
 # ---------------------------------------------------------------------------
@@ -2628,6 +2650,279 @@ body.hide-media #picgen-result-gallery video { visibility: hidden !important; }
 #col-container textarea { resize: vertical !important; min-height: 60px !important; touch-action: pan-y !important; }
 """
 
+# AUTORUN PUSH API
+#
+# A tiny HTTP server on port 7861 that lets your local machine push images
+# into the app one at a time over SSH tunnel, entirely in memory.
+#
+# Protocol (all requests hit 127.0.0.1:7861 via SSH -L tunnel):
+#
+#   GET  /autorun/status   -> JSON {"state": "idle"|"ready"|"busy"|"done"}
+#   POST /autorun/push     -> multipart/form-data with field "file"
+#                             Returns {"accepted": true, "filename": "..."} or error
+#   POST /autorun/cancel   -> abort a running push-mode autorun
+#
+# The local feeder script polls /status, pushes the next image when "ready",
+# waits for "idle" (generation+download+cleanup done), then pushes the next.
+# ---------------------------------------------------------------------------
+
+_PUSH_API_PORT = 7861
+
+# State machine: idle -> ready -> busy -> idle (loops) | done | error
+_push_state = "idle"          # current state string
+_push_lock   = threading.Lock()
+_push_image_queue: "_queue.Queue[tuple]" = _queue.Queue(maxsize=1)  # (filename, PIL.Image)
+_push_cancel = threading.Event()
+# Holds the bytes of the most recently generated video so the feeder can pull
+# it via GET /autorun/download instead of needing a browser download.
+_push_pending_video: dict = {"bytes": None, "name": None, "ready": False}
+
+
+def _set_push_state(s: str):
+    global _push_state
+    with _push_lock:
+        _push_state = s
+    print(f"[AutorunAPI] state -> {s}")
+
+
+def _start_push_api():
+    """Run a minimal HTTP server for the push API in a daemon thread."""
+    import http.server
+    import urllib.parse
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass  # silence default access log
+
+        def _send_json(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/autorun/status":
+                with _push_lock:
+                    s = _push_state
+                self._send_json(200, {"state": s})
+
+            elif self.path == "/autorun/download":
+                # Serve the most recently generated video as raw bytes so the
+                # local feeder can write it to PUSH_LOCAL_DOWNLOAD_DIR without
+                # needing a browser.  Clears the pending slot after sending.
+                with _push_lock:
+                    ready  = _push_pending_video.get("ready", False)
+                    vbytes = _push_pending_video.get("bytes")
+                    vname  = _push_pending_video.get("name", "vidgen.mp4")
+                if not ready or not vbytes:
+                    self._send_json(404, {"error": "no video pending"})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(len(vbytes)))
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{vname}"')
+                self.end_headers()
+                self.wfile.write(vbytes)
+                # Clear after serving so a stale download isn't re-fetched.
+                with _push_lock:
+                    _push_pending_video["bytes"] = None
+                    _push_pending_video["ready"] = False
+                print(f"[AutorunAPI] /autorun/download served {vname} "
+                      f"({len(vbytes)//1024} KB) to local feeder")
+
+            else:
+                self._send_json(404, {"error": "not found"})
+
+        def do_POST(self):
+            if self.path == "/autorun/cancel":
+                _push_cancel.set()
+                _set_push_state("idle")
+                self._send_json(200, {"cancelled": True})
+                return
+
+            if self.path == "/autorun/ready":
+                with _push_lock:
+                    state = _push_state
+                if state not in ("busy", "done"):
+                    self._send_json(409, {"error": f"not awaiting completion (state={state})"})
+                    return
+                _set_push_state("ready")
+                self._send_json(200, {"ready": True})
+                return
+
+            if self.path != "/autorun/push":
+                self._send_json(404, {"error": "not found"})
+                return
+
+            with _push_lock:
+                state = _push_state
+            if state != "ready":
+                self._send_json(409, {"error": f"not ready (state={state})"})
+                return
+
+            # Parse multipart body to extract the image file
+            ctype = self.headers.get("Content-Type", "")
+            if "multipart/form-data" not in ctype:
+                self._send_json(400, {"error": "expected multipart/form-data"})
+                return
+
+            import cgi
+            length = int(self.headers.get("Content-Length", 0))
+            fs = cgi.FieldStorage(
+                fp=self.rfile,
+                headers=self.headers,
+                environ={
+                    "REQUEST_METHOD": "POST",
+                    "CONTENT_TYPE": ctype,
+                    "CONTENT_LENGTH": str(length),
+                },
+            )
+            file_item = fs.getvalue("file")
+            filename   = fs["file"].filename if "file" in fs else "image.jpg"
+
+            if file_item is None:
+                self._send_json(400, {"error": "missing 'file' field"})
+                return
+
+            try:
+                img = Image.open(BytesIO(file_item if isinstance(file_item, bytes) else file_item.read())).convert("RGB")
+            except Exception as e:
+                self._send_json(400, {"error": f"cannot decode image: {e}"})
+                return
+
+            _set_push_state("busy")
+            _push_image_queue.put((filename, img))
+            self._send_json(200, {"accepted": True, "filename": filename})
+
+    server = http.server.HTTPServer(("127.0.0.1", _PUSH_API_PORT), _Handler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    print(f"[AutorunAPI] listening on 127.0.0.1:{_PUSH_API_PORT}  (SSH-tunnel only)")
+
+
+def autorun_push_generate(
+    prompt,
+    duration_seconds,
+    resolution,
+    frame_multiplier,
+    export_quality,
+    seed,
+    randomize_seed,
+    add_audio_cb,
+    audio_prompt_tb,
+    vid_negative_prompt,
+    edit_steps,
+    edit_guidance,
+    flow_shift_auto,
+    flow_shift,
+    *lora_args,
+    progress=gr.Progress(track_tqdm=True),
+):
+    """
+    Push-mode autorun: waits for images sent from the local machine via the
+    push API, processes each one, yields status, then signals ready for next.
+    Runs until cancelled or until the local feeder sends no more images
+    (detected by a 60-second timeout after the last 'ready' signal).
+    """
+    global _current_input_image_path
+    _push_cancel.clear()
+    completed = 0
+
+    _set_push_state("ready")
+
+    while not _push_cancel.is_set():
+        # Wait for exactly one image. The next request is accepted only after
+        # the browser completes the download/cleanup acknowledgement.
+        try:
+            filename, img = _push_image_queue.get(timeout=900)
+        except _queue.Empty:
+            _set_push_state("idle")
+            yield None, None, f"Push autorun complete: {completed} video(s) generated (timed out waiting for next image)"
+            return
+
+        if _push_cancel.is_set():
+            _set_push_state("idle")
+            return
+
+        completed += 1
+        status = f"Push autorun: processing {filename} (#{completed})"
+        print(f"\n[AutorunPush] {status}")
+        _current_input_image_path = None  # in-memory image, no path to protect
+
+        try:
+            video_path, _, _ = generate_video(
+                img,
+                prompt,
+                MODE_KEEP,
+                None,
+                duration_seconds,
+                resolution,
+                frame_multiplier,
+                export_quality,
+                seed,
+                randomize_seed,
+                add_audio_cb,
+                audio_prompt_tb,
+                vid_negative_prompt,
+                edit_steps,
+                edit_guidance,
+                flow_shift_auto,
+                flow_shift,
+                *lora_args,
+                progress=progress,
+            )
+        except gr.Error:
+            _set_push_state("idle")
+            raise
+        except Exception as e:
+            _set_push_state("idle")
+            raise gr.Error(f"Push autorun failed on {filename}: {e}")
+
+        # ---- Queue video bytes for local pull via /autorun/download -----------
+        # State transitions: busy -> done  (feeder sees "done", downloads, then
+        # POSTs /autorun/ready to transition done -> ready for next image).
+        push_status = f"Push autorun: {completed} done, ready for local download"
+        if video_path and os.path.exists(video_path):
+            out_name = os.path.basename(video_path)
+            try:
+                with open(video_path, "rb") as _vf:
+                    _vbytes = _vf.read()
+                with _push_lock:
+                    _push_pending_video["bytes"] = _vbytes
+                    _push_pending_video["name"]  = out_name
+                    _push_pending_video["ready"] = True
+                print(f"[AutorunPush] video queued for local pull ({len(_vbytes)//1024} KB): {out_name}")
+            except Exception as _e:
+                print(f"[AutorunPush] could not queue video for local download: {_e}")
+
+        # Transition to "done" so the feeder knows to fetch /autorun/download.
+        _set_push_state("done")
+        yield video_path, video_path, push_status
+
+        # Clear VPS storage while the feeder is downloading.
+        # The video bytes are already in memory (_push_pending_video) so deleting
+        # the file on disk is safe.
+        time.sleep(1)
+        clear_storage()
+        print(f"[AutorunPush] storage cleared after #{completed} — waiting for /autorun/ready")
+
+        # Wait for the feeder to POST /autorun/ready (after confirming the local
+        # file is written), which transitions done -> ready for the next image.
+        while not _push_cancel.is_set():
+            with _push_lock:
+                s = _push_state
+            if s == "ready":
+                break
+            time.sleep(0.25)
+
+    _set_push_state("idle")
+
+
+
+
 with gr.Blocks(css=css) as demo:
     # Clear button  outside tabs, always visible at top right
     with gr.Row():
@@ -2807,7 +3102,7 @@ with gr.Blocks(css=css) as demo:
         outputs=[clear_storage_status],
     )
 
-    # Global Show Media checkbox — hides all input/output media when unchecked.
+    # Global Show Media checkbox â€” hides all input/output media when unchecked.
     # Default: unchecked (hidden) for privacy / distraction-free use.
     with gr.Row():
         show_media_cb = gr.Checkbox(
@@ -2919,7 +3214,7 @@ with gr.Blocks(css=css) as demo:
                     
                     # Generate button directly under video output
                     generate_btn = gr.Button(
-                        "Generate Video", variant="primary", size="lg"
+                        "Generate Video", variant="primary", size="lg", elem_id="generate-btn"
                     )
                     # Clear storage button directly under generate button
                     clear_storage_btn_vid = gr.Button(
@@ -3074,8 +3369,8 @@ with gr.Blocks(css=css) as demo:
                         needs_download = (not high_exists and high_downloadable) or (not low_exists and low_downloadable)
                         can_use = high_exists or low_exists
                         
-                        high_status = "✓" if high_exists else ("↓" if high_downloadable else "✗")
-                        low_status = "✓" if low_exists else ("↓" if low_downloadable else "✗")
+                        high_status = "âœ“" if high_exists else ("â†“" if high_downloadable else "âœ—")
+                        low_status = "âœ“" if low_exists else ("â†“" if low_downloadable else "âœ—")
                         high_cls = "lora-badge-ok" if high_exists else ("lora-badge-dl" if high_downloadable else "lora-badge-miss")
                         low_cls = "lora-badge-ok" if low_exists else ("lora-badge-dl" if low_downloadable else "lora-badge-miss")
                         
@@ -3124,7 +3419,7 @@ with gr.Blocks(css=css) as demo:
                                 if not low_exists and low_downloadable:
                                     dl_parts.append("Low")
                                 lora_download_btns[lora_id] = gr.Button(
-                                    f"↓ Download {' + '.join(dl_parts)}",
+                                    f"â†“ Download {' + '.join(dl_parts)}",
                                     size="sm",
                                     variant="secondary",
                                 )
@@ -3276,13 +3571,13 @@ with gr.Blocks(css=css) as demo:
                 label="Autorun Status", visible=False, interactive=False,
             )
 
-            # Push Autorun button — starts waiting for images from local machine via SSH tunnel
+            # Push Autorun button â€” starts waiting for images from local machine via SSH tunnel
             with gr.Row(visible=False) as push_autorun_row:
                 push_autorun_btn = gr.Button(
-                    "▶ Start Push Autorun (waiting for local feeder)",
+                    "â–¶ Start Push Autorun (waiting for local feeder)",
                     variant="primary", size="lg",
                 )
-                push_cancel_btn = gr.Button("■ Cancel", variant="stop", size="lg")
+                push_cancel_btn = gr.Button("â–  Cancel", variant="stop", size="lg")
 
             # Show push_autorun_row only when Autorun mode is selected
             scene_mode.change(
@@ -3382,6 +3677,18 @@ with gr.Blocks(css=css) as demo:
                 fn=clear_storage,
                 inputs=[],
                 outputs=[clear_storage_status],
+            ).then(
+                fn=None,
+                inputs=[],
+                outputs=[],
+                js="""
+                () => {
+                    fetch('http://127.0.0.1:7861/autorun/ready', {
+                        method: 'POST'
+                    }).catch(() => {});
+                    return [];
+                }
+                """
             )
 
             push_cancel_btn.click(
@@ -3631,7 +3938,7 @@ with gr.Blocks(css=css) as demo:
                                     }, i * 300);
                                 });
                             } else {
-                                // Images not rendered yet — retry
+                                // Images not rendered yet â€” retry
                                 setTimeout(downloadGalleryImages, 300);
                             }
                         }
@@ -3784,211 +4091,6 @@ with gr.Blocks(css=css) as demo:
     demo.load(fn=None, js=video_time_sync_js)
 
 # ---------------------------------------------------------------------------
-# AUTORUN PUSH API
-#
-# A tiny HTTP server on port 7861 that lets your local machine push images
-# into the app one at a time over SSH tunnel, entirely in memory.
-#
-# Protocol (all requests hit 127.0.0.1:7861 via SSH -L tunnel):
-#
-#   GET  /autorun/status   -> JSON {"state": "idle"|"ready"|"busy"|"done"}
-#   POST /autorun/push     -> multipart/form-data with field "file"
-#                             Returns {"accepted": true, "filename": "..."} or error
-#   POST /autorun/cancel   -> abort a running push-mode autorun
-#
-# The local feeder script polls /status, pushes the next image when "ready",
-# waits for "idle" (generation+download+cleanup done), then pushes the next.
-# ---------------------------------------------------------------------------
-
-_PUSH_API_PORT = 7861
-
-# State machine: idle -> ready -> busy -> idle (loops) | done | error
-_push_state = "idle"          # current state string
-_push_lock   = threading.Lock()
-_push_image_queue: "_queue.Queue[tuple]" = _queue.Queue(maxsize=1)  # (filename, PIL.Image)
-_push_cancel = threading.Event()
-
-
-def _set_push_state(s: str):
-    global _push_state
-    with _push_lock:
-        _push_state = s
-    print(f"[AutorunAPI] state -> {s}")
-
-
-def _start_push_api():
-    """Run a minimal HTTP server for the push API in a daemon thread."""
-    import http.server
-    import urllib.parse
-
-    class _Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, fmt, *args):
-            pass  # silence default access log
-
-        def _send_json(self, code, obj):
-            body = json.dumps(obj).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self):
-            if self.path == "/autorun/status":
-                with _push_lock:
-                    s = _push_state
-                self._send_json(200, {"state": s})
-            else:
-                self._send_json(404, {"error": "not found"})
-
-        def do_POST(self):
-            if self.path == "/autorun/cancel":
-                _push_cancel.set()
-                _set_push_state("idle")
-                self._send_json(200, {"cancelled": True})
-                return
-
-            if self.path != "/autorun/push":
-                self._send_json(404, {"error": "not found"})
-                return
-
-            with _push_lock:
-                state = _push_state
-            if state != "ready":
-                self._send_json(409, {"error": f"not ready (state={state})"})
-                return
-
-            # Parse multipart body to extract the image file
-            ctype = self.headers.get("Content-Type", "")
-            if "multipart/form-data" not in ctype:
-                self._send_json(400, {"error": "expected multipart/form-data"})
-                return
-
-            import cgi
-            length = int(self.headers.get("Content-Length", 0))
-            fs = cgi.FieldStorage(
-                fp=self.rfile,
-                headers=self.headers,
-                environ={
-                    "REQUEST_METHOD": "POST",
-                    "CONTENT_TYPE": ctype,
-                    "CONTENT_LENGTH": str(length),
-                },
-            )
-            file_item = fs.getvalue("file")
-            filename   = fs["file"].filename if "file" in fs else "image.jpg"
-
-            if file_item is None:
-                self._send_json(400, {"error": "missing 'file' field"})
-                return
-
-            try:
-                img = Image.open(BytesIO(file_item if isinstance(file_item, bytes) else file_item.read())).convert("RGB")
-            except Exception as e:
-                self._send_json(400, {"error": f"cannot decode image: {e}"})
-                return
-
-            _set_push_state("busy")
-            _push_image_queue.put((filename, img))
-            self._send_json(200, {"accepted": True, "filename": filename})
-
-    server = http.server.HTTPServer(("127.0.0.1", _PUSH_API_PORT), _Handler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    print(f"[AutorunAPI] listening on 127.0.0.1:{_PUSH_API_PORT}  (SSH-tunnel only)")
-
-
-def autorun_push_generate(
-    prompt,
-    duration_seconds,
-    resolution,
-    frame_multiplier,
-    export_quality,
-    seed,
-    randomize_seed,
-    add_audio_cb,
-    audio_prompt_tb,
-    vid_negative_prompt,
-    edit_steps,
-    edit_guidance,
-    flow_shift_auto,
-    flow_shift,
-    *lora_args,
-    progress=gr.Progress(track_tqdm=True),
-):
-    """
-    Push-mode autorun: waits for images sent from the local machine via the
-    push API, processes each one, yields status, then signals ready for next.
-    Runs until cancelled or until the local feeder sends no more images
-    (detected by a 60-second timeout after the last 'ready' signal).
-    """
-    global _current_input_image_path
-    _push_cancel.clear()
-    completed = 0
-
-    _set_push_state("ready")
-
-    while not _push_cancel.is_set():
-        # Wait up to 60 seconds for the next image
-        try:
-            filename, img = _push_image_queue.get(timeout=60)
-        except _queue.Empty:
-            # No image arrived within 60s after signalling ready — assume done
-            _set_push_state("idle")
-            yield None, None, f"Push autorun complete: {completed} video(s) generated (timed out waiting for next image)"
-            return
-
-        if _push_cancel.is_set():
-            _set_push_state("idle")
-            return
-
-        completed += 1
-        status = f"Push autorun: processing {filename} (#{completed})"
-        print(f"\n[AutorunPush] {status}")
-        _current_input_image_path = None  # in-memory image, no path to protect
-
-        try:
-            video_path, _, _ = generate_video(
-                img,
-                prompt,
-                MODE_KEEP,
-                None,
-                duration_seconds,
-                resolution,
-                frame_multiplier,
-                export_quality,
-                seed,
-                randomize_seed,
-                add_audio_cb,
-                audio_prompt_tb,
-                vid_negative_prompt,
-                edit_steps,
-                edit_guidance,
-                flow_shift_auto,
-                flow_shift,
-                *lora_args,
-                progress=progress,
-            )
-        except gr.Error:
-            _set_push_state("idle")
-            raise
-        except Exception as e:
-            _set_push_state("idle")
-            raise gr.Error(f"Push autorun failed on {filename}: {e}")
-
-        yield video_path, video_path, f"Push autorun: {completed} done, downloading {filename}…"
-
-        # After yielding, the Gradio chain will do download + sleep + clear_storage.
-        # We signal ready for the next image only after that chain fires clear_storage,
-        # but since we can't hook into that directly from here we wait briefly then
-        # set ready — the local script's poll loop handles the rest.
-        # The 2s sleep in the chain + network latency gives enough margin.
-        time.sleep(3)
-        _set_push_state("ready")
-
-    _set_push_state("idle")
-
-
 if __name__ == "__main__":
     _start_push_api()
     os.makedirs(os.path.join(SCRIPT_DIR, "tmp"), exist_ok=True)
@@ -4076,6 +4178,7 @@ if __name__ == "__main__":
                 import traceback; traceback.print_exc()
 
         threading.Thread(target=_bg_load, daemon=True).start()
+
 
 
 

@@ -1,0 +1,211 @@
+=====================================================
+  NewGen - Full Setup & Autorun Workflow
+=====================================================
+
+
+═══════════════════════════════════════════════════
+  MANUAL COMMANDS REFERENCE
+  (if you need to do anything by hand)
+═══════════════════════════════════════════════════
+
+  -- VPS: start app --
+    cd /root/newgen
+    pkill -f "python3 app.py" 2>/dev/null || true
+    nohup python3 app.py > newgen.log 2>&1 &
+    sleep 10
+    tail -n 80 newgen.log
+
+  -- VPS: confirm it started --
+    Look for both of these lines in the log:
+      [AutorunAPI] listening on 127.0.0.1:7861
+      * Running on local URL: http://0.0.0.0:7860
+
+  -- VPS: kill app --
+    pkill -f "python3 app.py" 2>/dev/null || true
+
+  -- VPS: verify Python files compile --
+    cd /root/newgen
+    python3 -m py_compile app.py autorun_feeder.py
+
+  -- PC: open SSH tunnel (PowerShell or cmd) --
+    ssh root@159.48.242.33 -p20202 -L 7861:127.0.0.1:7861 -N
+    (type password when prompted, leave window open)
+
+  -- PC: run feeder manually (PowerShell) --
+    cd "D:\Apps\newgen"
+    python .\autorun_feeder.py `
+      --folder "D:\Apps\newgen\newgen-autorun" `
+      --port 7861 `
+      --download-dir "D:\Apps\newgen\downloads"
+
+
+═══════════════════════════════════════════════════
+  PART 1 — VPS FIRST-TIME SETUP  (do once per VPS)
+═══════════════════════════════════════════════════
+
+1. SSH into the VPS
+   ─────────────────
+   Open PowerShell or cmd on your PC:
+
+     ssh root@<VPS-IP> -p<PORT>
+     e.g.  ssh root@159.48.242.33 -p20202
+
+   Enter your password when prompted.
+
+
+2. Clone your repo
+   ─────────────────
+     cd /root
+     git clone <your-repo-url> newgen
+     cd /root/newgen
+
+
+3. Run setup
+   ──────────
+     bash setup.sh
+
+   Wait for it to finish. Only needed once per fresh VPS.
+
+
+4. Make the helper scripts executable
+   ────────────────────────────────────
+     chmod +x /root/newgen/autorun.sh
+     chmod +x /root/newgen/kill.sh
+
+   Only needed once.
+
+
+═══════════════════════════════════════════════════
+  PART 2 — EVERY SESSION  (each time you use the VPS)
+═══════════════════════════════════════════════════
+
+── ON THE VPS ──────────────────────────────────────
+
+5. SSH in and start the app
+   ──────────────────────────
+     ssh root@<VPS-IP> -p<PORT>
+     cd /root/newgen
+     bash autorun.sh
+
+   Waits and confirms Gradio is up before returning.
+   You can close the SSH window after — app keeps running.
+
+   Check the log any time:
+     bash autorun.sh logs
+   (Ctrl+C stops tailing, app keeps running)
+
+
+── ON YOUR WINDOWS PC ──────────────────────────────
+
+6. Open Gradio in your browser
+   ─────────────────────────────
+     http://<VPS-IP>:7860
+     e.g.  http://159.48.242.33:7860
+
+
+═══════════════════════════════════════════════════
+  PART 3A — REGULAR AUTORUN  (browser/folder mode)
+═══════════════════════════════════════════════════
+
+   Images are already on the VPS in /root/newgen/autorun/
+
+7. Put images on the VPS
+   ──────────────────────
+     /root/newgen/autorun/
+   Supported: .jpg  .jpeg  .png  .webp
+
+8. In the browser
+   ────────────────
+   - Video Generator tab
+   - Scene Mode → Autorun
+   - Set prompt and settings
+   - Click Generate
+
+   Each video downloads to your browser automatically,
+   storage clears, then the next image starts.
+
+
+═══════════════════════════════════════════════════
+  PART 3B — PUSH AUTORUN  (SSH feeder from your PC)
+═══════════════════════════════════════════════════
+
+   Images live on your PC. Videos download back to your PC.
+
+9. Put images on your PC
+   ──────────────────────
+     D:\Apps\newgen\newgen-autorun\
+   Supported: .jpg  .jpeg  .png  .webp
+   Processed in alphabetical order by filename.
+
+10. In the Gradio browser tab
+    ───────────────────────────
+    - Video Generator tab
+    - Scene Mode → Autorun
+    - Set prompt and settings
+    - Click "▶ Start Push Autorun (waiting for local feeder)"
+    Do NOT click Generate.
+
+11. Run newgen-autorun.bat on your PC
+    ─────────────────────────────────
+    Double-click newgen-autorun.bat
+
+    It asks:
+      Enter SSH command: ssh root@159.48.242.33 -p20202
+      → type it exactly like that, press Enter
+
+    A second window opens: "NewGen SSH Tunnel -- type password here"
+      → click that window, type your SSH password, press Enter
+
+    Once connected the tunnel window shows nothing (that is normal —
+    -N means no command, just the tunnel). Come back to the main window.
+    The feeder starts automatically once port 7861 is reachable.
+
+12. What happens automatically
+    ────────────────────────────
+    For each image:
+      - Feeder pushes image to VPS over the tunnel
+      - VPS generates the video
+      - Browser downloads the finished video
+      - VPS clears storage
+      - Browser calls /autorun/ready
+      - Feeder sends the next image
+
+    Finished videos saved to:
+      D:\Apps\newgen\downloads\
+
+
+═══════════════════════════════════════════════════
+  STOPPING / RESTARTING
+═══════════════════════════════════════════════════
+
+  Stop app:       bash autorun.sh stop
+                  — or —  bash kill.sh
+
+  Restart app:    bash autorun.sh restart
+
+  Status:         bash autorun.sh status
+
+  Live log:       bash autorun.sh logs
+
+  Stop tunnel:    Close the "NewGen SSH Tunnel" window on your PC.
+
+  Cancel push:    Click "■ Cancel" in the Gradio browser tab.
+
+
+═══════════════════════════════════════════════════
+  FILE REFERENCE
+═══════════════════════════════════════════════════
+
+  VPS — /root/newgen/
+    app.py              Main application
+    autorun_feeder.py   Feeder script
+    autorun.sh          Start / stop / restart / logs
+    kill.sh             Force-kill regardless of how app was started
+    newgen.log          Live log  (bash autorun.sh logs)
+    autorun/            Images for browser/local autorun mode
+
+  Your PC — D:\Apps\newgen\
+    newgen-autorun.bat  Double-click to run Push Autorun
+    autorun_feeder.py   Feeder script
+    newgen-autorun\     Images to push (Push Autorun)
+    downloads\          Finished videos land here
