@@ -1,8 +1,9 @@
-﻿import os
+import os
 import shutil
 import subprocess
 import sys
 import random
+import math
 import tempfile
 import warnings
 import logging
@@ -652,48 +653,192 @@ def discover_loras():
 # Track active LoRAs (global state)
 _active_loras = {}  # {base_name: {"high": path, "low": path}}
 
+def _unload_loras_from_transformer(transformer, name="transformer"):
+    """Safely remove all LoRA adapters from a single transformer module."""
+    try:
+        if hasattr(transformer, 'unfuse_lora'):
+            try:
+                transformer.unfuse_lora()
+            except Exception:
+                pass
+        if hasattr(transformer, 'unload_lora'):
+            transformer.unload_lora()
+        elif hasattr(transformer, 'set_adapters'):
+            # Some diffusers versions expose set_adapters on the module itself.
+            # Passing an empty list deactivates without unloading weights.
+            try:
+                transformer.set_adapters([])
+            except Exception:
+                pass
+        # Hard reset: delete the peft_config and adapter layers if present.
+        if hasattr(transformer, 'peft_config'):
+            try:
+                from peft import get_peft_model_state_dict  # noqa: F401
+                # delete_adapter is the proper PEFT call
+                for adapter_name in list(getattr(transformer, 'peft_config', {}).keys()):
+                    try:
+                        transformer.delete_adapter(adapter_name)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[LoRA] Warning: could not unload LoRAs from {name}: {e}")
+
+
 def load_loras_to_pipeline(pipe, selected_loras):
-    """Load selected LoRAs to the Wan pipeline."""
+    """
+    Load selected LoRAs into the Wan pipeline.
+
+    Wan 2.2 I2V is a dual-transformer model:
+      - pipe.transformer   — high-noise denoising expert
+      - pipe.transformer_2 — low-noise denoising expert
+
+    Each LoRA entry can supply a _high safetensors (for transformer) and/or
+    a _low safetensors (for transformer_2).  The correct approach is:
+
+      1. Unload existing adapters from each transformer independently.
+      2. Load each LoRA file directly onto the target transformer module using
+         load_lora_weights() on the *pipeline* with an explicit
+         `transformer_layer_index` kwarg that diffusers >= 0.32 supports, OR
+         by loading directly onto the module via its own load_attn_procs().
+      3. Call set_adapters() on each transformer module independently so that
+         weights and adapter names don't bleed across the two experts.
+
+    IMPORTANT: the `transformer_layer_name` kwarg used in earlier code is NOT
+    a real diffusers parameter — it was silently ignored, meaning low-noise
+    LoRAs were never actually applied to transformer_2.  This version fixes
+    that by loading onto each transformer module directly.
+    """
     global _active_loras
-    
+
     if pipe is None:
         return
-    
-    # Unload all existing LoRAs first
+
+    # ---- 1. Unload all existing LoRAs from both transformers ---------------
+    # We unload at the module level rather than at the pipeline level because
+    # pipe.unload_lora_weights() on dual-transformer pipelines in some diffusers
+    # versions only touches transformer, not transformer_2.
+    _unload_loras_from_transformer(pipe.transformer, "transformer")
+    if hasattr(pipe, 'transformer_2') and pipe.transformer_2 is not None:
+        _unload_loras_from_transformer(pipe.transformer_2, "transformer_2")
+
+    # Also call the pipeline-level unload as a belt-and-suspenders measure.
     try:
-        if hasattr(pipe, 'unfuse_lora'):
-            pipe.unfuse_lora()
         if hasattr(pipe, 'unload_lora_weights'):
             pipe.unload_lora_weights()
-    except Exception as e:
+    except Exception:
         pass
-    
+
     _active_loras = {}
-    
+
     if not selected_loras:
+        print("[LoRA] No LoRAs selected — all unloaded.")
         return
-    
-    # Load selected LoRAs
+
+    # ---- 2. Load each LoRA onto the correct transformer --------------------
+    # Track adapter names per transformer so we can activate them correctly.
+    high_adapter_names   = []   # adapters loaded onto transformer
+    high_adapter_weights = []
+    low_adapter_names    = []   # adapters loaded onto transformer_2
+    low_adapter_weights  = []
+    loaded_count = 0
+
     for base_name, lora_info in selected_loras.items():
-        high_path = lora_info.get("high")
-        low_path = lora_info.get("low")
-        
-        try:
-            # Load high-noise LoRA to transformer (high-noise expert)
-            if high_path and hasattr(pipe, 'transformer'):
-                pipe.load_lora_weights(high_path, adapter_name=f"{base_name}_high")
-                pipe.set_adapters([f"{base_name}_high"], adapter_weights=[1.0])
-            
-            # Load low-noise LoRA to transformer_2 (low-noise expert)
-            if low_path and hasattr(pipe, 'transformer_2'):
-                # Note: diffusers may need specific API for dual-transformer LoRA loading
-                # This is a simplified approach - may need adjustment based on actual API
-                pass
-            
+        high_path   = lora_info.get("high")
+        low_path    = lora_info.get("low")
+        high_weight = float(lora_info.get("high_weight") or 1.0)
+        low_weight  = float(lora_info.get("low_weight")  or 1.0)
+        lora_ok     = False
+
+        # --- High-noise LoRA → pipe.transformer ---
+        if high_path and os.path.exists(high_path):
+            adapter_name = f"{base_name}_high"
+            try:
+                # Load directly onto the transformer module.  The module-level
+                # load_lora_weights is available via the PEFT mixin in diffusers.
+                if hasattr(pipe.transformer, 'load_lora_weights'):
+                    pipe.transformer.load_lora_weights(high_path, adapter_name=adapter_name)
+                else:
+                    # Fallback: use the pipeline's load_lora_weights with the
+                    # component kwarg (diffusers >= 0.30 accepts `component` to
+                    # target a specific sub-module).
+                    pipe.load_lora_weights(
+                        high_path,
+                        adapter_name=adapter_name,
+                        component="transformer",
+                    )
+                high_adapter_names.append(adapter_name)
+                high_adapter_weights.append(high_weight)
+                lora_ok = True
+                print(f"[LoRA] Loaded high-noise: {base_name} (w={high_weight}) <- {os.path.basename(high_path)}")
+            except Exception as e:
+                # Last-resort: load onto the full pipeline (targets transformer
+                # by default for WanI2V) and accept that only transformer gets it.
+                try:
+                    pipe.load_lora_weights(high_path, adapter_name=adapter_name)
+                    high_adapter_names.append(adapter_name)
+                    high_adapter_weights.append(high_weight)
+                    lora_ok = True
+                    print(f"[LoRA] Loaded high-noise (pipeline fallback): {base_name} (w={high_weight})")
+                except Exception as e2:
+                    print(f"[LoRA] ERROR loading high-noise LoRA '{base_name}': {e} / {e2}")
+
+        # --- Low-noise LoRA → pipe.transformer_2 ---
+        has_t2 = hasattr(pipe, 'transformer_2') and pipe.transformer_2 is not None
+        if low_path and os.path.exists(low_path) and has_t2:
+            adapter_name = f"{base_name}_low"
+            try:
+                if hasattr(pipe.transformer_2, 'load_lora_weights'):
+                    pipe.transformer_2.load_lora_weights(low_path, adapter_name=adapter_name)
+                else:
+                    pipe.load_lora_weights(
+                        low_path,
+                        adapter_name=adapter_name,
+                        component="transformer_2",
+                    )
+                low_adapter_names.append(adapter_name)
+                low_adapter_weights.append(low_weight)
+                lora_ok = True
+                print(f"[LoRA] Loaded low-noise:  {base_name} (w={low_weight}) <- {os.path.basename(low_path)}")
+            except Exception as e:
+                print(f"[LoRA] ERROR loading low-noise LoRA '{base_name}': {e}")
+        elif low_path and os.path.exists(low_path) and not has_t2:
+            print(f"[LoRA] WARNING: '{base_name}' has a low-noise file but pipeline has no transformer_2 — skipping low.")
+
+        if lora_ok:
             _active_loras[base_name] = lora_info
-            
+            loaded_count += 1
+        else:
+            print(f"[LoRA] WARNING: '{base_name}' — no files loaded (high={high_path}, low={low_path})")
+
+    # ---- 3. Activate adapters on each transformer independently ------------
+    # Calling set_adapters on the module (not the pipeline) is the safe path:
+    # the pipeline-level set_adapters may only address transformer, not t2.
+    if high_adapter_names:
+        try:
+            if hasattr(pipe.transformer, 'set_adapters'):
+                pipe.transformer.set_adapters(high_adapter_names, adapter_weights=high_adapter_weights)
+            else:
+                pipe.set_adapters(high_adapter_names, adapter_weights=high_adapter_weights)
+            print(f"[LoRA] transformer adapters active: {high_adapter_names} weights={high_adapter_weights}")
         except Exception as e:
-            pass
+            print(f"[LoRA] ERROR activating transformer adapters {high_adapter_names}: {e}")
+
+    if low_adapter_names and has_t2:
+        try:
+            if hasattr(pipe.transformer_2, 'set_adapters'):
+                pipe.transformer_2.set_adapters(low_adapter_names, adapter_weights=low_adapter_weights)
+            else:
+                # No module-level set_adapters — enable_adapters at least turns them on
+                if hasattr(pipe.transformer_2, 'enable_adapters'):
+                    pipe.transformer_2.enable_adapters()
+            print(f"[LoRA] transformer_2 adapters active: {low_adapter_names} weights={low_adapter_weights}")
+        except Exception as e:
+            print(f"[LoRA] ERROR activating transformer_2 adapters {low_adapter_names}: {e}")
+
+    if loaded_count:
+        print(f"[LoRA] {loaded_count} LoRA(s) loaded and activated successfully.")
 
 
 def apply_lora_prompt_modifications(base_prompt, selected_loras_info):
@@ -860,7 +1005,168 @@ wan_pipe = None
 _wan_loaded = False
 _wan_scheduler_config = None
 
-# Track current input image path to exclude from clear_storage
+# Track current input image path(s) to exclude from clear_storage.
+# NOTE: a single overwritten global is not safe once multiple images (reference
+# + end frame + sequence slots) or concurrent generations are involved, so we
+# also keep a thread-safe SET of every path that is currently "live" in an
+# input widget. clear_storage() consults this set in addition to the legacy
+# single-path variable below (kept for backwards compatibility).
+_protected_image_paths = set()
+_protected_paths_lock = threading.Lock()
+
+# Paths that are *currently being used by an in-flight generation*.
+# generate_video() (and sequence equivalents) add paths here at the START of
+# a run and remove them when the run finishes or errors.  The widget-change
+# tracker (_make_image_tracker) must not unprotect a path that is still in
+# this set — otherwise replacing an input image mid-generation would
+# immediately expose the file the running job is reading.
+_generation_active_paths = set()
+_generation_active_lock = threading.Lock()
+
+
+def _generation_protect(path):
+    """Pin a path as in-use by a running generation."""
+    if not path:
+        return
+    try:
+        p = str(path)
+        with _generation_active_lock:
+            _generation_active_paths.add(p)
+        _protect_path(p)          # also in the general set
+    except Exception:
+        pass
+
+
+def _generation_release(path):
+    """Release a path from the generation-active set (generation done/error)."""
+    if not path:
+        return
+    try:
+        p = str(path)
+        with _generation_active_lock:
+            _generation_active_paths.discard(p)
+        # Only unprotect from the general set if the widget is no longer
+        # pointing at this file either.  We leave the general set alone here
+        # and let the widget tracker clean it up on the next change event.
+    except Exception:
+        pass
+
+
+def _is_generation_active(path) -> bool:
+    """True if path is currently held by a running generation."""
+    if not path:
+        return False
+    try:
+        p = str(path)
+        with _generation_active_lock:
+            return p in _generation_active_paths
+    except Exception:
+        return False
+
+
+# Additional set of protected *filenames* (basenames only).
+# protect_current_inputs() populates this before each automatic clear so that
+# even if the full path lookup misses (e.g. Gradio moved the file), anything
+# whose filename matches the current first-frame or last-frame is never deleted.
+_protected_image_filenames = set()
+_protected_filenames_lock = threading.Lock()
+
+
+def _protect_filename(path):
+    """Register the basename of path as protected from clear_storage()."""
+    if not path:
+        return
+    try:
+        name = os.path.basename(str(path))
+        if name:
+            with _protected_filenames_lock:
+                _protected_image_filenames.add(name)
+    except Exception:
+        pass
+
+
+def _unprotect_filename(path):
+    """Remove the basename of path from the protected-filenames set."""
+    if not path:
+        return
+    try:
+        name = os.path.basename(str(path))
+        if name:
+            with _protected_filenames_lock:
+                _protected_image_filenames.discard(name)
+    except Exception:
+        pass
+
+
+def _is_filename_protected(item_path) -> bool:
+    """True if the item's basename is in the protected-filenames set."""
+    try:
+        name = os.path.basename(str(item_path))
+        with _protected_filenames_lock:
+            return name in _protected_image_filenames
+    except Exception:
+        return False
+
+
+def _protect_path(path):
+    """Mark a filesystem path as protected from clear_storage()."""
+    if not path:
+        return
+    try:
+        p = str(path)
+    except Exception:
+        return
+    with _protected_paths_lock:
+        _protected_image_paths.add(p)
+
+
+def _unprotect_path(path):
+    """Remove a path from the protected set (safe no-op if absent)."""
+    if not path:
+        return
+    try:
+        p = str(path)
+    except Exception:
+        return
+    with _protected_paths_lock:
+        _protected_image_paths.discard(p)
+
+
+def _is_protected(item_path) -> bool:
+    """True if item_path is, or contains, a currently-protected input image.
+
+    Two layers of protection:
+    1. Full-path set: _protected_image_paths (and legacy _current_input_image_path).
+    2. Filename set: _protected_image_filenames — any item whose *basename*
+       matches a currently-live first-frame or last-frame filename is skipped,
+       even if the full path lookup misses (e.g. Gradio moved/renamed the file).
+    """
+    # Layer 2: filename-based protection (fast, checked first)
+    if _is_filename_protected(item_path):
+        return True
+
+    # Layer 1: full-path protection
+    item_path = Path(item_path)
+    with _protected_paths_lock:
+        protected_now = set(_protected_image_paths)
+    if _current_input_image_path:
+        protected_now.add(_current_input_image_path)
+    for p in protected_now:
+        if not p:
+            continue
+        protected_path = Path(p)
+        if item_path == protected_path:
+            return True
+        if item_path.is_dir():
+            try:
+                protected_path.relative_to(item_path)
+                return True
+            except ValueError:
+                pass
+    return False
+
+
+
 _current_input_image_path = None
 
 
@@ -1078,7 +1384,11 @@ MODE_KEEP = "Keep original scene"
 MODE_REPLACE = "Replace background / environment"
 MODE_CUSTOM = "Custom edit instruction"
 MODE_AUTORUN = "Autorun"
-SCENE_MODES = [MODE_KEEP, MODE_REPLACE, MODE_CUSTOM, MODE_AUTORUN]
+MODE_SEQUENCE = "Sequence"
+MODE_CUSTOM_SEQ = "Custom edit sequence"
+SCENE_MODES = [MODE_KEEP, MODE_REPLACE, MODE_CUSTOM, MODE_AUTORUN, MODE_SEQUENCE, MODE_CUSTOM_SEQ]
+SEQUENCE_MAX_SLOTS = 10
+CUSTOM_SEQ_MAX_SLOTS = 10
 
 AUTORUN_DIR = Path(SCRIPT_DIR) / "autorun"
 AUTORUN_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -1179,8 +1489,8 @@ def edit_reference_frame(
     Returns the image untouched in keep-scene mode, so nothing is repainted and
     the original background and bodies survive exactly as shot.
     """
-    if mode in (MODE_KEEP, MODE_AUTORUN):
-        print("[1/2] Keep/Autorun-scene mode  reference frame used as-is.")
+    if mode in (MODE_KEEP, MODE_AUTORUN, MODE_SEQUENCE, MODE_CUSTOM_SEQ):
+        print("[1/2] Keep/Autorun/Sequence/CustomSeq mode  reference frame used as-is.")
         return image
 
     # Both MODE_REPLACE and MODE_CUSTOM now use the motion prompt
@@ -1233,23 +1543,45 @@ def animate_frame(
 ):
     """Stage 2  animate a frame with WAMU v2 merged model."""
     activate_wan()
-    
-    # Load LoRAs if any are selected
+
+    # Determine which LoRAs are actually enabled (checkbox True).
+    # lora_selections is always a dict (possibly all-False), never None when
+    # checkboxes exist — check the VALUES, not the dict itself.
+    selected = {}
     if lora_selections:
         selected = {k: v for k, v in AVAILABLE_LORAS.items() if lora_selections.get(k, False)}
-        if selected:
-            load_loras_to_pipeline(wan_pipe, selected)
-            
-            # Apply trigger prompt modifications
-            if selected_loras_info:
-                original_prompt = prompt
-                prompt = apply_lora_prompt_modifications(prompt, selected_loras_info)
-                if prompt != original_prompt:
-                    pass
-        
-    else:
-        # No LoRAs selected, make sure any previous LoRAs are unloaded
-        load_loras_to_pipeline(wan_pipe, {})
+
+    # Only reload LoRAs when the active set has changed, or when the adapters
+    # are not actually present on the transformer (e.g. after a pipeline swap).
+    currently_active = set(_active_loras.keys())
+    desired_active   = set(selected.keys())
+
+    def _adapters_actually_loaded():
+        """Check that at least one expected adapter is present on the transformer."""
+        if not desired_active or wan_pipe is None:
+            return True  # nothing to check
+        try:
+            peft_cfg = getattr(wan_pipe.transformer, 'peft_config', {})
+            if peft_cfg:
+                loaded_names = set(peft_cfg.keys())
+                # At least one desired adapter should be present
+                return any(
+                    f"{n}_high" in loaded_names or f"{n}_low" in loaded_names
+                    for n in desired_active
+                )
+        except Exception:
+            pass
+        return False  # can't verify → force reload
+
+    if currently_active != desired_active or (desired_active and not _adapters_actually_loaded()):
+        load_loras_to_pipeline(wan_pipe, selected)
+
+    # Apply trigger-prompt modifications from all enabled LoRAs.
+    if selected and selected_loras_info:
+        original_prompt = prompt
+        prompt = apply_lora_prompt_modifications(prompt, selected_loras_info)
+        if prompt != original_prompt:
+            print(f"[LoRA] Prompt modified: ...{prompt[-80:]}")
 
     # Use provided wan_steps, or fall back to WAN_STEPS constant
     steps = wan_steps if wan_steps is not None else WAN_STEPS
@@ -1322,6 +1654,59 @@ def _last_frame_of(video_path: str):
     if not ret:
         return None
     return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+
+# In-memory-only cache of the final frame of the most recently generated
+# video. Populated by _cache_last_frame_from_video() as a .then() step
+# right after generation finishes -- BEFORE the auto storage-clear chain
+# deletes the video file -- and consumed by the "Last Frame from Video"
+# button. This is a plain PIL Image held in a process-global; it is
+# deliberately never written to disk by this code, so it survives the
+# auto-clear even though nothing backs it on the filesystem, and it's
+# simply gone (reset to None) on process restart.
+_last_generated_frame = None
+_last_generated_frame_lock = threading.Lock()
+
+
+def _cache_last_frame_from_video(video_file):
+    """Grab the last frame of the just-generated video into memory only.
+
+    Wired as a .then() step immediately after every generate call (normal
+    generate, Push Autorun, Sequence, Custom Edit Sequence -- all of them
+    route through the same video_file output), so it runs before the
+    later .then(clear_storage) step deletes the video. Reads the frame
+    with _last_frame_of() and stores a copy of the resulting PIL Image in
+    the module-level cache above. Nothing is written to disk here.
+    """
+    global _last_generated_frame
+    path = video_file if isinstance(video_file, str) else None
+    if not path or not os.path.exists(path):
+        return
+    try:
+        frame = _last_frame_of(path)
+    except Exception as e:
+        print(f"Could not cache last frame from video: {e}")
+        frame = None
+    if frame is not None:
+        with _last_generated_frame_lock:
+            _last_generated_frame = frame.copy()
+
+
+def _use_last_generated_frame():
+    """Hand the in-memory cached last frame to the Reference Photo widget.
+
+    Reads only the in-memory cache populated by
+    _cache_last_frame_from_video() -- no disk access happens here. If
+    nothing has been generated yet this session (or the process was
+    restarted since), the cache is empty and the current Reference Photo
+    is left untouched.
+    """
+    with _last_generated_frame_lock:
+        frame = _last_generated_frame
+    if frame is None:
+        gr.Warning("No generated video yet this session -- generate a video first.")
+        return gr.update()
+    return frame.copy()
 
 
 def generate_with_preset(prompt_dict, choice, reference_image, scene_mode,
@@ -1442,7 +1827,7 @@ def generate_video(
     export_quality=7,
     seed=42,
     randomize_seed=True,
-    add_audio_cb=False,
+    add_audio_cb=True,
     audio_prompt_tb="realistic female breathing that matches the woman's movements and actions in video",
     negative_prompt=None,
     edit_steps=4,
@@ -1480,20 +1865,38 @@ def generate_video(
         if lora_settings_msg:
             pass
     
-    # Track the current input image path if it's a filepath (for clear_storage exclusion)
+    # Track the current input image path if it's a filepath (for clear_storage exclusion).
+    # _generation_protect() adds to both the general protected set AND the
+    # generation-active set, so a widget change mid-run cannot strip protection.
     if isinstance(reference_image, str):
         _current_input_image_path = reference_image
     elif hasattr(reference_image, 'filename'):
         _current_input_image_path = reference_image.filename
     else:
         _current_input_image_path = None
-    
+    _generation_protect(_current_input_image_path)
+
+    # Also protect the end/last frame image for the whole run.
+    _end_image_protect_path = None
+    if isinstance(end_image, str):
+        _end_image_protect_path = end_image
+    elif hasattr(end_image, 'filename'):
+        _end_image_protect_path = end_image.filename
+    _generation_protect(_end_image_protect_path)
+
     # Gradio can hand back "" instead of None for an untouched optional image
     # component  normalize both reference_image and end_image so a stray
     # empty string never reaches PIL-only code (that's what caused
     # `'str' object has no attribute 'size'` on end_image).
-    reference_image = _ensure_pil(reference_image)
-    end_image = _ensure_pil(end_image)
+    # Any failure while normalizing the inputs is converted to a clean
+    # gr.Error instead of an unhandled exception - an unhandled exception
+    # here previously left the reference/end-frame Image widgets stuck in an
+    # error state that only a full page refresh could clear.
+    try:
+        reference_image = _ensure_pil(reference_image)
+        end_image = _ensure_pil(end_image)
+    except Exception as e:
+        raise gr.Error(f"Could not read the input image(s): {e}")
 
     if reference_image is None:
         raise gr.Error("Please upload a reference photo.")
@@ -1545,7 +1948,9 @@ def generate_video(
             current_seed, edit_steps, edit_guidance,
         )
 
-        # End-frame conditioning applies to the first segment only.
+        # End-frame conditioning must land on the FINAL segment so the very
+        # last frame of the (possibly chained) output is the user's supplied
+        # end image, no matter how many ~6.1s segments the duration requires.
         processed_end = None
         if end_image is not None:
             processed_end = resize_and_crop_to_match(end_image, start_frame)
@@ -1560,8 +1965,9 @@ def generate_video(
             seg_duration = min(remaining, SEGMENT_DURATION)
             num_frames = get_num_frames(seg_duration)
             seg_index += 1
+            is_last_segment = (remaining - seg_duration) <= 0.01
 
-            seg_end = processed_end if seg_index == 1 else None
+            seg_end = processed_end if is_last_segment else None
             if progress:
                 progress(min(0.15 + 0.75 * (seg_index - 1) / max(1, int(duration_seconds / SEGMENT_DURATION + 1)), 0.90), desc=f"Generating segment {seg_index}")
             raw_frames = animate_frame(
@@ -1638,11 +2044,19 @@ def generate_video(
               f"seed {current_seed} -> {os.path.basename(final_path)}")
         if progress:
             progress(1.0, desc="Generation complete")
+        # Release generation-active pins so the widget tracker can clean up
+        # old paths if the user has already swapped the input images.
+        _generation_release(_current_input_image_path)
+        _generation_release(_end_image_protect_path)
         return final_path, final_path, gr.update(visible=False, value="")
 
     except gr.Error:
+        _generation_release(_current_input_image_path)
+        _generation_release(_end_image_protect_path)
         raise
     except Exception as e:
+        _generation_release(_current_input_image_path)
+        _generation_release(_end_image_protect_path)
         for p in segment_paths:
             try:
                 os.unlink(p)
@@ -1650,6 +2064,487 @@ def generate_video(
                 pass
         print(f"Generation error: {e}")
         raise gr.Error(f"Generation failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# SEQUENCE ORCHESTRATION  (chain N user-supplied images/prompts/durations
+# into one continuous mp4, each segment ending exactly on the next part's
+# starting image, chaining internally past SEGMENT_DURATION as needed)
+# ---------------------------------------------------------------------------
+
+def generate_sequence(
+    scene_images,
+    scene_prompts,
+    scene_durations,
+    resolution="480p",
+    frame_multiplier=16,
+    export_quality=7,
+    seed=42,
+    randomize_seed=True,
+    add_audio_cb=True,
+    audio_prompt_tb="realistic female breathing that matches the woman's movements and actions in video",
+    negative_prompt=None,
+    edit_steps=4,
+    edit_guidance=1.0,
+    flow_shift_auto=True,
+    flow_shift=None,
+    *lora_args,
+    progress=gr.Progress(track_tqdm=True),
+):
+    """
+    Sequence mode: up to SEQUENCE_MAX_SLOTS (image, prompt, duration) parts.
+    Each part is animated (chaining internally past SEGMENT_DURATION exactly
+    like normal generation) so that its FINAL segment ends on the NEXT part's
+    starting image - making that image both the last frame of the current
+    part and the first frame of the next part. All resulting segments across
+    every part are then concatenated into a single mp4.
+    """
+    global _current_input_image_path
+
+    lora_selections = {}
+    selected_loras_info = {}
+    if lora_args and len(lora_args) == len(AVAILABLE_LORAS):
+        for (lora_id, lora_info), is_enabled in zip(AVAILABLE_LORAS.items(), lora_args):
+            lora_selections[lora_id] = is_enabled
+            if is_enabled:
+                selected_loras_info[lora_id] = lora_info
+
+    if selected_loras_info:
+        edit_steps, flow_shift, _ = apply_lora_settings(
+            selected_loras_info, edit_steps, flow_shift, flow_shift_auto
+        )
+
+    if not negative_prompt or not str(negative_prompt).strip():
+        negative_prompt = default_negative_prompt
+
+    # ---- Gather + validate filled slots, protecting every slot image ----
+    slots = []
+    protected_slot_paths = []
+    for i in range(SEQUENCE_MAX_SLOTS):
+        raw = scene_images[i] if i < len(scene_images) else None
+        try:
+            img = _ensure_pil(raw)
+        except Exception as e:
+            raise gr.Error(f"Sequence part {i + 1}: could not read the image ({e})")
+        if img is None:
+            continue
+        slot_path = raw if isinstance(raw, str) else (getattr(raw, "filename", None))
+        if slot_path:
+            protected_slot_paths.append(slot_path)
+        prompt_i = (scene_prompts[i] if i < len(scene_prompts) else "") or ""
+        dur_i = float(scene_durations[i]) if i < len(scene_durations) and scene_durations[i] else 0.0
+        slots.append({"image": img, "prompt": prompt_i.strip(), "duration": dur_i})
+
+    for p in protected_slot_paths:
+        _generation_protect(p)   # generation-active pin (widget changes can't strip it)
+
+    if len(slots) < 1:
+        raise gr.Error("Add at least one image to the Sequence.")
+    for idx, s in enumerate(slots, start=1):
+        if not s["prompt"]:
+            raise gr.Error(f"Sequence part {idx}: please enter a prompt.")
+        if s["duration"] <= 0:
+            raise gr.Error(f"Sequence part {idx}: please set a duration greater than 0.")
+
+    current_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
+    started = time.time()
+    all_segment_paths = []
+
+    try:
+        n_slots = len(slots)
+        total_segments = sum(
+            max(1, math.ceil((s["duration"] - 0.01) / SEGMENT_DURATION)) for s in slots
+        )
+        seg_counter = 0
+
+        for slot_idx, slot in enumerate(slots):
+            if progress:
+                progress(min(0.05 + 0.9 * seg_counter / max(1, total_segments), 0.95),
+                          desc=f"Sequence part {slot_idx + 1}/{n_slots}: preparing frame")
+
+            # Same adaptive flow-shift rule as normal generation, evaluated
+            # per-part against that part's own duration.
+            if flow_shift_auto:
+                d = slot["duration"]
+                if d <= 6.0:
+                    slot_flow_shift = 6.9
+                elif d <= 10.0:
+                    slot_flow_shift = 5.5
+                elif d <= 20.0:
+                    slot_flow_shift = 4.5
+                else:
+                    slot_flow_shift = 4.0
+            else:
+                slot_flow_shift = flow_shift if flow_shift is not None else WAN_FLOW_SHIFT
+
+            sized = resize_image_for_wan(slot["image"], resolution)
+            start_frame = edit_reference_frame(
+                sized, MODE_SEQUENCE, slot["prompt"], current_seed, edit_steps, edit_guidance,
+            )
+
+            # This part's FINAL segment must end on the NEXT part's image -
+            # that is what makes the next part start from exactly that frame.
+            target_end = None
+            if slot_idx < n_slots - 1:
+                next_sized = resize_image_for_wan(slots[slot_idx + 1]["image"], resolution)
+                target_end = resize_and_crop_to_match(next_sized, start_frame)
+
+            remaining = float(slot["duration"])
+            current_frame = start_frame
+            seg_seed = current_seed
+            part_seg_index = 0
+
+            while remaining > 0.01:
+                seg_duration = min(remaining, SEGMENT_DURATION)
+                num_frames = get_num_frames(seg_duration)
+                part_seg_index += 1
+                seg_counter += 1
+                is_last_segment_of_part = (remaining - seg_duration) <= 0.01
+                seg_end = target_end if is_last_segment_of_part else None
+
+                if progress:
+                    progress(min(0.05 + 0.9 * seg_counter / max(1, total_segments), 0.97),
+                              desc=f"Sequence part {slot_idx + 1}/{n_slots}, segment {part_seg_index}")
+
+                raw_frames = animate_frame(
+                    current_frame, seg_end, slot["prompt"], negative_prompt,
+                    num_frames, seg_seed, slot_flow_shift, edit_steps,
+                    lora_selections, selected_loras_info, progress,
+                )
+
+                factor = max(1, int(frame_multiplier) // FIXED_FPS)
+                if factor > 1:
+                    seg_frames = interpolate_bits(raw_frames, multiplier=factor)
+                else:
+                    seg_frames = list(raw_frames)
+                seg_fps = FIXED_FPS * factor
+
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                    seg_path = f.name
+                export_to_video(seg_frames, seg_path, fps=seg_fps, quality=int(export_quality))
+                all_segment_paths.append(seg_path)
+                print(f"Sequence part {slot_idx + 1}/{n_slots} segment {part_seg_index} "
+                      f"complete ({seg_duration:.1f}s, {len(seg_frames)} frames @ {seg_fps} fps)")
+
+                remaining -= seg_duration
+                if remaining <= 0.01:
+                    break
+
+                # Mid-part chaining: continue from this segment's own tail
+                # frame (target_end only applies to the part's LAST segment).
+                nxt = _last_frame_of(seg_path)
+                if nxt is None:
+                    print("Could not read segment tail frame  stopping chain here.")
+                    break
+                current_frame = nxt
+                seg_seed = random.randint(0, MAX_SEED)
+
+        if not all_segment_paths:
+            raise gr.Error("No video segments were produced.")
+
+        if len(all_segment_paths) > 1:
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                final_path = f.name
+            concatenate_videos(all_segment_paths, final_path)
+            for p in all_segment_paths:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+        else:
+            final_path = all_segment_paths[0]
+
+        total_duration = sum(s["duration"] for s in slots)
+        if add_audio_cb and _MMAUDIO_AVAILABLE:
+            try:
+                final_path = add_audio_to_video(final_path, audio_prompt_tb, float(total_duration))
+            except Exception as e:
+                print(f"MMAudio error: {e}")
+
+        named_path = unique_output_path("vidgen_sequence", ".mp4")
+        try:
+            shutil.move(final_path, named_path)
+            final_path = str(named_path)
+        except Exception as e:
+            print(f"Could not rename output ({e})  serving original path.")
+
+        print(f"Sequence done in {time.time() - started:.1f}s  {n_slots} part(s) -> "
+              f"{os.path.basename(final_path)}")
+        if progress:
+            progress(1.0, desc="Sequence generation complete")
+        for p in protected_slot_paths:
+            _generation_release(p)
+        return final_path, final_path, gr.update(visible=False, value="")
+
+    except gr.Error:
+        for p in protected_slot_paths:
+            _generation_release(p)
+        raise
+    except Exception as e:
+        for p in protected_slot_paths:
+            _generation_release(p)
+        for p in all_segment_paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        print(f"Sequence generation error: {e}")
+        raise gr.Error(f"Sequence generation failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# CUSTOM EDIT SEQUENCE ORCHESTRATION
+#
+# Uses a single reference image (from the main image box). For each segment:
+#   1. Runs picgen (Qwen) with the current first image + picgen_prompt to
+#      generate the segment's last image.
+#   2. Runs vidgen (Wan) with current first image -> generated last image,
+#      using the segment's motion prompt and duration.
+# The last image of each segment becomes the first image of the next.
+# All segments are concatenated into one mp4.
+# ---------------------------------------------------------------------------
+
+def generate_custom_edit_sequence(
+    reference_image,
+    cs_motion_prompts,
+    cs_picgen_prompts,
+    cs_durations,
+    resolution="480p",
+    frame_multiplier=16,
+    export_quality=7,
+    seed=42,
+    randomize_seed=True,
+    add_audio_cb=True,
+    audio_prompt_tb="realistic female breathing that matches the woman's movements and actions in video",
+    negative_prompt=None,
+    edit_steps=4,
+    edit_guidance=1.0,
+    flow_shift_auto=True,
+    flow_shift=None,
+    *lora_args,
+    progress=gr.Progress(track_tqdm=True),
+):
+    """
+    Custom Edit Sequence: single starting image, N segments each with a
+    motion prompt (for vidgen), a picgen prompt (to generate the last frame),
+    and a duration. Each segment's generated last frame becomes the next
+    segment's first frame.
+    """
+    global _current_input_image_path
+
+    lora_selections = {}
+    selected_loras_info = {}
+    if lora_args and len(lora_args) == len(AVAILABLE_LORAS):
+        for (lora_id, lora_info), is_enabled in zip(AVAILABLE_LORAS.items(), lora_args):
+            lora_selections[lora_id] = is_enabled
+            if is_enabled:
+                selected_loras_info[lora_id] = lora_info
+
+    if selected_loras_info:
+        edit_steps, flow_shift, _ = apply_lora_settings(
+            selected_loras_info, edit_steps, flow_shift, flow_shift_auto
+        )
+
+    if not negative_prompt or not str(negative_prompt).strip():
+        negative_prompt = default_negative_prompt
+
+    # Protect the reference image
+    if isinstance(reference_image, str):
+        _current_input_image_path = reference_image
+    elif hasattr(reference_image, 'filename'):
+        _current_input_image_path = getattr(reference_image, 'filename', None)
+    else:
+        _current_input_image_path = None
+    _protect_path(_current_input_image_path)
+
+    try:
+        first_image = _ensure_pil(reference_image)
+    except Exception as e:
+        raise gr.Error(f"Could not read the reference image: {e}")
+    if first_image is None:
+        raise gr.Error("Please upload a reference photo.")
+
+    # Gather filled slots
+    slots = []
+    for i in range(CUSTOM_SEQ_MAX_SLOTS):
+        motion_p = cs_motion_prompts[i].strip() if i < len(cs_motion_prompts) else ""
+        picgen_p = cs_picgen_prompts[i].strip() if i < len(cs_picgen_prompts) else ""
+        dur = cs_durations[i] if i < len(cs_durations) else 0.0
+        if not motion_p and not picgen_p:
+            continue
+        if not motion_p:
+            raise gr.Error(f"Custom edit sequence segment {i+1}: please enter a motion prompt.")
+        if not picgen_p:
+            raise gr.Error(f"Custom edit sequence segment {i+1}: please enter a picgen (last image) prompt.")
+        if dur <= 0:
+            raise gr.Error(f"Custom edit sequence segment {i+1}: please set a duration greater than 0.")
+        slots.append({"motion": motion_p, "picgen": picgen_p, "duration": dur})
+
+    if not slots:
+        raise gr.Error("Add at least one segment to the Custom Edit Sequence.")
+
+    current_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
+    started = time.time()
+    all_segment_paths = []
+    n_slots = len(slots)
+    total_segments = sum(
+        max(1, math.ceil((s["duration"] - 0.01) / SEGMENT_DURATION)) for s in slots
+    )
+    seg_counter = 0
+
+    current_first = first_image
+
+    try:
+        for slot_idx, slot in enumerate(slots):
+            if progress:
+                progress(
+                    min(0.05 + 0.9 * seg_counter / max(1, total_segments), 0.92),
+                    desc=f"Custom seq segment {slot_idx + 1}/{n_slots}: generating last frame with picgen"
+                )
+
+            # ---- Step 1: generate the last frame via picgen ----
+            sized_first = resize_image_for_wan(current_first, resolution)
+            activate_pic()
+            torch.cuda.set_device(PIC_DEVICE)
+            pic_generator = torch.Generator(device=PIC_DEVICE).manual_seed(current_seed)
+            try:
+                with torch.cuda.device(PIC_DEVICE):
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        pic_result = pic_pipe(
+                            image=[current_first],
+                            prompt=slot["picgen"],
+                            negative_prompt=" ",
+                            num_inference_steps=int(edit_steps),
+                            true_cfg_scale=float(edit_guidance),
+                            generator=pic_generator,
+                        )
+                generated_last = pic_result.images[0]
+            except Exception as e:
+                raise gr.Error(f"Custom edit sequence segment {slot_idx + 1}: picgen failed: {e}")
+
+            # Resize last frame to match the first frame dimensions
+            processed_end = resize_and_crop_to_match(generated_last, sized_first)
+
+            # ---- Step 2: animate with vidgen ----
+            if progress:
+                progress(
+                    min(0.05 + 0.9 * (seg_counter + 0.5) / max(1, total_segments), 0.95),
+                    desc=f"Custom seq segment {slot_idx + 1}/{n_slots}: animating"
+                )
+
+            # Adaptive flow shift
+            if flow_shift_auto:
+                d = slot["duration"]
+                if d <= 6.0:
+                    slot_flow_shift = 6.9
+                elif d <= 10.0:
+                    slot_flow_shift = 5.5
+                elif d <= 20.0:
+                    slot_flow_shift = 4.5
+                else:
+                    slot_flow_shift = 4.0
+            else:
+                slot_flow_shift = flow_shift if flow_shift is not None else WAN_FLOW_SHIFT
+
+            remaining = float(slot["duration"])
+            current_frame = sized_first
+            seg_seed = current_seed
+            part_seg_index = 0
+
+            while remaining > 0.01:
+                seg_duration = min(remaining, SEGMENT_DURATION)
+                num_frames = get_num_frames(seg_duration)
+                part_seg_index += 1
+                seg_counter += 1
+                is_last_segment_of_part = (remaining - seg_duration) <= 0.01
+                seg_end = processed_end if is_last_segment_of_part else None
+
+                if progress:
+                    progress(
+                        min(0.05 + 0.9 * seg_counter / max(1, total_segments), 0.97),
+                        desc=f"Custom seq {slot_idx + 1}/{n_slots}, vidgen seg {part_seg_index}"
+                    )
+
+                raw_frames = animate_frame(
+                    current_frame, seg_end, slot["motion"], negative_prompt,
+                    num_frames, seg_seed, slot_flow_shift, edit_steps,
+                    lora_selections, selected_loras_info, progress,
+                )
+
+                factor = max(1, int(frame_multiplier) // FIXED_FPS)
+                if factor > 1:
+                    seg_frames = interpolate_bits(raw_frames, multiplier=factor)
+                else:
+                    seg_frames = list(raw_frames)
+                seg_fps = FIXED_FPS * factor
+
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                    seg_path = f.name
+                export_to_video(seg_frames, seg_path, fps=seg_fps, quality=int(export_quality))
+                all_segment_paths.append(seg_path)
+                print(f"Custom seq {slot_idx + 1}/{n_slots} vidgen seg {part_seg_index} "
+                      f"complete ({seg_duration:.1f}s, {len(seg_frames)} frames @ {seg_fps} fps)")
+
+                remaining -= seg_duration
+                if remaining <= 0.01:
+                    break
+
+                nxt = _last_frame_of(seg_path)
+                if nxt is None:
+                    print("Could not read segment tail frame — stopping chain here.")
+                    break
+                current_frame = nxt
+                seg_seed = random.randint(0, MAX_SEED)
+
+            # The generated last frame becomes the next segment's first frame
+            current_first = generated_last
+            current_seed = random.randint(0, MAX_SEED)
+
+        if not all_segment_paths:
+            raise gr.Error("No video segments were produced.")
+
+        if len(all_segment_paths) > 1:
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                final_path = f.name
+            concatenate_videos(all_segment_paths, final_path)
+            for p in all_segment_paths:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+        else:
+            final_path = all_segment_paths[0]
+
+        total_duration = sum(s["duration"] for s in slots)
+        if add_audio_cb and _MMAUDIO_AVAILABLE:
+            try:
+                final_path = add_audio_to_video(final_path, audio_prompt_tb, float(total_duration))
+            except Exception as e:
+                print(f"MMAudio error: {e}")
+
+        named_path = unique_output_path("vidgen_custom_seq", ".mp4")
+        try:
+            shutil.move(final_path, named_path)
+            final_path = str(named_path)
+        except Exception as e:
+            print(f"Could not rename output ({e}) — serving original path.")
+
+        print(f"Custom edit sequence done in {time.time() - started:.1f}s — "
+              f"{n_slots} segment(s) -> {os.path.basename(final_path)}")
+        if progress:
+            progress(1.0, desc="Custom edit sequence complete")
+        return final_path, final_path, gr.update(visible=False, value="")
+
+    except gr.Error:
+        raise
+    except Exception as e:
+        for p in all_segment_paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        print(f"Custom edit sequence error: {e}")
+        raise gr.Error(f"Custom edit sequence failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1754,7 +2649,7 @@ def autorun_generate(
             _current_input_image_path = video_path   # protect from deletion
             time.sleep(5)                             # let browser fetch the file
             _current_input_image_path = str(img_path)  # restore to next input
-            clear_storage()        # wipe tmp/gradio + outputs so VPS stays clean
+            _do_clear_storage()    # wipe tmp/gradio + outputs so VPS stays clean
 
 
 # ---------------------------------------------------------------------------
@@ -2309,6 +3204,177 @@ def b64_to_pil_list(b64_json_str):
             if img is not None:
                 pil_images.append(img)
         return pil_images
+
+
+def _do_clear_storage():
+    """
+    Module-level storage clear helper called by infer_with_preclear(),
+    autorun_generate(), and autorun_push_generate() — all module-level
+    functions that cannot reach the Gradio-scoped clear_storage() closure.
+
+    Mirrors clear_storage() exactly:
+      - tmp/gradio entries (skipping vibe_edit_history and protected paths)
+      - loose files in tmp root (skipping the gradio subdir and protected paths)
+      - additional find/rm sweep for stray .mp4 files in tmp
+      - outputs/images contents
+      - outputs/videos contents
+
+    Returns the count of successfully deleted items.
+    """
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    deleted = []
+
+    # 1. tmp/gradio — same three candidate paths as clear_storage()
+    for gradio_dir in [
+        Path.cwd() / "tmp" / "gradio",
+        Path(SCRIPT_DIR) / "tmp" / "gradio",
+        Path("/root/newgen/tmp/gradio"),
+    ]:
+        if gradio_dir.exists():
+            for item in gradio_dir.iterdir():
+                if item.name == "vibe_edit_history":
+                    continue
+                if _is_protected(item):
+                    continue
+                try:
+                    removed = False
+                    if item.is_dir():
+                        try:
+                            _shutil.rmtree(item)
+                            removed = True
+                        except Exception:
+                            result = _subprocess.run(["rm", "-rf", str(item)], capture_output=True)
+                            removed = result.returncode == 0
+                    else:
+                        try:
+                            item.unlink()
+                            removed = True
+                        except Exception:
+                            result = _subprocess.run(["rm", "-f", str(item)], capture_output=True)
+                            removed = result.returncode == 0
+                    if removed:
+                        deleted.append(str(item))
+                except Exception:
+                    pass
+            break  # only process the first found directory
+
+    # 2. Loose files in tmp root (mp4s etc.) — skip gradio subdir and other dirs
+    for tmp_dir in [Path.cwd() / "tmp", Path(SCRIPT_DIR) / "tmp", Path("/root/newgen/tmp")]:
+        if tmp_dir.exists():
+            for item in tmp_dir.iterdir():
+                if item.is_dir() and item.name == "gradio":
+                    continue
+                if item.is_dir():
+                    continue
+                if _is_protected(item):
+                    continue
+                try:
+                    removed = False
+                    try:
+                        item.unlink()
+                        removed = True
+                    except Exception:
+                        result = _subprocess.run(["rm", "-f", str(item)], capture_output=True)
+                        removed = result.returncode == 0
+                    if removed:
+                        deleted.append(str(item))
+                except Exception:
+                    pass
+            break
+
+    # 3. Additional backup: force-delete stray .mp4 files via find (mirrors clear_storage)
+    for tmp_dir in [Path.cwd() / "tmp", Path(SCRIPT_DIR) / "tmp", Path("/root/newgen/tmp")]:
+        if tmp_dir.exists():
+            _subprocess.run(
+                ["find", str(tmp_dir), "-maxdepth", "1", "-name", "*.mp4", "-type", "f", "-delete"],
+                capture_output=True, check=False,
+            )
+            _subprocess.run(
+                f"rm -f {tmp_dir}/*.mp4 2>/dev/null || true",
+                shell=True, check=False,
+            )
+            break
+
+    # 4. outputs/images — delete contents, keep folder
+    for images_dir in [IMAGE_OUTPUT_DIR, Path.cwd() / "outputs" / "images", Path("/root/newgen/outputs/images")]:
+        if images_dir.exists():
+            for item in images_dir.iterdir():
+                if _is_protected(item):
+                    continue
+                try:
+                    if item.is_dir():
+                        try:
+                            _shutil.rmtree(item)
+                        except Exception:
+                            _subprocess.run(["rm", "-rf", str(item)], check=False)
+                    else:
+                        try:
+                            item.unlink()
+                        except Exception:
+                            _subprocess.run(["rm", "-f", str(item)], check=False)
+                    deleted.append(str(item))
+                except Exception:
+                    pass
+            break
+
+    # 5. outputs/videos — delete contents, keep folder
+    for videos_dir in [VIDEO_OUTPUT_DIR, Path.cwd() / "outputs" / "videos", Path("/root/newgen/outputs/videos")]:
+        if videos_dir.exists():
+            for item in videos_dir.iterdir():
+                try:
+                    if item.is_dir():
+                        try:
+                            _shutil.rmtree(item)
+                        except Exception:
+                            _subprocess.run(["rm", "-rf", str(item)], check=False)
+                    else:
+                        try:
+                            item.unlink()
+                        except Exception:
+                            _subprocess.run(["rm", "-f", str(item)], check=False)
+                    deleted.append(str(item))
+                except Exception:
+                    pass
+            break
+
+    return len(deleted)
+
+
+def infer_with_preclear(
+    images_b64_json,
+    prompt,
+    negative_prompt=" ",
+    seed=42,
+    randomize_seed=False,
+    true_guidance_scale=1.0,
+    num_inference_steps=4,
+    height=None,
+    width=None,
+    num_images_per_prompt=1,
+    progress=gr.Progress(track_tqdm=True),
+):
+    """
+    Wrapper around infer() that clears storage (tmp/gradio + outputs) before
+    running generation, while preserving any input images currently loaded in
+    the picgen gallery (they are in-memory base64 in the browser and are NOT
+    on-disk files that need protecting, so the clear is safe).
+    """
+    # Clear storage before starting — delegates to the module-level helper
+    # which uses the correct TMPDIR (/root/newgen/tmp/gradio) and the same
+    # path logic as the Gradio-scoped clear_storage() button handler.
+    try:
+        n = _do_clear_storage()
+        print(f"[picgen pre-clear] cleared {n} item(s)")
+    except Exception as _e:
+        print(f"[picgen pre-clear] storage clear failed (non-fatal): {_e}")
+
+    return infer(
+        images_b64_json, prompt, negative_prompt, seed, randomize_seed,
+        true_guidance_scale, num_inference_steps, height, width,
+        num_images_per_prompt, progress,
+    )
 
 
 def infer(
@@ -2906,7 +3972,7 @@ def autorun_push_generate(
         # The video bytes are already in memory (_push_pending_video) so deleting
         # the file on disk is safe.
         time.sleep(1)
-        clear_storage()
+        _do_clear_storage()
         print(f"[AutorunPush] storage cleared after #{completed} — waiting for /autorun/ready")
 
         # Wait for the feeder to POST /autorun/ready (after confirming the local
@@ -2929,6 +3995,51 @@ with gr.Blocks(css=css) as demo:
         gr.HTML("<div style='flex:1'></div>")  # spacer pushes button right
         clear_storage_btn = gr.Button("Clear Storage", variant="secondary", size="sm", scale=0)
     clear_storage_status = gr.Textbox(visible=False, label="")
+
+    def protect_current_inputs(reference_image, end_image, *sequence_images):
+        """Explicit pre-clear protection step for the automatic storage clear.
+
+        Runs as a .then() step BEFORE clear_storage() in the generate/download
+        chains: reads the first frame (reference), last frame (end), and any
+        Sequence-mode slot images currently loaded in the input widgets, and
+        registers their on-disk paths in the protected set so the full
+        storage wipe that follows cannot delete them out from under the
+        widgets. The previous per-generation protection (inside
+        generate_video) only covered images of the run in flight; this step
+        additionally covers the widgets' *current* inputs at clear time.
+
+        Two protection layers are applied:
+          1. Full path registered in _protected_image_paths (existing behaviour).
+          2. Basename registered in _protected_image_filenames so that even if
+             Gradio has moved or re-indexed the file, anything sharing the same
+             filename is guaranteed to survive the clear.
+
+        Accepts the same image component values Gradio hands to change
+        handlers: None, "", filepath str, or objects with .name/.filename.
+        """
+
+        def _path_of(img):
+            if img is None or img == "":
+                return None
+            if isinstance(img, str):
+                return img
+            for attr in ("name", "filename"):
+                v = getattr(img, attr, None)
+                if isinstance(v, str) and v:
+                    return v
+            return None
+
+        # Reset the filename-protection set fresh each time so stale names
+        # from a previous generation don't pile up and over-protect.
+        with _protected_filenames_lock:
+            _protected_image_filenames.clear()
+
+        for img in (reference_image, end_image, *sequence_images):
+            p = _path_of(img)
+            if p:
+                _protect_path(p)
+                _protect_filename(p)  # layer 2: basename protection
+        return None
 
     def clear_storage():
         """Delete all generated files  same as running clear.sh."""
@@ -2957,27 +4068,11 @@ with gr.Blocks(css=css) as demo:
                     if item.name == "vibe_edit_history":
                         continue
                     
-                    # Check if we should skip this item (file or directory)
-                    should_skip = False
-                    
-                    if _current_input_image_path:
-                        protected_path = Path(_current_input_image_path)
-                        
-                        # Skip if this IS the protected file
-                        if item == protected_path:
-                            should_skip = True
-                        
-                        # Skip if this directory CONTAINS the protected file
-                        elif item.is_dir():
-                            try:
-                                # Check if protected path is inside this directory
-                                protected_path.relative_to(item)
-                                should_skip = True
-                            except ValueError:
-                                # Not a parent directory, can delete
-                                pass
-                    
-                    if should_skip:
+                    # Check if we should skip this item (file or directory) -
+                    # protects the reference image, end frame, AND any
+                    # Sequence-mode slot images that are currently loaded in
+                    # an input widget (across all in-flight generations).
+                    if _is_protected(item):
                         continue
                     
                     try:
@@ -3016,8 +4111,8 @@ with gr.Blocks(css=css) as demo:
                     if item.is_dir():
                         continue
                     
-                    # Skip current input image
-                    if _current_input_image_path and str(item) in str(_current_input_image_path):
+                    # Skip current input image(s)
+                    if _is_protected(item):
                         continue
                     
                     # Delete ALL loose files (including .mp4, .png, etc)
@@ -3129,6 +4224,9 @@ with gr.Blocks(css=css) as demo:
                         type="filepath",
                         elem_id="vidgen-reference",
                     )
+                    last_frame_from_video_btn = gr.Button(
+                        "Last Frame from Video", size="sm",
+                    )
                     vid_prompt = gr.Textbox(
                         label="Motion & Scene Prompt",
                         value=default_video_prompt,
@@ -3151,7 +4249,13 @@ with gr.Blocks(css=css) as demo:
                             "identical. Replace = new environment with motion prompt. "
                             "Custom = motion prompt applied as direct edit instruction. "
                             "Autorun = process all images in the 'autorun' folder "
-                            "sequentially using the current prompt and settings."
+                            "sequentially using the current prompt and settings. "
+                            "Sequence = chain up to 10 of your own image/prompt/duration "
+                            "parts into one continuous video. "
+                            "Custom Edit Sequence = single reference photo, N segments each "
+                            "with a picgen prompt (Qwen generates the last frame) and a "
+                            "motion prompt (Wan animates from current to generated frame); "
+                            "uses Generation Steps and Frame-Edit Guidance sliders."
                         ),
                     )
 
@@ -3172,6 +4276,24 @@ with gr.Blocks(css=css) as demo:
                                 label="Flow Shift",
                                 info="Lower = better prompt. Higher = more motion.",
                                 interactive=False,
+                            )
+
+                    # Quick duration presets -- one click sets the slider
+                    # straight to that value, no dragging required.
+                    def _make_duration_setter(value):
+                        def _set_duration():
+                            return gr.update(value=value)
+                        return _set_duration
+
+                    with gr.Row():
+                        for _dur_preset in (3.5, 6, 12, 18, 24, 30):
+                            _dur_btn = gr.Button(
+                                str(_dur_preset), size="sm", min_width=40,
+                            )
+                            _dur_btn.click(
+                                fn=_make_duration_setter(_dur_preset),
+                                inputs=[],
+                                outputs=[duration_seconds],
                             )
                     
                     # Steps slider - auto-updates based on selected LoRAs
@@ -3196,7 +4318,7 @@ with gr.Blocks(css=css) as demo:
                     )
 
                     with gr.Row():
-                        add_audio_cb = gr.Checkbox(label="Add Audio (MMAudio)", value=False)
+                        add_audio_cb = gr.Checkbox(label="Add Audio (MMAudio)", value=True)
                         audio_prompt_tb = gr.Textbox(
                             label="Audio Prompt", value="realistic female breathing that matches the woman's movements and actions in video",
                         )
@@ -3290,10 +4412,105 @@ with gr.Blocks(css=css) as demo:
                         )
                     
                     end_image = gr.Image(
-                        label="End Frame (optional, first segment only)",
-                        type="pil",
+                        label="End Frame (optional - used as the true last frame, "
+                              "even when the duration requires chaining multiple segments)",
+                        type="filepath",
                         elem_id="end-frame-image",
                     )
+                    use_last_as_first_btn = gr.Button(
+                        "Use as first frame",
+                        variant="secondary",
+                        size="sm",
+                        elem_id="use-last-as-first-btn",
+                    )
+
+            # ------------------------------------------------------------ #
+            #  SEQUENCE MODE  up to SEQUENCE_MAX_SLOTS (image, prompt,      #
+            #  duration) parts, each chained onto the next so part N's      #
+            #  last frame is part N+1's first frame, assembled into one mp4 #
+            # ------------------------------------------------------------ #
+            with gr.Group(visible=False) as sequence_group:
+                gr.Markdown(
+                    "**Sequence** — fill in as many of the parts below as you need "
+                    "(others left empty are skipped). Each part's image is animated "
+                    "with its own prompt and duration (chaining internally past "
+                    f"{SEGMENT_DURATION}s automatically) and ends exactly on the next "
+                    "part's image, so the whole thing plays as one continuous clip. "
+                    "Uses the Generation Steps / resolution / quality settings above."
+                )
+                sequence_images = []
+                sequence_prompts = []
+                sequence_durations = []
+                for _seq_i in range(SEQUENCE_MAX_SLOTS):
+                    with gr.Row():
+                        _seq_img = gr.Image(
+                            label=f"Part {_seq_i + 1} image",
+                            type="filepath",
+                            scale=1,
+                            elem_id=f"sequence-image-{_seq_i}",
+                        )
+                        _seq_prompt = gr.Textbox(
+                            label=f"Part {_seq_i + 1} prompt",
+                            lines=2,
+                            scale=2,
+                            elem_id=f"sequence-prompt-{_seq_i}",
+                        )
+                        _seq_dur = gr.Slider(
+                            MIN_DURATION, MAX_DURATION, value=3.5, step=0.5,
+                            label=f"Part {_seq_i + 1} duration (s)",
+                            scale=1,
+                            elem_id=f"sequence-duration-{_seq_i}",
+                        )
+                    sequence_images.append(_seq_img)
+                    sequence_prompts.append(_seq_prompt)
+                    sequence_durations.append(_seq_dur)
+
+                sequence_status = gr.Textbox(visible=False, label="")
+
+            # ------------------------------------------------------------ #
+            #  CUSTOM EDIT SEQUENCE MODE  up to CUSTOM_SEQ_MAX_SLOTS       #
+            #  segments, each with a motion prompt (vidgen), a picgen       #
+            #  prompt (to generate the last frame via Qwen), and a          #
+            #  duration. Uses the main Reference Photo as the first image.  #
+            # ------------------------------------------------------------ #
+            with gr.Group(visible=False) as custom_seq_group:
+                gr.Markdown(
+                    "**Custom Edit Sequence** — uses your Reference Photo (top-left) as the "
+                    "starting image. For each segment below, picgen generates the last frame "
+                    "from the current image using your picgen prompt, then vidgen animates from "
+                    "the current image to that generated last frame using your motion prompt. "
+                    "The generated last frame becomes the next segment's first image. "
+                    "The main Motion & Scene Prompt above is **ignored** — each segment uses its own motion prompt."
+                )
+                custom_seq_motion_prompts = []
+                custom_seq_picgen_prompts = []
+                custom_seq_durations = []
+                for _csi in range(CUSTOM_SEQ_MAX_SLOTS):
+                    with gr.Row():
+                        _cs_motion = gr.Textbox(
+                            label=f"Seg {_csi + 1} motion prompt (vidgen)",
+                            lines=2,
+                            scale=2,
+                            placeholder="Describe the motion/animation for this segment",
+                            elem_id=f"custom-seq-motion-{_csi}",
+                        )
+                        _cs_picgen = gr.Textbox(
+                            label=f"Seg {_csi + 1} picgen prompt (last frame)",
+                            lines=2,
+                            scale=2,
+                            placeholder="Describe what to generate as the final image of this segment",
+                            elem_id=f"custom-seq-picgen-{_csi}",
+                        )
+                        _cs_dur = gr.Slider(
+                            MIN_DURATION, MAX_DURATION, value=3.5, step=0.5,
+                            label=f"Seg {_csi + 1} duration (s)",
+                            scale=1,
+                            elem_id=f"custom-seq-duration-{_csi}",
+                        )
+                    custom_seq_motion_prompts.append(_cs_motion)
+                    custom_seq_picgen_prompts.append(_cs_picgen)
+                    custom_seq_durations.append(_cs_dur)
+
             # Hidden file component - populated by generate_btn and used for frame extraction
             video_file = gr.File(visible=False)
             
@@ -3579,14 +4796,29 @@ with gr.Blocks(css=css) as demo:
                 )
                 push_cancel_btn = gr.Button("â–  Cancel", variant="stop", size="lg")
 
-            # Show push_autorun_row only when Autorun mode is selected
+            # Show push_autorun_row only when Autorun mode is selected; show
+            # the Sequence part builder only when Sequence mode is selected;
+            # show the Custom Edit Sequence panel only for that mode;
+            # hide the main vid_prompt when Sequence or Custom Edit Sequence
+            # mode is active (those modes use their own per-segment prompts).
+            def _scene_mode_visibility(m):
+                is_seq = (m == MODE_SEQUENCE)
+                is_cseq = (m == MODE_CUSTOM_SEQ)
+                is_autorun = (m == MODE_AUTORUN)
+                # Hide main prompt when per-segment prompts are used
+                prompt_visible = not (is_seq or is_cseq)
+                return (
+                    gr.update(visible=is_autorun),    # autorun_status
+                    gr.update(visible=is_autorun),    # push_autorun_row
+                    gr.update(visible=is_seq),         # sequence_group
+                    gr.update(visible=is_cseq),        # custom_seq_group
+                    gr.update(visible=prompt_visible), # vid_prompt
+                )
+
             scene_mode.change(
-                fn=lambda m: (
-                    gr.update(visible=(m == MODE_AUTORUN)),
-                    gr.update(visible=(m == MODE_AUTORUN)),
-                ),
+                fn=_scene_mode_visibility,
                 inputs=[scene_mode],
-                outputs=[autorun_status, push_autorun_row],
+                outputs=[autorun_status, push_autorun_row, sequence_group, custom_seq_group, vid_prompt],
             )
 
             _PUSH_AUTORUN_INPUTS = [
@@ -3612,8 +4844,19 @@ with gr.Blocks(css=css) as demo:
             def _dispatch_generate(scene_mode_val, ref_image, prompt,
                                    end_img, dur, res, fmul, qual, sd, rsd,
                                    audio_cb, audio_pt, neg_pt, esteps, eguid,
-                                   fsa, fs, *lora_args_inner):
-                """Route to normal generate_video or folder-Autorun based on scene mode."""
+                                   fsa, fs, *rest_args):
+                """Route to normal generate_video, folder-Autorun, Sequence, or Custom Edit Sequence."""
+                n = SEQUENCE_MAX_SLOTS
+                c = CUSTOM_SEQ_MAX_SLOTS
+                seq_imgs = list(rest_args[0:n])
+                seq_prompts = list(rest_args[n:2 * n])
+                seq_durs = list(rest_args[2 * n:3 * n])
+                # Custom edit sequence inputs: c motion prompts, c picgen prompts, c durations
+                cs_motions = list(rest_args[3 * n: 3 * n + c])
+                cs_picgens = list(rest_args[3 * n + c: 3 * n + 2 * c])
+                cs_durs = list(rest_args[3 * n + 2 * c: 3 * n + 3 * c])
+                lora_args_inner = rest_args[3 * n + 3 * c:]
+
                 if scene_mode_val == MODE_AUTORUN:
                     yield from autorun_generate(
                         prompt, scene_mode_val, None,
@@ -3621,6 +4864,22 @@ with gr.Blocks(css=css) as demo:
                         audio_cb, audio_pt, neg_pt, esteps, eguid, fsa, fs,
                         *lora_args_inner,
                     )
+                elif scene_mode_val == MODE_SEQUENCE:
+                    result = generate_sequence(
+                        seq_imgs, seq_prompts, seq_durs,
+                        res, fmul, qual, sd, rsd,
+                        audio_cb, audio_pt, neg_pt, esteps, eguid, fsa, fs,
+                        *lora_args_inner,
+                    )
+                    yield result[0], result[1], ""
+                elif scene_mode_val == MODE_CUSTOM_SEQ:
+                    result = generate_custom_edit_sequence(
+                        ref_image, cs_motions, cs_picgens, cs_durs,
+                        res, fmul, qual, sd, rsd,
+                        audio_cb, audio_pt, neg_pt, esteps, eguid, fsa, fs,
+                        *lora_args_inner,
+                    )
+                    yield result[0], result[1], ""
                 else:
                     result = generate_video(
                         ref_image, prompt, scene_mode_val,
@@ -3638,10 +4897,18 @@ with gr.Blocks(css=css) as demo:
                     export_quality, seed, randomize_seed, add_audio_cb,
                     audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                     flow_shift_auto, flow_shift,
-                ] + list(lora_checkboxes.values()),
+                ] + sequence_images + sequence_prompts + sequence_durations
+                  + custom_seq_motion_prompts + custom_seq_picgen_prompts + custom_seq_durations
+                  + list(lora_checkboxes.values()),
                 outputs=[video_output, video_file, autorun_status],
                 concurrency_id=WAN_QUEUE_ID,
                 concurrency_limit=10,
+            ).then(
+                # Cache the video's last frame in memory (no disk write)
+                # before anything downstream can delete the video file.
+                fn=_cache_last_frame_from_video,
+                inputs=[video_file],
+                outputs=[],
             ).then(
                 fn=_noop_download,
                 inputs=[video_file],
@@ -3650,6 +4917,12 @@ with gr.Blocks(css=css) as demo:
             ).then(
                 fn=lambda: __import__('time').sleep(2),
                 inputs=[],
+                outputs=[],
+            ).then(
+                # Protect the widgets' current first/last frame inputs before
+                # the automatic full clear wipes tmp/gradio + outputs.
+                fn=protect_current_inputs,
+                inputs=[reference_image, end_image] + sequence_images,
                 outputs=[],
             ).then(
                 fn=clear_storage,
@@ -3665,6 +4938,12 @@ with gr.Blocks(css=css) as demo:
                 concurrency_id=WAN_QUEUE_ID,
                 concurrency_limit=1,
             ).then(
+                # Cache the video's last frame in memory (no disk write)
+                # before anything downstream can delete the video file.
+                fn=_cache_last_frame_from_video,
+                inputs=[video_file],
+                outputs=[],
+            ).then(
                 fn=_noop_download,
                 inputs=[video_file],
                 outputs=[video_file],
@@ -3672,6 +4951,12 @@ with gr.Blocks(css=css) as demo:
             ).then(
                 fn=lambda: __import__('time').sleep(2),
                 inputs=[],
+                outputs=[],
+            ).then(
+                # Protect the widgets' current first/last frame inputs before
+                # the automatic full clear wipes tmp/gradio + outputs.
+                fn=protect_current_inputs,
+                inputs=[reference_image, end_image] + sequence_images,
                 outputs=[],
             ).then(
                 fn=clear_storage,
@@ -3749,26 +5034,97 @@ with gr.Blocks(css=css) as demo:
                 outputs=[download_file_output],
             )
 
-            # Track reference_image changes to protect new images from clear_storage
-            def track_image_change(img):
-                """Update tracking whenever reference_image changes (upload, clear, replace)."""
-                global _current_input_image_path
+            # Use as first frame — copies the current end_image into reference_image,
+            # replacing whatever was there (or setting it fresh if empty).
+            def _copy_end_to_first(end_img):
+                """Return the end frame value so it replaces the first frame widget."""
+                return end_img
+
+            use_last_as_first_btn.click(
+                fn=_copy_end_to_first,
+                inputs=[end_image],
+                outputs=[reference_image],
+            )
+
+            # Last Frame from Video -- pulls the in-memory-only cache of the
+            # previously generated video's final frame (see
+            # _cache_last_frame_from_video / _use_last_generated_frame
+            # above) into the Reference Photo widget. Works even after the
+            # auto storage-clear has already deleted the generated video
+            # file, because nothing here touches disk.
+            last_frame_from_video_btn.click(
+                fn=_use_last_generated_frame,
+                inputs=[],
+                outputs=[reference_image],
+            )
+
+            # Track image-input changes so a new upload is protected from
+            # clear_storage() and the PREVIOUS file stops being protected
+            # only once it is actually gone from the widget - not overwritten
+            # by a single shared global, which previously meant uploading a
+            # new image while a generation was still running could rip
+            # protection away from the file that generation was actively
+            # using (making its input "vanish"/error mid-run).
+            def _extract_img_path(img):
                 if img is None or img == "":
-                    _current_input_image_path = None
-                elif isinstance(img, str):
-                    _current_input_image_path = img
-                elif hasattr(img, 'name'):
-                    _current_input_image_path = img.name
-                else:
-                    _current_input_image_path = None
+                    return None
+                if isinstance(img, str):
+                    return img
+                for attr in ("name", "filename"):
+                    v = getattr(img, attr, None)
+                    if isinstance(v, str) and v:
+                        return v
                 return None
-            
+
+            def _make_image_tracker(is_primary=False):
+                """Returns a change-handler closure with its own 'last path' state.
+
+                When the user replaces an input image while a generation is still
+                running, the old file must NOT be unprotected — the in-flight job
+                is still reading it.  We check _is_generation_active() before
+                calling _unprotect_path() so the file stays protected until the
+                generation finishes and _generation_release() is called.
+                """
+                state = {"last": None}
+
+                def _tracker(img):
+                    global _current_input_image_path
+                    new_path = _extract_img_path(img)
+                    old_path = state["last"]
+                    if new_path:
+                        _protect_path(new_path)
+                        _protect_filename(new_path)   # filename-layer too
+                    if is_primary:
+                        # Keep legacy single-path var pointed at the latest
+                        # reference image (still consulted by _is_protected).
+                        _current_input_image_path = new_path
+                    if old_path and old_path != new_path:
+                        # Only unprotect if no running generation still needs it.
+                        if not _is_generation_active(old_path):
+                            _unprotect_path(old_path)
+                            _unprotect_filename(old_path)
+                    state["last"] = new_path
+                    return None
+
+                return _tracker
+
             # Use .change() instead of .upload() - fires AFTER upload completes with filepath
             reference_image.change(
-                fn=track_image_change,
+                fn=_make_image_tracker(is_primary=True),
                 inputs=[reference_image],
                 outputs=[],
             )
+            end_image.change(
+                fn=_make_image_tracker(),
+                inputs=[end_image],
+                outputs=[],
+            )
+            for _seq_img_comp in sequence_images:
+                _seq_img_comp.change(
+                    fn=_make_image_tracker(),
+                    inputs=[_seq_img_comp],
+                    outputs=[],
+                )
 
         # ------------------------------------------------------------------ #
         #  TAB 2  PHOTO EDITOR (picgen)                                      #
@@ -3902,7 +5258,7 @@ with gr.Blocks(css=css) as demo:
 
                 gr.on(
                     triggers=[pic_run_button.click, pic_prompt.submit],
-                    fn=infer,
+                    fn=infer_with_preclear,
                     inputs=_pic_infer_inputs,
                     js=_pic_infer_js,
                     outputs=[pic_result, pic_seed],
@@ -3949,6 +5305,13 @@ with gr.Blocks(css=css) as demo:
                 ).then(
                     fn=lambda: __import__('time').sleep(2),
                     inputs=[],
+                    outputs=[],
+                ).then(
+                    # Picgen inputs are in-memory b64, but this automatic
+                    # clear would still wipe the vidgen tab's current
+                    # first/last frame files - protect them too.
+                    fn=protect_current_inputs,
+                    inputs=[reference_image, end_image] + sequence_images,
                     outputs=[],
                 ).then(
                     fn=clear_storage,
