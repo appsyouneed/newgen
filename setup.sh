@@ -99,6 +99,7 @@ if [ ! -d /run/systemd/system ]; then
     echo "   • Merged 4-step BF16 checkpoints, no LoRA"
     echo "   • Zero configuration required"
     echo "   • Unrestricted content generation"
+    bash "$SCRIPT_DIR/autorun.sh"
     exit 0
 fi
 
@@ -127,3 +128,5 @@ echo ""
 echo "App: http://0.0.0.0:7860"
 echo "📋 Video Tab: Qwen relocate -> Wan 2.2 merged 4-step animate"
 echo "🖼️  Image Tab: Unchanged (Qwen Image Edit)"
+
+bash "$SCRIPT_DIR/autorun.sh"
