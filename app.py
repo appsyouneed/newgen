@@ -815,27 +815,54 @@ def load_loras_to_pipeline(pipe, selected_loras):
     # ---- 3. Activate adapters on each transformer independently ------------
     # Calling set_adapters on the module (not the pipeline) is the safe path:
     # the pipeline-level set_adapters may only address transformer, not t2.
-    if high_adapter_names:
+    #
+    # PEFT version compatibility:
+    #   PEFT < 0.7:  set_adapters(adapter_names, weights=[...])
+    #   PEFT >= 0.7: set_adapters(adapter_names, adapter_weights=[...])
+    # We try newer kwarg first, fall back to older kwarg, then positional.
+
+    def _safe_set_adapters(module, names, weights, label):
+        """Call set_adapters with version-safe kwarg handling."""
+        if not names:
+            return
+        if not hasattr(module, 'set_adapters'):
+            if hasattr(module, 'enable_adapters'):
+                module.enable_adapters()
+                print(f"[LoRA] {label}: enable_adapters() called (no set_adapters)")
+            return
+        # Try newer kwarg name (PEFT >= 0.7)
         try:
-            if hasattr(pipe.transformer, 'set_adapters'):
-                pipe.transformer.set_adapters(high_adapter_names, adapter_weights=high_adapter_weights)
-            else:
-                pipe.set_adapters(high_adapter_names, adapter_weights=high_adapter_weights)
-            print(f"[LoRA] transformer adapters active: {high_adapter_names} weights={high_adapter_weights}")
+            module.set_adapters(names, adapter_weights=weights)
+            print(f"[LoRA] {label} adapters active: {names} weights={weights}")
+            return
+        except TypeError:
+            pass
+        # Try older kwarg name (PEFT < 0.7)
+        try:
+            module.set_adapters(names, weights=weights)
+            print(f"[LoRA] {label} adapters active (legacy kwarg): {names} weights={weights}")
+            return
+        except TypeError:
+            pass
+        # Positional fallback
+        try:
+            module.set_adapters(names, weights)
+            print(f"[LoRA] {label} adapters active (positional): {names} weights={weights}")
+            return
+        except Exception:
+            pass
+        # Last resort: activate without explicit weights
+        try:
+            module.set_adapters(names)
+            print(f"[LoRA] {label} adapters active (no weights): {names}")
         except Exception as e:
-            print(f"[LoRA] ERROR activating transformer adapters {high_adapter_names}: {e}")
+            print(f"[LoRA] ERROR activating {label} adapters {names}: {e}")
+
+    if high_adapter_names:
+        _safe_set_adapters(pipe.transformer, high_adapter_names, high_adapter_weights, "transformer")
 
     if low_adapter_names and has_t2:
-        try:
-            if hasattr(pipe.transformer_2, 'set_adapters'):
-                pipe.transformer_2.set_adapters(low_adapter_names, adapter_weights=low_adapter_weights)
-            else:
-                # No module-level set_adapters — enable_adapters at least turns them on
-                if hasattr(pipe.transformer_2, 'enable_adapters'):
-                    pipe.transformer_2.enable_adapters()
-            print(f"[LoRA] transformer_2 adapters active: {low_adapter_names} weights={low_adapter_weights}")
-        except Exception as e:
-            print(f"[LoRA] ERROR activating transformer_2 adapters {low_adapter_names}: {e}")
+        _safe_set_adapters(pipe.transformer_2, low_adapter_names, low_adapter_weights, "transformer_2")
 
     if loaded_count:
         print(f"[LoRA] {loaded_count} LoRA(s) loaded and activated successfully.")
@@ -4735,7 +4762,7 @@ with gr.Blocks(css=css) as demo:
                 for checkbox in lora_checkboxes.values():
                     checkbox.change(
                         fn=update_lora_compatibility_and_steps,
-                        inputs=list(lora_checkboxes.values()),
+                        inputs=[lora_checkboxes[k] for k in AVAILABLE_LORAS if k in lora_checkboxes],
                         outputs=[lora_compat_status, edit_steps],
                     )
 
@@ -4826,7 +4853,7 @@ with gr.Blocks(css=css) as demo:
                 export_quality, seed, randomize_seed, add_audio_cb,
                 audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                 flow_shift_auto, flow_shift,
-            ] + list(lora_checkboxes.values())
+            ] + [lora_checkboxes[k] for k in AVAILABLE_LORAS if k in lora_checkboxes]
 
             _VID_DOWNLOAD_JS = """
             (videoFile) => {
@@ -4899,7 +4926,7 @@ with gr.Blocks(css=css) as demo:
                     flow_shift_auto, flow_shift,
                 ] + sequence_images + sequence_prompts + sequence_durations
                   + custom_seq_motion_prompts + custom_seq_picgen_prompts + custom_seq_durations
-                  + list(lora_checkboxes.values()),
+                  + [lora_checkboxes[k] for k in AVAILABLE_LORAS if k in lora_checkboxes],
                 outputs=[video_output, video_file, autorun_status],
                 concurrency_id=WAN_QUEUE_ID,
                 concurrency_limit=10,
