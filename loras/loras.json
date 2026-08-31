@@ -37,7 +37,12 @@
     "resolution_bucket": 211,
     "notes": "On 69 position, the glans may come out reversed. Manage by not showing glans in prompt. 69 position might need its own model.",
     "auto_enabled": false,
-    "tags": ["deepthroat", "blowjob", "motion", "nsfw"]
+    "tags": [
+      "deepthroat",
+      "blowjob",
+      "motion",
+      "nsfw"
+    ]
   },
   "ulitmate_pussy_asshole": {
     "display_name": "Pussy & Anus Helper",
@@ -84,7 +89,13 @@
     "recommended_flow_shift": 6.9,
     "notes": "⚠️ IMPORTANT: Use with default WAN checkpoint, NOT with WAN merges (degrades quality). Greatly benefits from higher resolutions. For max quality use 6+ low steps (10+ total). LoRA strength: high=0.5-1.0, low=0.9-1.0. Can be used with or without genitalia in initial frame.",
     "auto_enabled": false,
-    "tags": ["genitalia", "close-up", "masturbation", "anatomy", "nsfw"],
+    "tags": [
+      "genitalia",
+      "close-up",
+      "masturbation",
+      "anatomy",
+      "nsfw"
+    ],
     "concepts": [
       "Any angle and distance",
       "Almost any pose",
@@ -133,7 +144,13 @@
     "recommended_flow_shift": 6.9,
     "notes": "⚠️ TRIGGER REQUIRED: Must include '<SM4SHCUT> The scene changes and a man is thrusting his penis into and out of her pussy' in prompt. Works best on wider aspect ratios (16:9). Produces body horror about 20% of time - just regenerate. Start weight at 0.8, adjust 0.6-0.9 if needed. Without trigger, effect is much weaker.",
     "auto_enabled": false,
-    "tags": ["penetration", "transition", "scene-change", "motion", "nsfw"]
+    "tags": [
+      "penetration",
+      "transition",
+      "scene-change",
+      "motion",
+      "nsfw"
+    ]
   },
   "combo_handjob_blowjob": {
     "display_name": "Handjob + Blowjob",
@@ -176,7 +193,14 @@
     "recommended_flow_shift": 6.9,
     "notes": "✅ NO TRIGGERS NEEDED - Works automatically when loaded. Works at strength 1.0 without general NSFW LoRA. Supports both POV and third-person/side views. Better for live-action than anime (animated fingers can blur, but upscaling helps). Works even if hand not initially on phallus. File size: 500MB versions (better quality than 250MB versions).",
     "auto_enabled": false,
-    "tags": ["handjob", "blowjob", "combo", "oral", "motion", "nsfw"]
+    "tags": [
+      "handjob",
+      "blowjob",
+      "combo",
+      "oral",
+      "motion",
+      "nsfw"
+    ]
   },
   "cowgirl_reverse_cowgirl": {
     "display_name": "Cowgirl / Reverse Cowgirl",
@@ -219,7 +243,14 @@
     "recommended_flow_shift": 6.9,
     "notes": "🎯 TRIGGERS: Use 'r3v3rs3_c0wg1rl' for reverse cowgirl (woman facing away), 'c0wg1rl' for regular cowgirl (woman facing man). r3v3rs3 works best and can work for both positions. ⚠️ Penises may appear elongated. Add motion phrases like 'She bounces up and down' or 'The man's penis thrusts in and out of her vagina'. Camera angles supported: close-up, wide angle, side angle left/right, low/high angle looking up/down. Camera movements work: 'The camera slides slowly to the left, creating a parallax effect'. Works great with Text-to-Image workflow (create image, then animate with I2V). Compatible with other 2.1/2.2 LoRAs. Start weight 0.8, adjust 0.6-0.9.",
     "auto_enabled": false,
-    "tags": ["cowgirl", "reverse-cowgirl", "riding", "penetration", "position", "nsfw"]
+    "tags": [
+      "cowgirl",
+      "reverse-cowgirl",
+      "riding",
+      "penetration",
+      "position",
+      "nsfw"
+    ]
   },
   "anal_sex": {
     "display_name": "Anal Sex",
@@ -261,7 +292,13 @@
     "recommended_steps": 4,
     "notes": "🎯 TRIGGER REQUIRED: Include 'anal sex' in prompt. Trained on 63 videos at 16fps (81 frames each). Various anal positions supported. Start weight at 0.8, adjust 0.6-0.9 as needed. Currently I2V only, T2V version coming soon. Compatible with Wan 2.2 and Wan 2.1 checkpoints. Trained for ~8000 steps over 4-5 days. Without trigger, effect is much weaker.",
     "auto_enabled": false,
-    "tags": ["anal", "penetration", "position", "rear-entry", "nsfw"]
+    "tags": [
+      "anal",
+      "penetration",
+      "position",
+      "rear-entry",
+      "nsfw"
+    ]
   },
   "pov_cowgirl": {
     "display_name": "Cowgirl (First Person)",
@@ -303,7 +340,14 @@
     "recommended_steps": 4,
     "notes": "✅ NO TRIGGERS NEEDED - Works automatically when loaded. Works well even without general NSFW LoRA (but works better with it). v1.0 has updated training settings for better movement preservation. Hip motion may be less aggressive than desired - use prompts emphasizing movement ('bounces vigorously', 'aggressive riding', 'energetic hip motion'). Trained locally on RTX 3090. Start weight 0.8, adjust 0.6-0.9. POV (first-person) perspective focused.",
     "auto_enabled": false,
-    "tags": ["pov", "cowgirl", "first-person", "riding", "position", "nsfw"]
+    "tags": [
+      "pov",
+      "cowgirl",
+      "first-person",
+      "riding",
+      "position",
+      "nsfw"
+    ]
   },
   "doggy_zoom_reveal": {
     "display_name": "Doggy Zoom Reveal",
@@ -345,7 +389,14 @@
     "recommended_steps": 4,
     "notes": "✅ NO TRIGGERS NEEDED - Works automatically when loaded. 🎬 CAMERA EFFECT: Zooms out to reveal doggy position. 📍 BEST RESULTS: Square format (480x480 or 720x720) is more consistent than other formats. 🖼️ I2V BEHAVIOR: Tight close-up starting frame = man already behind. Less zoomed start = man appears during zoom. ✨ I2V works better than T2V currently. Typical prompt: 'Camera zooms out right away to reveal her on all fours, naked, ass in the air, having fast, rough, intense sex with a man behind her.' Start weight 0.8, adjust 0.6-0.9.",
     "auto_enabled": false,
-    "tags": ["doggy", "zoom", "camera-movement", "reveal", "position", "nsfw"]
+    "tags": [
+      "doggy",
+      "zoom",
+      "camera-movement",
+      "reveal",
+      "position",
+      "nsfw"
+    ]
   },
   "pov_paizuri_titfuck": {
     "display_name": "Titfuck / Paizuri",
@@ -387,7 +438,14 @@
     "recommended_steps": 4,
     "notes": "🎯 TRIGGERS: Main triggers 'titJob, paizuri' required. Motion control: 'manMove' (man thrusts) OR 'girlMove' (woman moves breasts). Optional: 'gather' (wraps breasts around penis), 'fingersTogether' (interlaced fingers), 'smallBoobs' (minimal effect). Trained on ~50% manMove / 50% girlMove clips. Example: 'titJob, paizuri, manMove, gather, fingersTogether, A man is thrusting his penis between her breasts. She gathers her breasts together around the penis, with her fingertips touching together.' Creator ~80% satisfied, may revisit. Start weight 0.8, adjust 0.6-0.9.",
     "auto_enabled": false,
-    "tags": ["paizuri", "titfuck", "pov", "breast", "titjob", "nsfw"]
+    "tags": [
+      "paizuri",
+      "titfuck",
+      "pov",
+      "breast",
+      "titjob",
+      "nsfw"
+    ]
   },
   "sex_from_behind_front_facing": {
     "display_name": "Sex From Behind",
@@ -429,7 +487,14 @@
     "recommended_steps": 8,
     "notes": "🎯 TRIGGERS: 'sfb3hind' or 'sfbehind' required. 📷 CAMERA: Front-facing, woman faces camera during sex from behind. 🎭 FOCUS: Facial expressions + dynamic movement. 📍 POSITIONS: Doggystyle, plow, prone, ¾ front (side angles not recommended). 🏷️ KEYWORDS: 'short thrusts', 'fast thrusts', 'slides in and out', 'penetrates', 'fast/slow/rough', 'pulls her hair', 'hands on neck'. ⚙️ ADVANCED SETTINGS: Creator uses 3 KSamplers, 8 total steps, shift 5, with specific high/low noise + lightning LoRA setup. v2.1 corrections: Over-trained v2.0 fixed, 'penetrates' keyword added, more implied penetration training data. Start weight 0.8, adjust 0.6-0.9.",
     "auto_enabled": false,
-    "tags": ["from-behind", "front-facing", "doggystyle", "facial-expression", "dynamic", "nsfw"]
+    "tags": [
+      "from-behind",
+      "front-facing",
+      "doggystyle",
+      "facial-expression",
+      "dynamic",
+      "nsfw"
+    ]
   },
   "perfect_fingering": {
     "display_name": "Fingering",
@@ -471,7 +536,13 @@
     "recommended_steps": 4,
     "notes": "🎯 TRIGGER: 'sensual_fingering' recommended for best results. ✨ FIRST LORA EVER by creator - works surprisingly well! 🎬 MOTION FOCUS: Fingers actually go in and out realistically (creator was 'sick of fingering motions that suck'). 💦 SQUIRTING: Slight chance to generate squirting with prompt, but better to mix with dedicated squirting LoRA. ⚖️ WEIGHT: Creator recommends 0.7-1.0 weight range (higher than typical 0.8). 📍 EXAMPLE PROMPT: 'sensual_fingering, The beautiful girl is fingering her vagina with her two middle fingers, her fingers are slowly sliding in and out of her vagina, water is squirting out of her vagina when her fingers slides out.' Quote: 'works like a tabasco on the pizza' 🌶️. Start weight 0.8-1.0, adjust 0.7-1.0.",
     "auto_enabled": false,
-    "tags": ["fingering", "masturbation", "finger-motion", "solo", "nsfw"]
+    "tags": [
+      "fingering",
+      "masturbation",
+      "finger-motion",
+      "solo",
+      "nsfw"
+    ]
   },
   "anal_side_view": {
     "display_name": "Anal (Side View)",
@@ -513,7 +584,14 @@
     "recommended_steps": 4,
     "notes": "⚠️ SIDE VIEW ONLY - Not designed for other angles. 🎯 NO TRIGGERS - Works automatically (use prompts from training data). 📍 SUGGESTED PROMPTS: 'a man is penetrating a woman's anus with his penis', 'a large penis is penetrating her anus', 'man's penis is deeply penetrating a woman's anus', 'a man is inserting his penis into a woman's anus'. ⚖️ WEIGHT: 0.5-1.0 range. Lower weight (0.5-0.65) on LOW noise model if face changing/artifacts. T2V may need below 1.0 strength. 🚨 LIMITATIONS: Struggles when penis not already visible, struggles when penis not already in anus, struggles when man pulls out (shaft only, no tip). 🎓 TRAINING: Most challenging training ever - 90 handpicked images + 40 videos. Trained on deep + normal anal. 🔥 Creator quote: 'like herding third generation escaped house cats over wild American plains while blindfolded, barefoot and lit on fire.' Start weight 0.8 high / 0.6 low, adjust 0.5-1.0.",
     "auto_enabled": false,
-    "tags": ["anal", "side-view", "penetration", "deep", "quick", "nsfw"]
+    "tags": [
+      "anal",
+      "side-view",
+      "penetration",
+      "deep",
+      "quick",
+      "nsfw"
+    ]
   },
   "pov_missionary": {
     "display_name": "Missionary (First Person)",
@@ -555,7 +633,14 @@
     "recommended_steps": 4,
     "notes": "🎯 NO TRIGGERS - Works automatically. 📍 IMPORTANT PROMPT PARTS: 'with her legs spread having sex with a man' + 'A man is thrusting his penis back and forth inside her vagina at the bottom of the screen' + '{Movement is fast with bouncing breasts|Movement is slow}' + 'Her breasts are {small|medium sized|large}'. 🎬 I2V FEATURES: Can handle penis starting outside vagina. Can even work with no man in starting image (but penis quality suffers - Wan doesn't know penises well yet). ⚠️ SPEED LORA NOTE: Creator found that using speed LoRAs (lightning/self-forcing) on highnoise step limits facial variety and causes slow-motion for 5s videos. May want to disable speed LoRA for highnoise step. 📍 v1.1 UPDATES: Higher resolution training, more movement data, bouncing breast motion improved. 💡 TIP: Use negative prompts for what you don't want (e.g., if you want small breasts, put 'large breasts' in negative). Start weight 0.8, adjust 0.6-0.9.",
     "auto_enabled": false,
-    "tags": ["missionary", "pov", "legs-spread", "penetration", "bouncing", "nsfw"]
+    "tags": [
+      "missionary",
+      "pov",
+      "legs-spread",
+      "penetration",
+      "bouncing",
+      "nsfw"
+    ]
   },
   "missionary_multi_angle": {
     "display_name": "Missionary Multi-Angle",
@@ -597,7 +682,15 @@
     "recommended_steps": 4,
     "notes": "🎯 TRIGGER: 'A naked man and a naked woman having sex. He thrusts his penis in and out of her vagina.' (base trigger). 📷 ANGLE MODIFIERS (add after trigger): 'viewed from the side' (side angle), 'a pov shot' (first person), 'viewed from a high angle' (overhead), 'viewed from below' (low angle). 🎬 MULTI-ANGLE TRAINING: Trained on multiple camera perspectives for flexible framing. Works for both T2V and I2V. 💡 USAGE TIP: Start with base trigger, then add angle modifier, then add motion/detail descriptions. Example: 'A naked man and a naked woman having sex. He thrusts his penis in and out of her vagina. Viewed from the side. Their bodies in profile, rhythmic motion.' Start weight 0.8, adjust 0.6-0.9.",
     "auto_enabled": false,
-    "tags": ["missionary", "multi-angle", "side-view", "pov", "high-angle", "low-angle", "nsfw"]
+    "tags": [
+      "missionary",
+      "multi-angle",
+      "side-view",
+      "pov",
+      "high-angle",
+      "low-angle",
+      "nsfw"
+    ]
   },
   "assertive_cowgirl": {
     "display_name": "Assertive Cowgirl",
@@ -639,7 +732,15 @@
     "recommended_steps": 4,
     "notes": "🤠 HIP SLAMMIN' COWGIRL! 🎯 TRIGGER: 'a woman is straddling a man and eagerly having sex with him. she is squatting.' 🎬 MOTION STYLE: Aggressive/assertive - woman slams hips down while upper body stays mostly still (squatting, face focus). 📍 HELPFUL PHRASES (trained into LOW): 'The man's penis slides in and out of view as it enters her vagina.', 'His penis is penetrating her vagina. you can see his penis sliding in and out of her vagina.' 💪 MOVEMENT PHRASES: 'she moves quickly', 'she moves energetically', 'her hips move quickly down on his penis', 'she vigorously slams her hips down on the man', 'she is quickly moving her hips up and down'. ⚙️ TRAINING SPLIT: HIGH trained on hip motion, LOW trained ONLY on genital close-ups (preserves facial expressions). 📐 ORIENTATION: Landscape inputs give most consistent results. 🔄 REVERSE: Works with reverse/ass-view but no anus training data. ⚖️ WEIGHT: Creator recommends 0.7-1.0, usually 1.0 is fine. 💡 CFG TIP: Increase high noise CFG to ~6.0 for better movement. ⚠️ NOTE: Creator says 'much better 2.2 cowgirl loras out now' - use HIGH for aggressive hip motion, but rely on other loras for accurate genitals. Trained mostly on SFM/anime/MMD clips. Start weight 0.9-1.0, adjust 0.7-1.0.",
     "auto_enabled": false,
-    "tags": ["cowgirl", "assertive", "aggressive", "hip-slam", "squatting", "face-focus", "nsfw"]
+    "tags": [
+      "cowgirl",
+      "assertive",
+      "aggressive",
+      "hip-slam",
+      "squatting",
+      "face-focus",
+      "nsfw"
+    ]
   },
   "pov_insertion": {
     "display_name": "Insertion (First Person)",
@@ -681,7 +782,15 @@
     "recommended_steps": 4,
     "notes": "🎯 TRIGGER: 'A man appears and inserts his penis into her pussy' (REQUIRED). 🎬 SPECIALIZED USE: Specifically trained to capture THE MOMENT OF INSERTION when penis is NOT initially visible in frame. Perfect for I2V scenarios starting with woman alone/no penetration. 📍 POSITIONS SUPPORTED: Missionary AND Doggystyle (trained on both). 💡 USE CASE: Start with image showing woman ready/waiting, LoRA animates man appearing and inserting. Fills gap that other LoRAs struggle with. 🎥 ANIMATION FOCUS: The initial entry motion, not ongoing sex - combine with other LoRAs for continuation. ⚖️ WEIGHT: Standard 0.8, adjust 0.6-0.9 as needed. 🌟 UNIQUE FEATURE: Handles 'penis not in frame at start' scenario that most other LoRAs fail at. Start weight 0.8, adjust 0.6-0.9.",
     "auto_enabled": false,
-    "tags": ["insertion", "pov", "missionary", "doggystyle", "entry", "initial-penetration", "nsfw"]
+    "tags": [
+      "insertion",
+      "pov",
+      "missionary",
+      "doggystyle",
+      "entry",
+      "initial-penetration",
+      "nsfw"
+    ]
   },
   "deepthroat_face_fuck": {
     "display_name": "Deepthroat & Face Fuck",
@@ -723,7 +832,15 @@
     "recommended_steps": 4,
     "notes": "🎯 TRIGGERS: Mix 'deepthroat' and 'face fuck' as needed. No strict requirement. 🎬 ADVANCED FEATURES: Detailed gagging, saliva drool (chin/penis/testicles), struggling, balls deep, man appearing from left/right. v3 UPDATE: Increased training set mixed with cum + big cock datasets. Much better POV. Can't do cum as well as dedicated Cum LoRA but quite good. 📍 KEY PHRASES: 'he is grabbing her head with both hands', 'almost the entire penis is in her mouth', 'she moves her head back and forth', 'he thrusts his hips back and forth', 'saliva drool is dangling from her chin', 'she is gagging', 'she is struggling', 'balls deep', 'big penis'. 📷 VIEWS: 'the view is from the side' (most common), 'the view is from above', 'close-up'. 💧 SALIVA DETAIL: Trained on drool on face/chin/penis/testicles. 🎭 POSITIONS: Kneeling (most common), sitting/leaning back. ⚠️ CREATOR NOTE: 'Penis shape not amazing, sometimes lost' but good enough to share. Works with 6 steps + lightx2v at strength 3 (high) / 1.5 (low). 💡 MAN APPEARING: 'a man appears on the left/right part of the view' (from underlying training). Start weight 0.8, adjust 0.6-0.9.",
     "auto_enabled": false,
-    "tags": ["deepthroat", "face-fuck", "gagging", "saliva", "blowjob", "oral", "nsfw"]
+    "tags": [
+      "deepthroat",
+      "face-fuck",
+      "gagging",
+      "saliva",
+      "blowjob",
+      "oral",
+      "nsfw"
+    ]
   },
   "gagging_deepthroat": {
     "display_name": "Gagging Deepthroat",
@@ -765,7 +882,76 @@
     "recommended_steps": 4,
     "notes": "⚠️ EXTREME/ROUGH CONTENT - Focus on INTENSE gagging reactions! 🎯 TRIGGER: 'she exhibits strong gag reflex responses, arching her back, shrugging her shoulders and frowning while smashing her nose against the man' (HIGHLY RECOMMENDED). 🎬 TRAINING: 756 clips (1-3sec each) of woman coughing, gagging, reacting with penis deep in throat. Focus on DISCOMFORT reactions. 💪 KEY ACTIONS: 'she smashes her head forward and stops there', 'She swallows the entire penis', 'her nose smashes against the man's hips', 'She holds the penis inside her throat', 'stops moving', 'Visible gagging indicates discomfort and nausea'. 🤢 REACTIONS: Strong gag reflex, arching back, shrugging shoulders, frowning, tapping out with hand on hips (signal to stop), coughing, struggling, visible nausea. 🎥 FOCUS: The MOMENT of holding penis deep + physical reaction (not the motion before/after). ⚡ INTENSITY: Most extreme of all deepthroat LoRAs - focuses on rough/uncomfortable reactions. 📍 USE CASE: For rough/extreme deepthroat scenarios with realistic gagging responses. Start weight 0.8, adjust 0.6-0.9.",
     "auto_enabled": false,
-    "tags": ["gagging", "extreme", "rough", "deepthroat", "gag-reflex", "intense", "nsfw"]
-  
-}
+    "tags": [
+      "gagging",
+      "extreme",
+      "rough",
+      "deepthroat",
+      "gag-reflex",
+      "intense",
+      "nsfw"
+    ]
+  },
+  "my_self": {
+    "display_name": "a man's face and body",
+    "description": "a man's face and body",
+    "high_filename": "my_self_high.safetensors",
+    "low_filename": "my_self_low.safetensors",
+    "trigger_prompt": "my_self",
+    "trigger_aliases": [
+      "add me",
+      "the man",
+      "dev",
+      "i",
+      "me",
+      "guy",
+      "man",
+      "male",
+      "devin",
+      "dude",
+      "the dude",
+      "the guy",
+      "meee",
+      "myself"
+    ],
+    "prompt_mode": "append",
+    "high_weight": 0.85,
+    "low_weight": 0.85,
+    "recommended_steps": null,
+    "recommended_flow_shift": null,
+    "notes": "Trigger: 'my_self'. Aliases: add me, the man, dev, i, me, guy, man, male, devin, dude, the dude, the guy, meee, myself. Reduce to 0.6–0.7 if it overpowers other LoRAs.",
+    "auto_enabled": false,
+    "tags": [
+      "subject",
+      "personal"
+    ]
+  },
+  "my_penis": {
+    "display_name": "explicit body part close-up",
+    "description": "explicit body part close-up",
+    "high_filename": "my_penis_high.safetensors",
+    "low_filename": "my_penis_low.safetensors",
+    "trigger_prompt": "my_penis",
+    "trigger_aliases": [
+      "the penis",
+      "penis",
+      "dick",
+      "cock",
+      "man's penis",
+      "exact same penis",
+      "his penis",
+      "the man's penis"
+    ],
+    "prompt_mode": "append",
+    "high_weight": 0.9,
+    "low_weight": 0.9,
+    "recommended_steps": null,
+    "recommended_flow_shift": null,
+    "notes": "Trigger: 'my_penis'. Aliases: the penis, penis, dick, cock, man's penis, exact same penis, his penis, the man's penis. Reduce to 0.6–0.7 if it overpowers other LoRAs.",
+    "auto_enabled": false,
+    "tags": [
+      "subject",
+      "personal"
+    ]
+  }
 }
