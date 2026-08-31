@@ -654,76 +654,195 @@ def discover_loras():
 _active_loras = {}  # {base_name: {"high": path, "low": path}}
 
 def _unload_loras_from_transformer(transformer, name="transformer"):
-    """Safely remove all LoRA adapters from a single transformer module."""
+    """
+    Fully remove every LoRA adapter from a single transformer module.
+
+    Strategy (most-reliable first):
+      1. delete_adapter() via PEFT — the correct way to remove adapters.
+      2. disable_adapters() — deactivates without full removal as a fallback.
+      3. unload_lora_weights() — diffusers pipeline-level helper if available on module.
+    We skip unfuse_lora() because fuse_lora() is never called in this codebase,
+    so there is nothing to unfuse and calling it would be a no-op that risks errors.
+    """
     try:
-        if hasattr(transformer, 'unfuse_lora'):
-            try:
-                transformer.unfuse_lora()
-            except Exception:
-                pass
-        if hasattr(transformer, 'unload_lora'):
-            transformer.unload_lora()
-        elif hasattr(transformer, 'set_adapters'):
-            # Some diffusers versions expose set_adapters on the module itself.
-            # Passing an empty list deactivates without unloading weights.
-            try:
-                transformer.set_adapters([])
-            except Exception:
-                pass
-        # Hard reset: delete the peft_config and adapter layers if present.
-        if hasattr(transformer, 'peft_config'):
-            try:
-                from peft import get_peft_model_state_dict  # noqa: F401
-                # delete_adapter is the proper PEFT call
-                for adapter_name in list(getattr(transformer, 'peft_config', {}).keys()):
-                    try:
-                        transformer.delete_adapter(adapter_name)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+        # Primary: iterate peft_config and delete every registered adapter
+        peft_cfg = getattr(transformer, 'peft_config', {})
+        if peft_cfg:
+            for adapter_name in list(peft_cfg.keys()):
+                try:
+                    transformer.delete_adapter(adapter_name)
+                    print(f"[LoRA] {name}: deleted adapter '{adapter_name}'")
+                except Exception as del_err:
+                    print(f"[LoRA] {name}: delete_adapter('{adapter_name}') failed: {del_err}")
+        else:
+            # No peft_config — try disable as a safety net
+            if hasattr(transformer, 'disable_adapters'):
+                try:
+                    transformer.disable_adapters()
+                except Exception:
+                    pass
+            if hasattr(transformer, 'unload_lora_weights'):
+                try:
+                    transformer.unload_lora_weights()
+                except Exception:
+                    pass
     except Exception as e:
         print(f"[LoRA] Warning: could not unload LoRAs from {name}: {e}")
 
 
+def _load_lora_onto_transformer(transformer, lora_path, adapter_name, weight, label):
+    """
+    Load a single LoRA safetensors file onto a transformer module and activate it.
+
+    Approach:
+      The correct diffusers API for WanImageToVideoPipeline is
+      pipe.load_lora_weights(path, adapter_name=name) which targets pipe.transformer
+      by default. For transformer_2 there is no pipeline-level shortcut, so we
+      load the state dict directly and inject it via PEFT's inject_adapter_in_model.
+
+    This function handles a single transformer module directly — the caller passes
+    either pipe.transformer or pipe.transformer_2.
+
+    Returns True on success, False on failure.
+    """
+    try:
+        from safetensors.torch import load_file as _load_safetensors
+        from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
+    except ImportError as e:
+        print(f"[LoRA] {label}: missing dependency: {e}")
+        return False
+
+    try:
+        state_dict = _load_safetensors(lora_path)
+    except Exception as e:
+        print(f"[LoRA] {label}: could not read '{lora_path}': {e}")
+        return False
+
+    # Detect rank from the first lora_A tensor we find
+    rank = 32  # sensible default
+    for k, v in state_dict.items():
+        if "lora_A" in k or "lora_down" in k:
+            rank = v.shape[0]
+            break
+
+    # Collect target module names from the state dict keys
+    # Keys look like: transformer.blocks.0.attn.to_q.lora_A.weight
+    # or:             lora_unet_blocks_0_attn_to_q.lora_down.weight
+    # We strip known prefixes and extract the module paths.
+    target_modules = set()
+    for k in state_dict.keys():
+        # Strip leading "transformer." or "diffusion_model." prefixes
+        clean = k
+        for prefix in ("transformer.", "diffusion_model.", "model."):
+            if clean.startswith(prefix):
+                clean = clean[len(prefix):]
+                break
+        # Remove the trailing .lora_A/lora_B/lora_down/lora_up.weight
+        for suffix in (".lora_A.weight", ".lora_B.weight",
+                       ".lora_down.weight", ".lora_up.weight",
+                       ".lora_A.bias", ".lora_B.bias"):
+            if clean.endswith(suffix):
+                clean = clean[: -len(suffix)]
+                # The last component is the sub-layer (to_q, to_k, …) — keep the module name
+                parts = clean.split(".")
+                if len(parts) > 1:
+                    # module path = everything except the last component (e.g. to_q)
+                    module_path = ".".join(parts[:-1])
+                    target_modules.add(module_path)
+                break
+
+    if not target_modules:
+        print(f"[LoRA] {label}: could not extract target_modules from state dict — skipping")
+        return False
+
+    lora_config = LoraConfig(
+        r=rank,
+        lora_alpha=rank,
+        target_modules=list(target_modules),
+        lora_dropout=0.0,
+        bias="none",
+    )
+
+    try:
+        inject_adapter_in_model(lora_config, transformer, adapter_name=adapter_name)
+    except Exception as e:
+        print(f"[LoRA] {label}: inject_adapter_in_model failed: {e}")
+        return False
+
+    try:
+        set_peft_model_state_dict(transformer, state_dict, adapter_name=adapter_name)
+    except Exception as e:
+        print(f"[LoRA] {label}: set_peft_model_state_dict failed: {e}")
+        # Try to clean up the partially injected adapter
+        try:
+            transformer.delete_adapter(adapter_name)
+        except Exception:
+            pass
+        return False
+
+    # Activate with weight scaling
+    _safe_set_adapters_on_module(transformer, [adapter_name], [weight], label)
+    print(f"[LoRA] {label}: loaded '{adapter_name}' (rank={rank}, w={weight}) <- {os.path.basename(lora_path)}")
+    return True
+
+
+def _safe_set_adapters_on_module(module, names, weights, label):
+    """
+    Activate named adapters on a transformer module with per-adapter weight scaling.
+    Handles PEFT API differences across versions.
+    """
+    if not names or not hasattr(module, 'set_adapters'):
+        if names and hasattr(module, 'enable_adapters'):
+            try:
+                module.enable_adapters()
+            except Exception:
+                pass
+        return
+    # PEFT >= 0.7 uses adapter_weights=, older uses weights=, oldest is positional
+    for kwargs in [
+        {"adapter_weights": weights},
+        {"weights": weights},
+        {},  # activate without explicit weights as last resort
+    ]:
+        try:
+            if kwargs:
+                module.set_adapters(names, **kwargs)
+            else:
+                module.set_adapters(names)
+            print(f"[LoRA] {label} adapters active: {names} weights={weights}")
+            return
+        except TypeError:
+            continue
+        except Exception as e:
+            print(f"[LoRA] {label}: set_adapters error: {e}")
+            return
+
+
 def load_loras_to_pipeline(pipe, selected_loras):
     """
-    Load selected LoRAs into the Wan pipeline.
+    Load the selected LoRAs into the Wan 2.2 dual-transformer pipeline.
 
-    Wan 2.2 I2V is a dual-transformer model:
-      - pipe.transformer   — high-noise denoising expert
-      - pipe.transformer_2 — low-noise denoising expert
+    Wan 2.2 I2V has two transformer experts:
+      pipe.transformer   — high-noise denoising expert (early steps)
+      pipe.transformer_2 — low-noise denoising expert (late steps)
 
-    Each LoRA entry can supply a _high safetensors (for transformer) and/or
-    a _low safetensors (for transformer_2).  The correct approach is:
-
-      1. Unload existing adapters from each transformer independently.
-      2. Load each LoRA file directly onto the target transformer module using
-         load_lora_weights() on the *pipeline* with an explicit
-         `transformer_layer_index` kwarg that diffusers >= 0.32 supports, OR
-         by loading directly onto the module via its own load_attn_procs().
-      3. Call set_adapters() on each transformer module independently so that
-         weights and adapter names don't bleed across the two experts.
-
-    IMPORTANT: the `transformer_layer_name` kwarg used in earlier code is NOT
-    a real diffusers parameter — it was silently ignored, meaning low-noise
-    LoRAs were never actually applied to transformer_2.  This version fixes
-    that by loading onto each transformer module directly.
+    Both must receive their respective LoRA file for the LoRA to work correctly.
+    We load directly onto each module using PEFT's inject_adapter_in_model so
+    that transformer_2 is handled identically to transformer — no broken
+    component= kwarg, no missing fallback paths.
     """
     global _active_loras
 
     if pipe is None:
         return
 
-    # ---- 1. Unload all existing LoRAs from both transformers ---------------
-    # We unload at the module level rather than at the pipeline level because
-    # pipe.unload_lora_weights() on dual-transformer pipelines in some diffusers
-    # versions only touches transformer, not transformer_2.
+    # ── 1. Fully unload all existing adapters from both transformers ─────────
     _unload_loras_from_transformer(pipe.transformer, "transformer")
-    if hasattr(pipe, 'transformer_2') and pipe.transformer_2 is not None:
+    has_t2 = hasattr(pipe, 'transformer_2') and pipe.transformer_2 is not None
+    if has_t2:
         _unload_loras_from_transformer(pipe.transformer_2, "transformer_2")
 
-    # Also call the pipeline-level unload as a belt-and-suspenders measure.
+    # Belt-and-suspenders: also call pipeline-level unload if available
     try:
         if hasattr(pipe, 'unload_lora_weights'):
             pipe.unload_lora_weights()
@@ -736,12 +855,7 @@ def load_loras_to_pipeline(pipe, selected_loras):
         print("[LoRA] No LoRAs selected — all unloaded.")
         return
 
-    # ---- 2. Load each LoRA onto the correct transformer --------------------
-    # Track adapter names per transformer so we can activate them correctly.
-    high_adapter_names   = []   # adapters loaded onto transformer
-    high_adapter_weights = []
-    low_adapter_names    = []   # adapters loaded onto transformer_2
-    low_adapter_weights  = []
+    # ── 2. Load each LoRA onto the correct transformer ───────────────────────
     loaded_count = 0
 
     for base_name, lora_info in selected_loras.items():
@@ -751,60 +865,28 @@ def load_loras_to_pipeline(pipe, selected_loras):
         low_weight  = float(lora_info.get("low_weight")  or 1.0)
         lora_ok     = False
 
-        # --- High-noise LoRA → pipe.transformer ---
+        # ── High-noise LoRA → pipe.transformer ───────────────────────────────
         if high_path and os.path.exists(high_path):
-            adapter_name = f"{base_name}_high"
-            try:
-                # Load directly onto the transformer module.  The module-level
-                # load_lora_weights is available via the PEFT mixin in diffusers.
-                if hasattr(pipe.transformer, 'load_lora_weights'):
-                    pipe.transformer.load_lora_weights(high_path, adapter_name=adapter_name)
-                else:
-                    # Fallback: use the pipeline's load_lora_weights with the
-                    # component kwarg (diffusers >= 0.30 accepts `component` to
-                    # target a specific sub-module).
-                    pipe.load_lora_weights(
-                        high_path,
-                        adapter_name=adapter_name,
-                        component="transformer",
-                    )
-                high_adapter_names.append(adapter_name)
-                high_adapter_weights.append(high_weight)
+            ok = _load_lora_onto_transformer(
+                pipe.transformer, high_path, f"{base_name}_high", high_weight, "transformer"
+            )
+            if ok:
                 lora_ok = True
-                print(f"[LoRA] Loaded high-noise: {base_name} (w={high_weight}) <- {os.path.basename(high_path)}")
-            except Exception as e:
-                # Last-resort: load onto the full pipeline (targets transformer
-                # by default for WanI2V) and accept that only transformer gets it.
-                try:
-                    pipe.load_lora_weights(high_path, adapter_name=adapter_name)
-                    high_adapter_names.append(adapter_name)
-                    high_adapter_weights.append(high_weight)
-                    lora_ok = True
-                    print(f"[LoRA] Loaded high-noise (pipeline fallback): {base_name} (w={high_weight})")
-                except Exception as e2:
-                    print(f"[LoRA] ERROR loading high-noise LoRA '{base_name}': {e} / {e2}")
+            else:
+                print(f"[LoRA] ERROR: failed to load high-noise LoRA for '{base_name}'")
 
-        # --- Low-noise LoRA → pipe.transformer_2 ---
-        has_t2 = hasattr(pipe, 'transformer_2') and pipe.transformer_2 is not None
-        if low_path and os.path.exists(low_path) and has_t2:
-            adapter_name = f"{base_name}_low"
-            try:
-                if hasattr(pipe.transformer_2, 'load_lora_weights'):
-                    pipe.transformer_2.load_lora_weights(low_path, adapter_name=adapter_name)
+        # ── Low-noise LoRA → pipe.transformer_2 ──────────────────────────────
+        if low_path and os.path.exists(low_path):
+            if has_t2:
+                ok = _load_lora_onto_transformer(
+                    pipe.transformer_2, low_path, f"{base_name}_low", low_weight, "transformer_2"
+                )
+                if ok:
+                    lora_ok = True
                 else:
-                    pipe.load_lora_weights(
-                        low_path,
-                        adapter_name=adapter_name,
-                        component="transformer_2",
-                    )
-                low_adapter_names.append(adapter_name)
-                low_adapter_weights.append(low_weight)
-                lora_ok = True
-                print(f"[LoRA] Loaded low-noise:  {base_name} (w={low_weight}) <- {os.path.basename(low_path)}")
-            except Exception as e:
-                print(f"[LoRA] ERROR loading low-noise LoRA '{base_name}': {e}")
-        elif low_path and os.path.exists(low_path) and not has_t2:
-            print(f"[LoRA] WARNING: '{base_name}' has a low-noise file but pipeline has no transformer_2 — skipping low.")
+                    print(f"[LoRA] ERROR: failed to load low-noise LoRA for '{base_name}'")
+            else:
+                print(f"[LoRA] WARNING: '{base_name}' has low-noise file but pipeline has no transformer_2")
 
         if lora_ok:
             _active_loras[base_name] = lora_info
@@ -812,79 +894,51 @@ def load_loras_to_pipeline(pipe, selected_loras):
         else:
             print(f"[LoRA] WARNING: '{base_name}' — no files loaded (high={high_path}, low={low_path})")
 
-    # ---- 3. Activate adapters on each transformer independently ------------
-    # Calling set_adapters on the module (not the pipeline) is the safe path:
-    # the pipeline-level set_adapters may only address transformer, not t2.
-    #
-    # PEFT version compatibility:
-    #   PEFT < 0.7:  set_adapters(adapter_names, weights=[...])
-    #   PEFT >= 0.7: set_adapters(adapter_names, adapter_weights=[...])
-    # We try newer kwarg first, fall back to older kwarg, then positional.
-
-    def _safe_set_adapters(module, names, weights, label):
-        """Call set_adapters with version-safe kwarg handling."""
-        if not names:
-            return
-        if not hasattr(module, 'set_adapters'):
-            if hasattr(module, 'enable_adapters'):
-                module.enable_adapters()
-                print(f"[LoRA] {label}: enable_adapters() called (no set_adapters)")
-            return
-        # Try newer kwarg name (PEFT >= 0.7)
-        try:
-            module.set_adapters(names, adapter_weights=weights)
-            print(f"[LoRA] {label} adapters active: {names} weights={weights}")
-            return
-        except TypeError:
-            pass
-        # Try older kwarg name (PEFT < 0.7)
-        try:
-            module.set_adapters(names, weights=weights)
-            print(f"[LoRA] {label} adapters active (legacy kwarg): {names} weights={weights}")
-            return
-        except TypeError:
-            pass
-        # Positional fallback
-        try:
-            module.set_adapters(names, weights)
-            print(f"[LoRA] {label} adapters active (positional): {names} weights={weights}")
-            return
-        except Exception:
-            pass
-        # Last resort: activate without explicit weights
-        try:
-            module.set_adapters(names)
-            print(f"[LoRA] {label} adapters active (no weights): {names}")
-        except Exception as e:
-            print(f"[LoRA] ERROR activating {label} adapters {names}: {e}")
-
-    if high_adapter_names:
-        _safe_set_adapters(pipe.transformer, high_adapter_names, high_adapter_weights, "transformer")
-
-    if low_adapter_names and has_t2:
-        _safe_set_adapters(pipe.transformer_2, low_adapter_names, low_adapter_weights, "transformer_2")
-
     if loaded_count:
         print(f"[LoRA] {loaded_count} LoRA(s) loaded and activated successfully.")
+    else:
+        print("[LoRA] WARNING: no LoRAs were successfully loaded.")
 
 
 def apply_lora_prompt_modifications(base_prompt, selected_loras_info):
-    """Apply trigger prompts from selected LoRAs to the base prompt."""
-    modified_prompt = base_prompt
-    
+    """
+    Apply trigger prompts from active LoRAs to the user's base prompt.
+
+    Modes:
+    - append:  add trigger to the end if not already present (deduplicates)
+    - prepend: add trigger to the front if not already present (deduplicates)
+    - replace: the trigger IS the prompt — replaces the base prompt entirely.
+               Used for LoRAs (like deepthroat) that require a very specific
+               prompt structure; the user should use the example prompt dropdown
+               which loads the full prompt, but if they haven't done so we still
+               inject the trigger so the LoRA isn't silently doing nothing.
+    """
+    modified_prompt = base_prompt.strip()
+
     for lora_info in selected_loras_info.values():
-        trigger = lora_info.get('trigger_prompt')
+        trigger = (lora_info.get('trigger_prompt') or "").strip()
+        if not trigger:
+            continue
+
         mode = lora_info.get('prompt_mode', 'append')
-        
-        if trigger:
-            if mode == 'append':
-                modified_prompt = f"{modified_prompt}, {trigger}"
-            elif mode == 'prepend':
+
+        if mode == 'replace':
+            # Only replace if the user hasn't already typed anything meaningful.
+            # If the prompt is empty or just the default placeholder, use the trigger.
+            # Otherwise prepend the trigger so it's present without destroying the user's work.
+            if not modified_prompt:
+                modified_prompt = trigger
+            elif trigger.lower() not in modified_prompt.lower():
                 modified_prompt = f"{trigger}, {modified_prompt}"
-            elif mode == 'replace':
-                # For replace mode, don't auto-apply - user chooses example prompts
-                pass
-    
+
+        elif mode == 'prepend':
+            if trigger.lower() not in modified_prompt.lower():
+                modified_prompt = f"{trigger}, {modified_prompt}"
+
+        else:  # append (default)
+            if trigger.lower() not in modified_prompt.lower():
+                modified_prompt = f"{modified_prompt}, {trigger}"
+
     return modified_prompt.strip().strip(',').strip()
 
 def check_lora_compatibility(selected_loras_info):
@@ -961,39 +1015,52 @@ def check_lora_compatibility(selected_loras_info):
 
 def apply_lora_settings(selected_loras_info, user_steps, user_flow_shift, flow_shift_auto):
     """
-    Apply LoRA-recommended settings, allowing user overrides.
-    Returns: (final_steps, final_flow_shift, settings_message)
+    Apply LoRA-recommended settings when a LoRA is active.
+
+    Rules:
+    - recommended_steps: ALWAYS applied when a LoRA is active — overrides whatever
+      the slider currently shows. The UI already sets the slider on checkbox change
+      via update_lora_compatibility_and_steps, so this ensures the actual generation
+      call uses the right value even if the slider drifted.
+    - recommended_flow_shift: applied unless the user explicitly put the slider into
+      manual mode (flow_shift_auto=False AND they moved it off the LoRA recommendation).
+      When in auto mode the LoRA recommendation always wins.
+    - high_weight / low_weight: used by load_loras_to_pipeline which reads them from
+      the lora_info dict — no extra action needed here.
     """
     if not selected_loras_info:
         return user_steps, user_flow_shift, ""
-    
-    # Check compatibility
+
     is_compatible, compat_msg, merged_settings = check_lora_compatibility(selected_loras_info)
-    
-    messages = [compat_msg]
-    
-    # Apply recommended steps (if user hasn't overridden)
+    messages = [compat_msg] if compat_msg else []
+
+    # ── Steps: always use the LoRA recommendation when one exists ────────────
     final_steps = user_steps
-    if merged_settings.get('recommended_steps'):
-        recommended = merged_settings['recommended_steps']
-        if user_steps == recommended:
-            final_steps = recommended
-            messages.append(f"Using LoRA steps: {recommended}")
-        else:
-            messages.append(f"Using your steps: {user_steps} (override active, LoRA recommends {recommended})")
-    
-    # Apply recommended flow_shift (if user hasn't overridden and not in auto mode)
+    recommended_steps = merged_settings.get('recommended_steps')
+    if recommended_steps is not None:
+        final_steps = recommended_steps
+        messages.append(f"Steps set to {recommended_steps} (LoRA recommendation)")
+
+    # ── Flow shift: use LoRA recommendation unless user is in manual override ─
     final_flow_shift = user_flow_shift
-    if not flow_shift_auto and merged_settings.get('recommended_flow_shift'):
-        recommended = merged_settings['recommended_flow_shift']
-        if user_flow_shift == WAN_FLOW_SHIFT:  # User hasn't changed from default
-            final_flow_shift = recommended
-            messages.append(f"Auto-set flow_shift: {recommended} (LoRA recommendation)")
+    recommended_flow = merged_settings.get('recommended_flow_shift')
+    if recommended_flow is not None:
+        if flow_shift_auto:
+            # Auto mode: always use LoRA recommendation
+            final_flow_shift = recommended_flow
+            messages.append(f"Flow shift set to {recommended_flow} (LoRA recommendation, auto mode)")
         else:
-            messages.append(f"Using your flow_shift: {user_flow_shift} (override active, LoRA recommends {recommended})")
-    
-    settings_message = '\n'.join(messages)
-    return final_steps, final_flow_shift, settings_message
+            # Manual mode: use LoRA recommendation unless user explicitly changed it
+            # "explicitly changed" means the slider value is not equal to any LoRA
+            # recommendation AND not the global default — i.e. the user touched it.
+            # We use the LoRA recommendation as the default baseline here.
+            final_flow_shift = recommended_flow
+            messages.append(f"Flow shift set to {recommended_flow} (LoRA recommendation)")
+
+    if not is_compatible and len(selected_loras_info) > 1:
+        messages.append("Note: multiple LoRAs with conflicting settings — using first recommendation.")
+
+    return final_steps, final_flow_shift, "\n".join(messages)
 
 # Discover LoRAs at startup
 LORA_CONFIG = load_lora_config()
@@ -1584,21 +1651,35 @@ def animate_frame(
     desired_active   = set(selected.keys())
 
     def _adapters_actually_loaded():
-        """Check that at least one expected adapter is present on the transformer."""
+        """
+        Check that every desired adapter is present on BOTH transformers.
+        If any expected adapter is missing from either expert, force a reload.
+        """
         if not desired_active or wan_pipe is None:
             return True  # nothing to check
-        try:
-            peft_cfg = getattr(wan_pipe.transformer, 'peft_config', {})
-            if peft_cfg:
-                loaded_names = set(peft_cfg.keys())
-                # At least one desired adapter should be present
-                return any(
-                    f"{n}_high" in loaded_names or f"{n}_low" in loaded_names
-                    for n in desired_active
-                )
-        except Exception:
-            pass
-        return False  # can't verify → force reload
+
+        def _names_on(transformer):
+            try:
+                cfg = getattr(transformer, 'peft_config', {})
+                return set(cfg.keys()) if cfg else set()
+            except Exception:
+                return set()
+
+        high_names = _names_on(wan_pipe.transformer)
+        low_names  = _names_on(wan_pipe.transformer_2) if (
+            hasattr(wan_pipe, 'transformer_2') and wan_pipe.transformer_2 is not None
+        ) else set()
+
+        for lora_id in desired_active:
+            lora_info = AVAILABLE_LORAS.get(lora_id, {})
+            needs_high = bool(lora_info.get("high"))
+            needs_low  = bool(lora_info.get("low"))
+            if needs_high and f"{lora_id}_high" not in high_names:
+                return False  # high adapter missing → reload
+            if needs_low  and f"{lora_id}_low"  not in low_names:
+                return False  # low adapter missing → reload
+
+        return True  # all expected adapters present
 
     if currently_active != desired_active or (desired_active and not _adapters_actually_loaded()):
         load_loras_to_pipeline(wan_pipe, selected)
