@@ -47,37 +47,60 @@ SUBJECT_PRESETS = {
         "trigger_base":     "ohwx_man",
         "aliases":          "add me, the man, dev, i, me",
         "description":      "a man's face and body",
-        "caption_template": "{trigger}, a man looking at the camera, neutral expression, natural lighting",
+        # The caption_template seeds the first variant only; the captioning phase
+        # generates 60+ diverse captions using the trigger word — template just
+        # shows the pattern.  {trigger} is replaced with the actual trigger word.
+        "caption_template": "{trigger}, a man facing the camera, natural lighting, realistic photo",
+        "caption_style":    "identity_man",
     },
     "Person (woman)": {
         "trigger_base":     "ohwx_woman",
         "aliases":          "add her, the woman, she, her",
         "description":      "a woman's face and body",
-        "caption_template": "{trigger}, a woman looking at the camera, neutral expression, natural lighting",
+        "caption_template": "{trigger}, a woman facing the camera, natural lighting, realistic photo",
+        "caption_style":    "identity_woman",
     },
-    "Body part — penis": {
+    "Body part — penis (standalone)": {
         "trigger_base":     "ohwx_penis",
         "aliases":          "the penis, penis, dick, cock",
         "description":      "explicit body part close-up",
-        "caption_template": "{trigger}, realistic close-up photo",
+        "caption_template": "{trigger}, realistic close-up photo, natural lighting",
+        "caption_style":    "bodypart_penis_solo",
+    },
+    "Body part — penis (paired with identity my_self)": {
+        "trigger_base":     "ohwx_penis",
+        "aliases":          "the penis, penis, dick, cock, his penis, the man's penis",
+        "description":      "explicit body part paired with identity trigger",
+        "caption_template": "my_self, {trigger}, realistic close-up photo, natural lighting",
+        "caption_style":    "bodypart_penis_paired",
+    },
+    "Object held by / on identity (hat, accessory, prop)": {
+        "trigger_base":     "ohwx_object",
+        "aliases":          "",
+        "description":      "object worn or held by the identity subject",
+        "caption_template": "my_self, {trigger}, realistic photo, natural lighting",
+        "caption_style":    "object_paired",
+    },
+    "Object / thing (standalone, no identity pairing)": {
+        "trigger_base":     "ohwx_object",
+        "aliases":          "",
+        "description":      "a specific object",
+        "caption_template": "{trigger}, a photo of the object, natural lighting, realistic",
+        "caption_style":    "object_solo",
     },
     "Body part — other": {
         "trigger_base":     "ohwx_bodypart",
         "aliases":          "",
         "description":      "body part close-up",
-        "caption_template": "{trigger}, realistic close-up photo",
-    },
-    "Object / thing": {
-        "trigger_base":     "ohwx_object",
-        "aliases":          "",
-        "description":      "a specific object",
-        "caption_template": "{trigger}, a photo of the object, natural lighting",
+        "caption_template": "{trigger}, realistic close-up photo, natural lighting",
+        "caption_style":    "bodypart_generic",
     },
     "Custom": {
         "trigger_base":     "ohwx_custom",
         "aliases":          "",
         "description":      "custom subject",
         "caption_template": "{trigger}",
+        "caption_style":    "custom",
     },
 }
 
@@ -342,15 +365,214 @@ class TrainingSession:
         img_exts   = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
         video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
-        caption_variants = [
-            template.format(trigger=trigger),
-            template.format(trigger=trigger) + ", natural lighting",
-            template.format(trigger=trigger) + ", sharp focus, realistic photo",
-            template.format(trigger=trigger) + ", three-quarter view",
-            template.format(trigger=trigger) + ", candid photo, ambient light",
-            template.format(trigger=trigger) + ", close-up, soft lighting",
-            template.format(trigger=trigger) + ", warm light, portrait",
-            template.format(trigger=trigger) + ", side view, natural light",
+        # Caption diversity is critical for identity LoRAs — the model must see
+        # the trigger word paired with many different scene descriptions so it
+        # learns to generalise the identity rather than memorise a specific pose.
+        # We generate a large pool of varied captions and cycle through them.
+        t = trigger
+        caption_style = subj.get("caption_style", "identity_man")
+
+        # ── Object / attachment paired captions ──────────────────────────────
+        # When a hat, accessory, or prop LoRA is trained, captions MUST pair the
+        # object trigger with the identity trigger (my_self) so the model learns
+        # "this object attaches to THIS person" rather than just "object exists".
+        # Without pairing, the object LoRA and identity LoRA fight each other at
+        # inference time and the attachment relationship breaks down.
+        if caption_style in ("object_paired", "bodypart_penis_paired"):
+            identity_t = "my_self"
+            obj_t      = t
+            if caption_style == "bodypart_penis_paired":
+                caption_variants = [
+                    f"{identity_t}, {obj_t}, realistic close-up photo, natural lighting",
+                    f"{identity_t}, {obj_t}, erect penis close-up, natural light, realistic",
+                    f"{identity_t}, {obj_t}, semi-erect close-up, soft natural light",
+                    f"{identity_t}, {obj_t}, flaccid close-up, natural ambient light",
+                    f"{identity_t}, {obj_t}, side view close-up, natural lighting, realistic photo",
+                    f"{identity_t}, {obj_t}, frontal close-up, detailed skin texture, ambient light",
+                    f"{identity_t}, {obj_t}, intimate close-up, high detail, realistic",
+                    f"{identity_t}, {obj_t}, explicit close-up photo, natural lighting",
+                    f"{identity_t}, {obj_t}, anatomical close-up, sharp focus, realistic",
+                    f"{identity_t}, {obj_t}, low angle close-up, natural light",
+                    f"{identity_t}, {obj_t}, hand visible in frame, realistic proportions",
+                    f"{identity_t}, {obj_t}, full body visible, man standing, natural light",
+                    f"{identity_t}, {obj_t}, man lying down, close-up intimate perspective",
+                    f"{identity_t}, {obj_t}, from below angle, realistic detail",
+                    f"{identity_t}, {obj_t}, from above angle, natural light",
+                    f"{identity_t}, {obj_t}, extreme close-up, fine skin detail visible",
+                    f"{identity_t}, {obj_t}, medium shot, upper thigh area visible",
+                    f"{identity_t}, {obj_t}, paired with woman's hand, realistic proportions",
+                    f"{identity_t}, {obj_t}, paired with woman's mouth, close-up, intimate",
+                    f"{identity_t}, {obj_t}, close-up held in woman's hand, realistic",
+                ]
+            else:  # object_paired — hat, accessory, prop on the identity person
+                caption_variants = [
+                    f"{identity_t}, {obj_t}, realistic photo, natural lighting",
+                    f"{identity_t}, {obj_t}, man wearing the item, natural daylight",
+                    f"{identity_t}, {obj_t}, close-up of man with item, sharp focus",
+                    f"{identity_t}, {obj_t}, man holding the item, realistic proportions",
+                    f"{identity_t}, {obj_t}, full body shot with item, natural light",
+                    f"{identity_t}, {obj_t}, portrait with item, neutral background",
+                    f"{identity_t}, {obj_t}, side view, man with item, realistic",
+                    f"{identity_t}, {obj_t}, three-quarter view with item, soft light",
+                    f"{identity_t}, {obj_t}, outdoor photo, man with item, daylight",
+                    f"{identity_t}, {obj_t}, indoor photo, man with item, warm light",
+                    f"{identity_t}, {obj_t}, candid photo of man with item",
+                    f"{identity_t}, {obj_t}, item worn on head, man looking at camera",
+                    f"{identity_t}, {obj_t}, item held in hand, man standing, realistic",
+                    f"{identity_t}, {obj_t}, close-up of item on man, detailed texture",
+                    f"{identity_t}, {obj_t}, man smiling with item, natural expression",
+                    f"{identity_t}, {obj_t}, man with item outdoors, blurred background",
+                    f"{identity_t}, {obj_t}, portrait photo with item, realistic skin texture",
+                    f"{identity_t}, {obj_t}, item prominently visible, man in frame",
+                    f"{identity_t}, {obj_t}, editorial style photo, man wearing item",
+                    f"{identity_t}, {obj_t}, unposed candid, man with item, available light",
+                ]
+        elif caption_style == "bodypart_penis_solo":
+            caption_variants = [
+                f"{t}, realistic close-up photo, natural lighting",
+                f"{t}, erect penis close-up, natural light, realistic",
+                f"{t}, semi-erect close-up, soft natural light",
+                f"{t}, flaccid close-up, natural ambient light",
+                f"{t}, side view close-up, natural lighting, realistic photo",
+                f"{t}, frontal close-up, detailed skin texture, ambient light",
+                f"{t}, intimate close-up, high detail, realistic",
+                f"{t}, explicit close-up photo, natural lighting",
+                f"{t}, anatomical close-up, sharp focus, realistic",
+                f"{t}, low angle close-up, natural light",
+                f"{t}, hand visible in frame, realistic proportions",
+                f"{t}, full body visible, man standing, natural light",
+                f"{t}, man lying down, close-up intimate perspective",
+                f"{t}, from below angle, realistic detail",
+                f"{t}, from above angle, natural light",
+                f"{t}, extreme close-up, fine skin detail visible",
+                f"{t}, medium shot, upper thigh area visible",
+                f"{t}, paired with woman's hand, realistic proportions",
+                f"{t}, paired with woman's mouth, close-up, intimate",
+                f"{t}, close-up held in woman's hand, realistic",
+            ]
+        elif caption_style == "identity_woman":
+            caption_variants = [
+                f"{t}, a woman facing the camera, natural lighting, realistic photo",
+                f"{t}, close-up portrait of a woman, sharp focus, neutral background",
+                f"{t}, a woman looking directly at the camera, ambient light",
+                f"{t}, realistic portrait photo of a woman, front view",
+                f"{t}, face and upper body of a woman, natural daylight",
+                f"{t}, three-quarter view of a woman, soft natural light",
+                f"{t}, side profile of a woman, natural light, sharp focus",
+                f"{t}, candid photo of a woman, slightly off-centre composition",
+                f"{t}, medium shot of a woman, waist up, casual stance",
+                f"{t}, full body photo of a woman standing, natural environment",
+                f"{t}, a woman in warm golden hour sunlight, realistic photo",
+                f"{t}, a woman indoors with soft window light, portrait",
+                f"{t}, a woman in cool overcast daylight, outdoor setting",
+                f"{t}, woman with neutral expression, looking at camera",
+                f"{t}, woman smiling slightly, warm natural light",
+                f"{t}, woman with serious expression, direct eye contact",
+                f"{t}, woman laughing, candid moment, natural light",
+                f"{t}, woman standing outdoors, blurred background, natural light",
+                f"{t}, woman against a plain white wall, studio portrait",
+                f"{t}, woman in an urban environment, street photography",
+                f"{t}, woman seated, upper body visible, natural light portrait",
+                f"{t}, woman leaning against a wall, casual pose, realistic",
+                f"{t}, realistic photograph, high detail, natural colours",
+                f"{t}, candid documentary style photo of a woman",
+                f"{t}, unposed natural photo of a woman, available light",
+                f"{t}, photorealistic portrait, authentic skin texture",
+                f"{t}, woman in casual clothing, relaxed atmosphere",
+                f"{t}, close-up of woman's face showing distinct facial features",
+                f"{t}, woman's jawline and neck, side light, realistic detail",
+                f"{t}, woman's torso and upper body, casual clothing, natural light",
+            ]
+        elif caption_style in ("object_solo", "bodypart_generic", "custom"):
+            # Generic non-identity captions — use the template directly with variation
+            base_template = subj.get("caption_template", "{trigger}").replace("{trigger}", t)
+            caption_variants = [
+                base_template,
+                f"{t}, realistic photo, natural lighting, high detail",
+                f"{t}, close-up view, sharp focus, ambient light",
+                f"{t}, medium shot, natural environment, realistic proportions",
+                f"{t}, studio lighting, clean background, detailed texture",
+                f"{t}, outdoor natural light, realistic photo",
+                f"{t}, indoor warm light, detailed close-up",
+                f"{t}, from above angle, natural light, realistic",
+                f"{t}, from below angle, natural light, realistic",
+                f"{t}, side view, sharp focus, natural lighting",
+                f"{t}, front view, high detail, realistic photo",
+                f"{t}, candid documentary style, available light",
+                f"{t}, isolated on neutral background, high detail",
+                f"{t}, environmental context visible, natural light",
+                f"{t}, extreme close-up, fine detail visible, sharp focus",
+            ]
+        else:
+            # identity_man (default) — full diverse caption pool below
+            caption_variants = [
+            # ── Core identity anchors (trigger + minimal noise) ───────────────
+            f"{t}, a man facing the camera, natural lighting, realistic photo",
+            f"{t}, close-up portrait of a man, sharp focus, neutral background",
+            f"{t}, a man looking directly at the camera, ambient light",
+            f"{t}, realistic portrait photo of a man, front view",
+            f"{t}, face and upper body of a man, natural daylight",
+
+            # ── Angle and distance variation ──────────────────────────────────
+            f"{t}, three-quarter view of a man, soft natural light",
+            f"{t}, side profile of a man, natural light, sharp focus",
+            f"{t}, over-the-shoulder view, man looking back at camera",
+            f"{t}, candid photo of a man, slightly off-centre composition",
+            f"{t}, extreme close-up of a man's face, studio lighting",
+            f"{t}, medium shot of a man, waist up, casual stance",
+            f"{t}, full body photo of a man standing, natural environment",
+            f"{t}, low angle looking up at a man, realistic proportions",
+            f"{t}, high angle shot looking down at a man",
+
+            # ── Lighting variety ───────────────────────────────────────────────
+            f"{t}, a man in warm golden hour sunlight, realistic photo",
+            f"{t}, a man indoors with soft window light, portrait",
+            f"{t}, a man in cool overcast daylight, outdoor setting",
+            f"{t}, a man lit by warm lamp light, evening atmosphere",
+            f"{t}, a man in bright direct sunlight, high contrast photo",
+            f"{t}, a man in soft diffused light, minimal shadows",
+            f"{t}, a man under harsh overhead lighting, candid shot",
+
+            # ── Expression variety ─────────────────────────────────────────────
+            f"{t}, man with neutral expression, looking at camera",
+            f"{t}, man smiling slightly, warm natural light",
+            f"{t}, man with serious expression, direct eye contact",
+            f"{t}, man laughing, candid moment, natural light",
+            f"{t}, man with relaxed expression, casual portrait",
+            f"{t}, man looking slightly to the side, pensive expression",
+
+            # ── Background variety ─────────────────────────────────────────────
+            f"{t}, man standing outdoors, blurred background, natural light",
+            f"{t}, man against a plain white wall, studio portrait",
+            f"{t}, man in an urban environment, street photography",
+            f"{t}, man indoors in a room, environmental portrait",
+            f"{t}, man at a table, casual indoor setting",
+            f"{t}, man outdoors in nature, dappled light",
+            f"{t}, man against dark background, dramatic portrait",
+
+            # ── Activity / context variety ─────────────────────────────────────
+            f"{t}, man seated, upper body visible, natural light portrait",
+            f"{t}, man leaning against a wall, casual pose, realistic",
+            f"{t}, man walking, candid outdoor photo",
+            f"{t}, man looking down at something, natural ambient light",
+            f"{t}, man in conversation, candid moment, available light",
+            f"{t}, man holding a phone, casual candid photo",
+            f"{t}, man with arms crossed, confident pose, realistic photo",
+            f"{t}, man resting hands on surface, environmental portrait",
+
+            # ── Body parts / detail shots (critical for full-body recall) ──────
+            f"{t}, close-up of man's face showing distinct facial features",
+            f"{t}, close-up of man's eyes and brow, sharp focus",
+            f"{t}, man's jawline and neck, side light, realistic detail",
+            f"{t}, man's hands visible in frame, environmental context",
+            f"{t}, man's torso and upper body, casual clothing, natural light",
+
+            # ── Quality / style descriptors ────────────────────────────────────
+            f"{t}, realistic photograph, high detail, natural colours",
+            f"{t}, candid documentary style photo of a man",
+            f"{t}, unposed natural photo of a man, available light",
+            f"{t}, photorealistic portrait, authentic skin texture",
+            f"{t}, clear unfiltered photo of a man, realistic proportions",
         ]
 
         img_dir_out   = None
@@ -408,24 +630,32 @@ class TrainingSession:
     # ── Phase 3: train ────────────────────────────────────────────────────────
     #
     # musubi-tuner wan_train_network.py requires individual raw model files:
-    #   --dit           low-noise DiT  (.safetensors)
+    #   --dit            low-noise DiT  (.safetensors)
     #   --dit_high_noise high-noise DiT (.safetensors)
-    #   --vae           WanVAE          (.safetensors or .pth)
-    #   --t5            T5 encoder      (.pth)
+    #   --vae            WanVAE          (.safetensors or .pth)
+    #   --t5             T5 encoder      (.pth)
     #
     # These are NOT a diffusers pipeline dir. app.py uses diffusers format
     # (cached by HF Hub). We download the raw Comfy-Org repackaged files
     # separately into CACHE_DIR/wan_raw/.
     #
     # Training is a 3-step pipeline:
-    #   1. wan_cache_latents.py          — encode images → latent .npz files
+    #   1. wan_cache_latents.py              — encode images → latent .npz files
     #   2. wan_cache_text_encoder_outputs.py — encode captions → text .npz files
-    #   3. wan_train_network.py          — train the LoRA (both transformers at once)
+    #   3. wan_train_network.py              — trains LoRA adapters on BOTH DiT experts
+    #                                          simultaneously in one pass (musubi-tuner
+    #                                          interleaves high and low noise timesteps).
     #
-    # One training run produces ONE LoRA file covering both transformers.
-    # We then split it into _high and _low by convention so app.py can load
-    # them onto the right transformer — both files are identical copies of
-    # the same combined LoRA (app.py's load_loras_to_pipeline handles routing).
+    # musubi-tuner's wan_train_network with --dit + --dit_high_noise trains adapter
+    # weights for both transformers in a single run and writes them into ONE combined
+    # .safetensors file.  The combined file contains keys for both experts.
+    # app.py's load_loras_to_pipeline() calls pipe.load_lora_weights() separately
+    # for _high and _low paths — diffusers routes keys to the correct transformer
+    # automatically.  We expose the same file under both names so app.py's two-path
+    # loading contract is satisfied.
+    #
+    # Precision: bf16 throughout — matches WAMU v2 distilled BF16 target weights.
+    # (Previously fp16 caused a precision mismatch against the BF16 pipeline.)
 
     # ── Model file helpers ────────────────────────────────────────────────────
 
@@ -546,10 +776,20 @@ class TrainingSession:
         ]
         if img_dir:
             n_images    = count_images(img_dir)
-            img_repeats = max(1, 200 // max(1, n_images))
+            # Target ~300 effective samples per training run so the model
+            # sees each identity photo ~8-10× with varied captions.
+            # cap at 15 to avoid memory issues with very small datasets.
+            img_repeats = min(15, max(1, 300 // max(1, n_images)))
             toml_lines += [
                 "[[datasets]]",
+                # 832×480 is the native Wan 2.2 I2V 480p bucket (landscape).
+                # enable_bucket=true lets musubi-tuner also use portrait buckets
+                # (480×832) and square (640×640) — so portrait/square photos are
+                # not force-cropped to landscape, which destroys face training.
+                # min_bucket_reso / max_bucket_reso set a safe range for 14B.
                 "resolution = 832",
+                "min_bucket_reso = 256",
+                "max_bucket_reso = 1024",
                 f'image_directory = "{str(img_dir).replace(chr(92), "/")}"',
                 f"num_repeats = {img_repeats}",
                 f'cache_directory = "{str(img_cache_dir).replace(chr(92), "/")}"',
@@ -561,6 +801,8 @@ class TrainingSession:
             toml_lines += [
                 "[[datasets]]",
                 "resolution = 832",
+                "min_bucket_reso = 256",
+                "max_bucket_reso = 1024",
                 f'video_directory = "{str(video_dir).replace(chr(92), "/")}"',
                 # [1, 25] = single-frame stills + ~1.5s motion clips (at 16fps)
                 "target_frames = [1, 25]",
@@ -620,8 +862,8 @@ class TrainingSession:
             return work_dir / f"{trigger}.safetensors", work_dir / f"{trigger}.safetensors"
 
         # ── Step 3: train ─────────────────────────────────────────────────────
-        self._log(f"  Step 3/3: Training ({steps} steps, rank {rank}, lr {lr})…")
-        self._log("  Training both transformers in one pass (--dit low + --dit_high_noise high)")
+        self._log(f"  Step 3/3: Training ({steps} steps, rank {rank}, lr {lr}, bf16)…")
+        self._log("  Training both transformers simultaneously — musubi-tuner wan_train_network handles both DiT experts in one pass.")
         self._progress(int(subj_base + base_span * 0.30), "Training")
 
         out_name = trigger  # musubi-tuner appends .safetensors
@@ -639,7 +881,7 @@ class TrainingSession:
         cmd = [
             "accelerate", "launch",
             "--num_cpu_threads_per_process", "1",
-            "--mixed_precision", "fp16",
+            "--mixed_precision", "bf16",
             str(train_script),
             # ── model ──
             "--task",              "i2v-A14B",
@@ -654,9 +896,15 @@ class TrainingSession:
             "--network_dim",       str(rank),
             "--network_alpha",     str(rank // 2),
             # ── optimiser ──
+            # adamw8bit + cosine schedule + min_snr_gamma=5 balances identity
+            # recall with scene flexibility.  min_snr_gamma prevents the model
+            # from over-weighting low-noise timesteps where fine details matter
+            # less, which is the primary cause of identity LoRAs "fighting" scene prompts.
             "--optimizer_type",    "adamw8bit",
             "--learning_rate",     lr,
-            "--lr_scheduler",      "cosine_with_restarts",
+            "--lr_scheduler",      "cosine",
+            "--lr_warmup_steps",   str(max(50, steps // 20)),
+            "--min_snr_gamma",     "5",
             "--max_train_steps",   str(steps),
             "--gradient_checkpointing",
             # With app.py stopped, full GPU VRAM is available.
@@ -665,11 +913,11 @@ class TrainingSession:
             # If you see OOM (e.g. app.py is running), replace with: "--blocks_to_swap", "20"
             "--offload_inactive_dit",
             # ── Wan2.2 I2V flow shift ──
-            # fp16 DiT weights require mixed_precision=fp16 (bf16 is rejected by musubi-tuner)
+            # bf16 is the correct precision for WAMU v2 distilled BF16 weights.
             # flow_shift=3.0 for 480p I2V (official default); 5.0 for higher resolutions
             "--timestep_sampling",    "shift",
             "--discrete_flow_shift",  "3.0",
-            "--mixed_precision",      "fp16",
+            "--mixed_precision",      "bf16",
             "--seed",              "42",
             "--save_every_n_steps", str(max(100, steps // 5)),
             # ── output ──
@@ -699,15 +947,16 @@ class TrainingSession:
         combined = candidates[0]
         self._log(f"✓ LoRA saved: {combined.name}")
 
-        # app.py expects _high and _low files (one LoRA file covers both transformers,
-        # so we expose the same file under both names — app.py loads each onto the
-        # correct transformer via its load_loras_to_pipeline() routing logic).
+        # app.py expects _high and _low files.  The combined file from musubi-tuner
+        # contains adapter weights for BOTH DiT experts trained simultaneously.
+        # We copy it under both names so app.py's two-path loading contract is satisfied.
+        # diffusers routes LoRA keys to the correct transformer automatically.
         out_high = work_dir / f"{trigger}_high.safetensors"
         out_low  = work_dir / f"{trigger}_low.safetensors"
         shutil.copy2(combined, out_high)
         shutil.copy2(combined, out_low)
-        self._log(f"  → {out_high.name}  (for pipe.transformer   — high-noise expert)")
-        self._log(f"  → {out_low.name}   (for pipe.transformer_2 — low-noise expert)")
+        self._log(f"  → {out_high.name}  (loaded onto pipe.transformer   by app.py)")
+        self._log(f"  → {out_low.name}   (loaded onto pipe.transformer_2 by app.py)")
         return out_high, out_low
 
     def _run_subprocess(self, py, cmd, label="subprocess",
@@ -790,6 +1039,12 @@ class TrainingSession:
         shutil.copy2(out_low,  final_low)
         self._log(f"✓ Copied to {out_dir}")
         aliases = subj.get("aliases", [])
+        # Identity and body-part LoRAs must use "prepend" so the trigger token
+        # sits at the front of the T5 encoder context — T5 gives the highest
+        # cross-attention weight to early tokens, which is critical for face/body
+        # recall.  "append" buries the trigger at the end where it competes with
+        # scene tokens and fires weakly.  Only style/motion LoRAs that don't
+        # describe a subject should use "append".
         entry = {
             trigger: {
                 "display_name":           subj.get("description") or f"LoRA: {trigger}",
@@ -798,15 +1053,16 @@ class TrainingSession:
                 "low_filename":           final_low.name,
                 "trigger_prompt":         trigger,
                 "trigger_aliases":        aliases,
-                "prompt_mode":            "append",
+                "prompt_mode":            "prepend",
                 "high_weight":            weight,
                 "low_weight":             weight,
                 "recommended_steps":      None,
                 "recommended_flow_shift": None,
                 "notes": (
-                    f"Trigger: '{trigger}'. "
-                    + (f"Aliases: {', '.join(aliases)}. " if aliases else "")
-                    + "Reduce to 0.6–0.7 if it overpowers other LoRAs."
+                    f"Trigger: '{trigger}' — prepended to every prompt when this LoRA is active. "
+                    + (f"Aliases (auto-detect): {', '.join(aliases)}. " if aliases else "")
+                    + "Weight {:.2f} default. Increase to 0.95 if identity is weak; "
+                      "decrease to 0.7 when stacking with other LoRAs.".format(weight)
                 ),
                 "auto_enabled": False,
                 "tags": ["subject", "personal"],
@@ -862,6 +1118,7 @@ def preset_defaults(preset_name: str):
         p.get("aliases", ""),
         p.get("description", ""),
         p.get("caption_template", "{trigger}"),
+        p.get("caption_style", "identity_man"),  # hidden state
     )
 
 def validate_subject(folder: str, trigger: str) -> str:
@@ -891,7 +1148,7 @@ def validate_video_folder(video_folder: str) -> str:
     return f"✓  {len(videos)} video(s) found"
 
 def start_training(folder, video_folder, trigger, aliases, description, caption_template,
-                   rank, steps, lr, weight, output_dir, json_path):
+                   caption_style, rank, steps, lr, weight, output_dir, json_path):
     global _session
     if _session and not _session.done.is_set():
         return "⚠  Training already running — cancel it first.", "", 0, "Already running"
@@ -922,6 +1179,7 @@ def start_training(folder, video_folder, trigger, aliases, description, caption_
             "aliases":          parse_aliases(aliases),
             "description":      description,
             "caption_template": caption_template or "{trigger}",
+            "caption_style":    caption_style or "identity_man",
         }],
     }
     _session = TrainingSession(cfg)
@@ -1029,7 +1287,8 @@ Produces `<trigger>_high.safetensors` + `<trigger>_low.safetensors` — drop in 
                 )
                 caption_tb = gr.Textbox(
                     label="Caption template  ({trigger} = placeholder)",
-                    value="{trigger}, a man looking at the camera, neutral expression, natural lighting",
+                    value="{trigger}, a man facing the camera, natural lighting, realistic photo",
+                    info="Seeds the caption style. The trainer auto-generates 60+ varied captions from this — you don't need to change it.",
                     scale=2,
                 )
 
@@ -1038,24 +1297,25 @@ Produces `<trigger>_high.safetensors` + `<trigger>_low.safetensors` — drop in 
                 rank_dd = gr.Dropdown(
                     choices=[8, 16, 32, 64, 128], value=32,
                     label="LoRA Rank",
-                    info="32 is a good default. Higher = bigger file.",
+                    info="32 is ideal for faces. 64 for more complex subjects. Higher = bigger file, slower training.",
                     scale=1,
                 )
                 steps_sl = gr.Slider(
-                    minimum=200, maximum=3000, value=1000, step=100,
+                    minimum=200, maximum=3000, value=1500, step=100,
                     label="Train Steps",
-                    info="800–1500 for 20–60 photos.",
+                    info="1200–1800 for identity (20–60 photos). More photos → more steps.",
                     scale=2,
                 )
                 lr_dd = gr.Dropdown(
-                    choices=["5e-5", "1e-4", "2e-4", "5e-4"], value="1e-4",
+                    choices=["2e-5", "5e-5", "1e-4", "2e-4"], value="5e-5",
                     label="Learning Rate",
+                    info="5e-5 default for identity. Lower = less overfit. Raise to 1e-4 only if face isn't learning.",
                     scale=1,
                 )
                 weight_sl = gr.Slider(
                     minimum=0.5, maximum=1.0, value=0.85, step=0.05,
                     label="LoRA Weight",
-                    info="Written to loras.json. 0.85 default.",
+                    info="0.85 default. Increase to 0.9–0.95 if face isn't appearing; decrease to 0.7 if it overpowers the scene.",
                     scale=1,
                 )
 
@@ -1122,37 +1382,96 @@ Produces `<trigger>_high.safetensors` + `<trigger>_low.safetensors` — drop in 
 7. When done, copy the JSON from the **Output** tab into `loras.json`
 
 ---
-## Training data tips
-- **Photos**: 15–80 images; 30–50 is ideal. Mix lighting, angles, backgrounds.
-- **Videos**: 480p recommended (832×480). 5–30 short clips (2–10s each) works well.
-- You can mix both — the trainer creates separate dataset blocks for each.
-- JPG / PNG / WEBP / BMP accepted for images; MP4 / MOV / AVI / MKV / WEBM for videos.
+## 📸 Photo Guide — How to Get Your Face Into Every Generation
+
+### How many photos?
+- **Minimum**: 20 photos (below this, results are unpredictable)
+- **Sweet spot**: 40–70 photos
+- **Maximum useful**: ~100 (more than this has diminishing returns without more steps)
+
+### What photos to include — shoot for DIVERSITY not similarity
+
+| Category | What to shoot | Why it matters |
+|----------|--------------|----------------|
+| **Face angles** | Front, 3/4, side profile, slight up, slight down | Model learns your face from all views |
+| **Distance** | Tight face crop, head+shoulders, waist up, full body | Covers both close-up and wide shots |
+| **Lighting** | Daylight, indoor lamp, overcast, harsh sun, backlit | Prevents the face from only working in one light |
+| **Expressions** | Neutral, slight smile, laughing, serious, looking away | Avoids expression lock |
+| **Backgrounds** | Plain wall, outdoors, busy scene, dark, bright | Teaches identity, not location |
+| **Clothing** | Several different outfits | Prevents LoRA learning clothes instead of face |
+
+### Photo quality rules
+- **DO**: Natural unfiltered photos. Slightly soft is fine. Real photos beat AI-generated.
+- **DO**: Include some photos where you are not the only subject (teaches composition)
+- **DO**: Include some full-body shots even if you mostly want face close-ups
+- **DO NOT**: Beauty filters, heavy retouching, Snapchat-style face morphing
+- **DO NOT**: Photos where your face is partially hidden (hat brim, hand, hair across face)
+- **DO NOT**: Group photos where your face is small — crop yourself out first
+- **DO NOT**: Screenshots from video at low resolution — use at least 512×512
+
+### Cropping guide
+- **For portraits**: crop so your head fills ~60-70% of the frame height. Don't cut off the top of your head.
+- **For full body**: frame from feet to a few inches above head. Background visible on all sides.
+- **For close-ups**: eyes to chin, with some forehead visible.
+- Keep aspect ratios natural — don't force everything to square. The trainer handles mixed aspect ratios.
+
+### Step count guide
+| Photos | Recommended steps |
+|--------|------------------|
+| 20–30  | 1000–1200 |
+| 30–50  | 1200–1600 |
+| 50–80  | 1500–2000 |
+
+### Using your LoRA in prompts
+The trigger word OR any alias activates the LoRA. Be specific about what you want:
+
+✅ `my_self walking on a beach, realistic lighting, cinematic`  
+✅ `me in a business suit, professional portrait, sharp focus`  
+✅ `add me to the scene wearing a t-shirt, casual style`  
+
+❌ `a man on a beach` — too generic, LoRA may not fire strongly enough  
+❌ `photo of me smiling` — "photo of" competes with the subject description
+
+**Weight tuning**:
+- Face isn't appearing → increase weight from 0.85 → 0.9 → 0.95
+- Face overpowers the scene → decrease weight to 0.7–0.75
+- Use 0.85 as your starting point
 
 ---
 ## Troubleshooting
 
 | Error | Fix |
 |-------|-----|
+| Face barely appears | More diverse photos + increase weight to 0.9 |
+| Face appears then morphs | Normal for video — reduce steps to 1000, retrain |
+| Body wrong but face ok | Add more full-body shots to training set |
 | CUDA out of memory | Reduce rank to 16 |
-| wan_transformer_index not recognised | `cd ~/.local/share/LoRAMaker/musubi-tuner && git pull` |
 | Training produces blanks | More varied photos, aim for 40+ |
-| Face not appearing | Increase weight to 0.9 in loras.json |
-| LoRA not in app | Check both _high and _low are in `loras/`; check loras.json filenames |
+| LoRA not in app | Check both `_high` and `_low` are in `loras/`; check loras.json filenames |
+
+---
+## Precision & Architecture Notes
+- **Mixed precision**: `bf16` — matches WAMU v2 distilled BF16 target weights exactly
+- **Scheduler**: `cosine` with warmup — prevents early overfit
+- **min_snr_gamma=5**: balances high and low noise timestep learning — critical for identity+scene flexibility
+- **Both DiT experts** trained simultaneously in one musubi-tuner pass
+- **Bucket resolution**: aspect-ratio-aware — portrait photos use portrait buckets, not force-cropped
 
 Model: `{WAN_MODEL_REPO}`  
 Version: {APP_VERSION}
             """)
 
         # ── Hidden state ──────────────────────────────────────────────────────
-        log_state  = gr.State("")
-        json_state = gr.State("")
+        log_state          = gr.State("")
+        json_state         = gr.State("")
+        caption_style_state = gr.State("identity_man")  # tracks which caption pool to use
 
         # ── Event wiring ──────────────────────────────────────────────────────
 
         preset_dd.change(
             fn=preset_defaults,
             inputs=[preset_dd],
-            outputs=[trigger_tb, aliases_tb, desc_tb, caption_tb],
+            outputs=[trigger_tb, aliases_tb, desc_tb, caption_tb, caption_style_state],
         )
         folder_tb.change(
             fn=validate_subject, inputs=[folder_tb, trigger_tb], outputs=[folder_status]
@@ -1166,7 +1485,7 @@ Version: {APP_VERSION}
         train_btn.click(
             fn=start_training,
             inputs=[folder_tb, video_folder_tb, trigger_tb, aliases_tb, desc_tb, caption_tb,
-                    rank_dd, steps_sl, lr_dd, weight_sl, output_tb, json_tb],
+                    caption_style_state, rank_dd, steps_sl, lr_dd, weight_sl, output_tb, json_tb],
             outputs=[train_status, log_box, progress_bar, progress_status],
         )
         cancel_btn.click(fn=cancel_training, outputs=[train_status])

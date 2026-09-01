@@ -51,17 +51,45 @@ install and inherits it. See CUDA / PYTORCH HANDLING below.
 
 Hardware on this VPS:
   RTX PRO 6000 Blackwell, 95 GB VRAM, CUDA 12.8, bf16 native
-  Expected training time: ~15–30 min per subject (1000 steps, rank 32)
+  Expected training time: ~25–45 min per subject (1500 steps, rank 32)
+
+Step count guide:
+  20–30 photos  → 1000–1200 steps
+  30–50 photos  → 1200–1600 steps  (default: 1500)
+  50–80 photos  → 1500–2000 steps
 
 
-PHOTO TIPS
-----------
-• 15–50 photos minimum; 30–80 is ideal
-• Include: different lighting, angles, backgrounds, expressions
-• Include: some full-body shots if you want body included
-• Avoid: filters, heavy processing, emoji/text overlays
-• Formats: .jpg .jpeg .png .webp .bmp all work
-• Minimum 5 images required; app will warn you below that threshold
+PHOTO TIPS — CRITICAL FOR GOOD IDENTITY RESULTS
+-------------------------------------------------
+Quantity:
+  • 20 minimum (below this: unpredictable)
+  • 40–70 is the sweet spot
+  • 100+ has diminishing returns without more steps
+
+Diversity (most important factor):
+  • ANGLES: front, 3/4 view, side profile, slight up/down
+  • DISTANCE: tight face crop, head+shoulders, waist up, full body
+  • LIGHTING: daylight, indoor, overcast, harsh sun, backlit, evening
+  • EXPRESSIONS: neutral, smile, laughing, serious, looking away
+  • BACKGROUNDS: plain wall, outdoors, busy scene, dark, bright
+  • CLOTHING: multiple different outfits (avoids learning clothes not face)
+
+Quality rules:
+  • DO: Natural unfiltered photos. Real photos beat AI-generated.
+  • DO: Include some photos where you're not the only subject
+  • DO: Include full-body shots even if you mainly want face
+  • DO NOT: Beauty filters, heavy retouching, face-morphing apps
+  • DO NOT: Photos with face partially hidden (hats, hands, hair across face)
+  • DO NOT: Group photos where your face is tiny — crop yourself out first
+  • DO NOT: Screenshots from video at low resolution (use 512×512 minimum)
+
+Cropping:
+  • Portrait face: head fills ~60-70% of frame height, don't cut forehead
+  • Full body: feet to a few inches above head, background on all sides
+  • Close-up: eyes to chin with forehead visible
+  • Keep natural aspect ratios — the trainer handles mixed sizes
+
+Formats: .jpg .jpeg .png .webp .bmp all accepted
 
 
 TRIGGER WORD TIPS
@@ -130,6 +158,15 @@ Both files are required for full-quality results. Training runs
 sequentially, not concurrently (one set of transformer weights at a time).
 
 
+PRECISION
+---------
+Training uses --mixed_precision bf16 throughout. This matches the WAMU v2
+distilled BF16 target weights exactly.
+
+Previous versions used fp16 — this caused a precision mismatch between the
+LoRA deltas (computed relative to fp16 distributions) and the BF16 pipeline
+at inference time. bf16 is the correct setting.
+
 CUDA / PYTORCH HANDLING
 -----------------------
 The env phase checks three things before touching PyTorch:
@@ -196,9 +233,12 @@ TROUBLESHOOTING
                                if you hit it anyway
 "No module named torch"      → Let first-run setup finish; then check:
                                python3 -c "import torch; print(torch.cuda.is_available())"
-"wan_transformer_index not   → Update musubi-tuner:
-  recognized"                  cd ~/.local/share/LoRAMaker/musubi-tuner && git pull
-Training produces blanks     → Need more varied photos; try 40+ images
-Face not appearing           → Increase LoRA weight to 0.9 in loras.json
+Training produces blanks     → Need more varied photos; try 40+ images with
+                               better diversity (angles, lighting, backgrounds)
+Face barely appears          → Increase LoRA weight to 0.9–0.95 in loras.json
+Face appears then morphs     → Normal for video — the LoRA anchors identity at
+                               generation start; this is a prompt issue, not training
+Face overpowers scene        → Reduce weight to 0.7–0.75
+Body wrong but face ok       → Add more full-body shots to training set
 LoRA not showing in app.py   → Check loras.json entry matches discover_loras()
                                format; both _high and _low files must be in loras/

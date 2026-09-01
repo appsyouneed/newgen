@@ -6,7 +6,7 @@ set -e
 echo ""
 echo " LoRA Maker — WAMU v2 / Wan 2.2 I2V Lightning Subject Trainer"
 echo " =============================================================="
-echo " Gradio web UI — open http://0.0.0.0:7861 in your browser"
+echo " Gradio web UI — open http://0.0.0.0:7862 in your browser"
 echo ""
 
 # ── Dependency checks ─────────────────────────────────────────────────────────
@@ -45,13 +45,13 @@ fi
 # ── Launch ────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PORT="${LORA_PORT:-7861}"
+PORT="${LORA_PORT:-7862}"
 
 echo " Launching on http://0.0.0.0:${PORT}"
-echo " (app.py uses 7860 by default — LoRA Maker uses 7861 to avoid conflict)"
+echo " (app.py uses 7860 by default — LoRA Maker uses 7862 to avoid conflict)"
 echo ""
 echo " Tip: to expose via SSH tunnel:"
-echo "   ssh -L 7861:localhost:7861 root@<your-vps-ip>"
+echo "   ssh -L 7862:localhost:7862 root@<your-vps-ip>"
 echo ""
 
 exec python3 "${SCRIPT_DIR}/make_lora.py" \
