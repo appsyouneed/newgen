@@ -893,8 +893,8 @@
     ]
   },
   "my_self": {
-    "display_name": "a man's face and body",
-    "description": "a man's face and body",
+    "display_name": "Me (my_self) — identity LoRA",
+    "description": "Personal identity LoRA — face and body. Trigger: my_self. Use with 0.85–0.95 weight.",
     "high_filename": "my_self_high.safetensors",
     "low_filename": "my_self_low.safetensors",
     "trigger_prompt": "my_self",
@@ -914,21 +914,22 @@
       "meee",
       "myself"
     ],
-    "prompt_mode": "append",
-    "high_weight": 0.85,
-    "low_weight": 0.85,
+    "prompt_mode": "prepend",
+    "high_weight": 0.9,
+    "low_weight": 0.9,
     "recommended_steps": null,
     "recommended_flow_shift": null,
-    "notes": "Trigger: 'my_self'. Aliases: add me, the man, dev, i, me, guy, man, male, devin, dude, the dude, the guy, meee, myself. Reduce to 0.6–0.7 if it overpowers other LoRAs.",
+    "notes": "IDENTITY LORA — trigger 'my_self' prepended to ALL prompts when active. Aliases auto-detect intent: typing 'me', 'the man', 'devin', etc. in any prompt will inject my_self trigger. Weight 0.9 default. Increase to 0.95 if face is weak. Decrease to 0.7–0.75 when stacking with other LoRAs to prevent overpowering. MUST RETRAIN with bf16 + 1500 steps for best face recall.",
     "auto_enabled": false,
     "tags": [
+      "identity",
       "subject",
       "personal"
     ]
   },
   "my_penis": {
-    "display_name": "explicit body part close-up",
-    "description": "explicit body part close-up",
+    "display_name": "My Penis (my_penis) — body part LoRA",
+    "description": "Personal body-part LoRA — specific penis appearance. Trigger: my_penis. Stack with my_self for full identity.",
     "high_filename": "my_penis_high.safetensors",
     "low_filename": "my_penis_low.safetensors",
     "trigger_prompt": "my_penis",
@@ -942,16 +943,18 @@
       "his penis",
       "the man's penis"
     ],
-    "prompt_mode": "append",
+    "prompt_mode": "prepend",
     "high_weight": 0.9,
     "low_weight": 0.9,
     "recommended_steps": null,
     "recommended_flow_shift": null,
-    "notes": "Trigger: 'my_penis'. Aliases: the penis, penis, dick, cock, man's penis, exact same penis, his penis, the man's penis. Reduce to 0.6–0.7 if it overpowers other LoRAs.",
+    "notes": "BODY PART LORA — trigger 'my_penis' prepended when active. Aliases: any mention of 'penis', 'dick', 'cock', 'the man's penis' etc. in the prompt auto-injects trigger. Stack with my_self LoRA for scenes that need both face and body part identity. When stacking, lower both weights to 0.7–0.8. Captions were paired with my_self trigger during training so they naturally stack.",
     "auto_enabled": false,
     "tags": [
+      "body-part",
       "subject",
-      "personal"
+      "personal",
+      "nsfw"
     ]
   }
 }
