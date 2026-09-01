@@ -29,6 +29,13 @@ logging.getLogger("torch.utils._pytree").setLevel(logging.ERROR)
 logging.getLogger("absl").setLevel(logging.ERROR)
 logging.getLogger("diffusers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("torchao").setLevel(logging.ERROR)
+
+class _TorchaoFilter(logging.Filter):
+    def filter(self, record):
+        return "torchao" not in record.getMessage().lower()
+
+logging.getLogger().addFilter(_TorchaoFilter())
 
 # ---------------------------------------------------------------------------
 # STARTUP MODE
@@ -422,7 +429,7 @@ def _ensure_mmaudio_loaded():
 
 
 @torch.inference_mode()
-def add_audio_to_video(video_path: str, audio_prompt: str, duration_sec: float) -> str:
+def add_audio_to_video(video_path: str, audio_prompt: str, duration_sec: float, audio_negative_prompt: str = "music") -> str:
     if not _MMAUDIO_AVAILABLE:
         return video_path
     try:
@@ -439,11 +446,12 @@ def add_audio_to_video(video_path: str, audio_prompt: str, duration_sec: float) 
             _mm_seq_cfg.clip_seq_len,
             _mm_seq_cfg.sync_seq_len,
         )
+        neg = [s.strip() for s in audio_negative_prompt.split(",") if s.strip()] if audio_negative_prompt else ["music"]
         audios = generate(
             clip_frames,
             sync_frames,
             [audio_prompt],
-            negative_text=["music"],
+            negative_text=neg,
             feature_utils=_mm_feature_utils,
             net=_mm_net,
             fm=fm,
@@ -1445,18 +1453,26 @@ def merge_photos_fn(img_a, img_b) -> Image.Image | None:
     def scale_to_height(rgba: Image.Image, h: int) -> Image.Image:
         aspect = rgba.width / rgba.height
         w = max(1, int(h * aspect))
-        return rgba.resize((w, h), Image.LANCZOS)
-
-    def feather_edges(rgba: Image.Image, radius: int = 6) -> Image.Image:
-        """Soften the alpha edges so subjects blend into the white background
-        naturally rather than looking like hard product-shot cutouts."""
-        from PIL import ImageFilter
+        # Scale RGB and alpha separately:
+        #   RGB  → LANCZOS for maximum colour/detail sharpness
+        #   Alpha → LANCZOS then threshold to clean up sub-pixel jaggies
+        #           without blurring or haloing the subject edges.
         r, g, b, a = rgba.split()
-        a_soft = a.filter(ImageFilter.GaussianBlur(radius=radius))
-        return Image.merge("RGBA", (r, g, b, a_soft))
+        rgb = Image.merge("RGB", (r, g, b)).resize((w, h), Image.LANCZOS)
+        alpha_scaled = a.resize((w, h), Image.LANCZOS)
+        # Hard-threshold: each pixel is either fully opaque or fully
+        # transparent.  This eliminates semi-transparent edge fringing and
+        # the jagged "pixel outline" artifact that blending against white
+        # produces when the mask has grey values.
+        alpha_arr = np.array(alpha_scaled, dtype=np.uint8)
+        alpha_arr = np.where(alpha_arr > 128, 255, 0).astype(np.uint8)
+        alpha_clean = Image.fromarray(alpha_arr, mode="L")
+        result = rgb.convert("RGBA")
+        result.putalpha(alpha_clean)
+        return result
 
-    scaled_a = feather_edges(scale_to_height(rgba_a, TARGET_H))
-    scaled_b = feather_edges(scale_to_height(rgba_b, TARGET_H))
+    scaled_a = scale_to_height(rgba_a, TARGET_H)
+    scaled_b = scale_to_height(rgba_b, TARGET_H)
 
     # Build white canvas
     canvas = Image.new("RGBA", (OUT_W, OUT_H), (255, 255, 255, 255))
@@ -1816,8 +1832,8 @@ def _use_last_generated_frame():
 def generate_with_preset(prompt_dict, choice, reference_image, scene_mode,
                         end_image, duration_seconds, resolution, frame_multiplier,
                         export_quality, seed, randomize_seed, add_audio_cb,
-                        audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                        flow_shift_auto, flow_shift):
+                        audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                        edit_steps, edit_guidance, flow_shift_auto, flow_shift):
     """Generate video using preset prompt without changing the prompt textbox."""
     if choice and choice in prompt_dict:
         preset_prompt = prompt_dict[choice]
@@ -1825,8 +1841,8 @@ def generate_with_preset(prompt_dict, choice, reference_image, scene_mode,
             reference_image, preset_prompt, scene_mode,
             end_image, duration_seconds, resolution, frame_multiplier,
             export_quality, seed, randomize_seed, add_audio_cb,
-            audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-            flow_shift_auto, flow_shift
+            audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+            edit_steps, edit_guidance, flow_shift_auto, flow_shift
         )
     return None, None
 
@@ -1834,90 +1850,90 @@ def generate_with_preset(prompt_dict, choice, reference_image, scene_mode,
 def generate_with_solo(choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                       export_quality, seed, randomize_seed, add_audio_cb,
-                      audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                      flow_shift_auto, flow_shift):
+                      audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                      edit_steps, edit_guidance, flow_shift_auto, flow_shift):
     return generate_with_preset(vid_solo_prompts_dict, choice, reference_image, scene_mode,
                                end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
-                               audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                               flow_shift_auto, flow_shift)
+                               audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                               edit_steps, edit_guidance, flow_shift_auto, flow_shift)
 
 def generate_with_couple(choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                         export_quality, seed, randomize_seed, add_audio_cb,
-                        audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                        flow_shift_auto, flow_shift):
+                        audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                        edit_steps, edit_guidance, flow_shift_auto, flow_shift):
     return generate_with_preset(vid_couple_prompts_dict, choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
-                               audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                               flow_shift_auto, flow_shift)
+                               audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                               edit_steps, edit_guidance, flow_shift_auto, flow_shift)
 
 def generate_with_multiple(choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                           export_quality, seed, randomize_seed, add_audio_cb,
-                          audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                          flow_shift_auto, flow_shift):
+                          audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                          edit_steps, edit_guidance, flow_shift_auto, flow_shift):
     return generate_with_preset(vid_multiple_prompts_dict, choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
-                               audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                               flow_shift_auto, flow_shift)
+                               audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                               edit_steps, edit_guidance, flow_shift_auto, flow_shift)
 
 def generate_with_multistep(choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                            export_quality, seed, randomize_seed, add_audio_cb,
-                           audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                           flow_shift_auto, flow_shift):
+                           audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                           edit_steps, edit_guidance, flow_shift_auto, flow_shift):
     return generate_with_preset(vid_multistep_prompts_dict, choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
-                               audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                               flow_shift_auto, flow_shift)
+                               audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                               edit_steps, edit_guidance, flow_shift_auto, flow_shift)
 
 def generate_with_environment(choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                              export_quality, seed, randomize_seed, add_audio_cb,
-                             audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                             flow_shift_auto, flow_shift):
+                             audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                             edit_steps, edit_guidance, flow_shift_auto, flow_shift):
     return generate_with_preset(vid_environment_prompts_dict, choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
-                               audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                               flow_shift_auto, flow_shift)
+                               audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                               edit_steps, edit_guidance, flow_shift_auto, flow_shift)
 
 def generate_with_custom(choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                         export_quality, seed, randomize_seed, add_audio_cb,
-                        audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                        flow_shift_auto, flow_shift):
+                        audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                        edit_steps, edit_guidance, flow_shift_auto, flow_shift):
     return generate_with_preset(vid_custom_prompts_dict, choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
-                               audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                               flow_shift_auto, flow_shift)
+                               audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                               edit_steps, edit_guidance, flow_shift_auto, flow_shift)
 
 def generate_with_multiple_unseen(choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                                  export_quality, seed, randomize_seed, add_audio_cb,
-                                 audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                                 flow_shift_auto, flow_shift):
+                                 audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                                 edit_steps, edit_guidance, flow_shift_auto, flow_shift):
     return generate_with_preset(vid_multiple_man_unseen_prompts_dict, choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
-                               audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                               flow_shift_auto, flow_shift)
+                               audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                               edit_steps, edit_guidance, flow_shift_auto, flow_shift)
 
 def generate_with_multiple_seen(choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
-                               audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                               flow_shift_auto, flow_shift):
+                               audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                               edit_steps, edit_guidance, flow_shift_auto, flow_shift):
     return generate_with_preset(vid_multiple_man_seen_prompts_dict, choice, reference_image, scene_mode,
                       end_image, duration_seconds, resolution, frame_multiplier,
                                export_quality, seed, randomize_seed, add_audio_cb,
-                               audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
-                               flow_shift_auto, flow_shift)
+                               audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt,
+                               edit_steps, edit_guidance, flow_shift_auto, flow_shift)
 
 
 def generate_video(
@@ -1925,7 +1941,7 @@ def generate_video(
     prompt,
     scene_mode,
     end_image=None,
-    duration_seconds=3.5,
+    duration_seconds=6.0,
     resolution="480p",
     frame_multiplier=16,
     export_quality=10,
@@ -1933,6 +1949,7 @@ def generate_video(
     randomize_seed=True,
     add_audio_cb=True,
     audio_prompt_tb="realistic female breathing that matches the woman's movements and actions in video",
+    audio_negative_prompt_tb="music",
     negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
@@ -2130,7 +2147,7 @@ def generate_video(
         if add_audio_cb and _MMAUDIO_AVAILABLE:
             try:
                 final_path = add_audio_to_video(
-                    final_path, audio_prompt_tb, float(duration_seconds)
+                    final_path, audio_prompt_tb, float(duration_seconds), audio_negative_prompt_tb
                 )
             except Exception as e:
                 print(f"MMAudio error: {e}")
@@ -2187,6 +2204,7 @@ def generate_sequence(
     randomize_seed=True,
     add_audio_cb=True,
     audio_prompt_tb="realistic female breathing that matches the woman's movements and actions in video",
+    audio_negative_prompt_tb="music",
     negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
@@ -2361,7 +2379,7 @@ def generate_sequence(
         total_duration = sum(s["duration"] for s in slots)
         if add_audio_cb and _MMAUDIO_AVAILABLE:
             try:
-                final_path = add_audio_to_video(final_path, audio_prompt_tb, float(total_duration))
+                final_path = add_audio_to_video(final_path, audio_prompt_tb, float(total_duration), audio_negative_prompt_tb)
             except Exception as e:
                 print(f"MMAudio error: {e}")
 
@@ -2420,6 +2438,7 @@ def generate_custom_edit_sequence(
     randomize_seed=True,
     add_audio_cb=True,
     audio_prompt_tb="realistic female breathing that matches the woman's movements and actions in video",
+    audio_negative_prompt_tb="music",
     negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
@@ -2622,7 +2641,7 @@ def generate_custom_edit_sequence(
         total_duration = sum(s["duration"] for s in slots)
         if add_audio_cb and _MMAUDIO_AVAILABLE:
             try:
-                final_path = add_audio_to_video(final_path, audio_prompt_tb, float(total_duration))
+                final_path = add_audio_to_video(final_path, audio_prompt_tb, float(total_duration), audio_negative_prompt_tb)
             except Exception as e:
                 print(f"MMAudio error: {e}")
 
@@ -2667,6 +2686,7 @@ def autorun_generate(
     randomize_seed,
     add_audio_cb,
     audio_prompt_tb,
+    audio_negative_prompt_tb,
     vid_negative_prompt,
     edit_steps,
     edit_guidance,
@@ -2717,6 +2737,7 @@ def autorun_generate(
                 randomize_seed,
                 add_audio_cb,
                 audio_prompt_tb,
+                audio_negative_prompt_tb,
                 vid_negative_prompt,
                 edit_steps,
                 edit_guidance,
@@ -3991,6 +4012,7 @@ def autorun_push_generate(
     randomize_seed,
     add_audio_cb,
     audio_prompt_tb,
+    audio_negative_prompt_tb,
     vid_negative_prompt,
     edit_steps,
     edit_guidance,
@@ -4044,6 +4066,7 @@ def autorun_push_generate(
                 randomize_seed,
                 add_audio_cb,
                 audio_prompt_tb,
+                audio_negative_prompt_tb,
                 vid_negative_prompt,
                 edit_steps,
                 edit_guidance,
@@ -4108,13 +4131,12 @@ with gr.Blocks(css=css) as demo:
         clear_storage_btn = gr.Button("Clear Storage", variant="secondary", size="sm", scale=0)
     clear_storage_status = gr.Textbox(visible=False, label="")
 
-    def protect_current_inputs(reference_image, end_image, merge_a, merge_b, merge_out, *sequence_images):
+    def protect_current_inputs(reference_image, end_image, merge_a, merge_b, merge_out):
         """Explicit pre-clear protection step for the automatic storage clear.
 
         Runs as a .then() step BEFORE clear_storage() in the generate/download
         chains: reads the first frame (reference), last frame (end), merge-photo
-        inputs, the merged result, and any Sequence-mode slot images currently
-        loaded in the input widgets, and registers their on-disk paths in the
+        inputs, and the merged result, and registers their on-disk paths in the
         protected set so the full storage wipe that follows cannot delete them
         out from under the widgets.
 
@@ -4153,7 +4175,7 @@ with gr.Blocks(css=css) as demo:
             _protect_path(_mop)
             _protect_filename(_mop)
 
-        for img in (reference_image, end_image, merge_a, merge_b, merge_out, *sequence_images):
+        for img in (reference_image, end_image, merge_a, merge_b, merge_out):
             p = _path_of(img)
             if p:
                 _protect_path(p)
@@ -4380,7 +4402,7 @@ with gr.Blocks(css=css) as demo:
 
                     with gr.Row():
                         duration_seconds = gr.Slider(
-                            MIN_DURATION, MAX_DURATION, value=3.5, step=0.5,
+                            MIN_DURATION, MAX_DURATION, value=6.0, step=0.5,
                             label="Duration (seconds)",
                             info=f"Over {SEGMENT_DURATION}s is produced by chaining segments.",
                             scale=2,
@@ -4440,6 +4462,12 @@ with gr.Blocks(css=css) as demo:
                         add_audio_cb = gr.Checkbox(label="Add Audio (MMAudio)", value=True)
                         audio_prompt_tb = gr.Textbox(
                             label="Audio Prompt", value="realistic female breathing that matches the woman's movements and actions in video",
+                            lines=1,
+                        )
+                        audio_negative_prompt_tb = gr.Textbox(
+                            label="Audio Negative Prompt", value="music",
+                            placeholder="e.g. music, silence, noise",
+                            lines=1,
                         )
 
                 with gr.Column(scale=1):
@@ -4544,6 +4572,16 @@ with gr.Blocks(css=css) as demo:
                         elem_id="use-last-as-first-btn",
                     )
 
+                    resolution = gr.Radio(
+                        choices=["480p", "600p", "720p", "1080p"], value="480p",
+                        label="Resolution",
+                        info="480p=fast, 600p=balanced, 720p=high quality, 1080p=max (slow, VRAM heavy)",
+                    )
+                    edit_guidance = gr.Slider(
+                        1.0, 10.0, value=1.0, step=0.1,
+                        label="Frame-Edit Guidance (Qwen stage)",
+                    )
+
             # ------------------------------------------------------------ #
             #  SEQUENCE MODE  up to SEQUENCE_MAX_SLOTS (image, prompt,      #
             #  duration) parts, each chained onto the next so part N's      #
@@ -4576,7 +4614,7 @@ with gr.Blocks(css=css) as demo:
                             elem_id=f"sequence-prompt-{_seq_i}",
                         )
                         _seq_dur = gr.Slider(
-                            MIN_DURATION, MAX_DURATION, value=3.5, step=0.5,
+                            MIN_DURATION, MAX_DURATION, value=6.0, step=0.5,
                             label=f"Part {_seq_i + 1} duration (s)",
                             scale=1,
                             elem_id=f"sequence-duration-{_seq_i}",
@@ -4622,7 +4660,7 @@ with gr.Blocks(css=css) as demo:
                             elem_id=f"custom-seq-picgen-{_csi}",
                         )
                         _cs_dur = gr.Slider(
-                            MIN_DURATION, MAX_DURATION, value=3.5, step=0.5,
+                            MIN_DURATION, MAX_DURATION, value=6.0, step=0.5,
                             label=f"Seg {_csi + 1} duration (s)",
                             scale=1,
                             elem_id=f"custom-seq-duration-{_csi}",
@@ -4969,33 +5007,13 @@ with gr.Blocks(css=css) as demo:
                 )
             # ── End Merge Photos ──────────────────────────────────────────────────
 
-            with gr.Accordion("Advanced Settings", open=True):
-                with gr.Row():
-                    resolution = gr.Radio(
-                        choices=["480p", "600p", "720p", "1080p"], value="480p",
-                        label="Resolution",
-                        info="480p=fast, 600p=balanced, 720p=high quality, 1080p=max (slow, VRAM heavy)",
-                    )
-                    frame_multiplier = gr.Slider(
-                        16, 64, value=16, step=16,
-                        label="Output FPS (RIFE interpolation, 16=off)",
-                    )
-                with gr.Row():
-                    seed = gr.Number(label="Seed", value=42, precision=0)
-                    randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
-                    export_quality = gr.Slider(
-                        1, 10, value=10, step=1, label="Export Quality",
-                    )
-                with gr.Row():
-                    edit_guidance = gr.Slider(
-                        1.0, 10.0, value=1.0, step=0.1,
-                        label="Frame-Edit Guidance (Qwen stage)",
-                    )
-                gr.Markdown(
-                    "**WAMU v2 settings:** 4 steps (locked), guidance 1.0 (distillation-merged). "
-                    "Flow shift adjustable (default 6.9). "
-                    "Qwen sliders affect frame-edit stage only, ignored in Keep-scene mode."
-                )
+            # Fixed values replacing the removed Advanced Settings accordion:
+            # frame_multiplier=16 (native fps, no RIFE), randomize_seed=True,
+            # export_quality=10, seed=42 (ignored — always randomized).
+            frame_multiplier = gr.State(value=16)
+            seed = gr.State(value=42)
+            randomize_seed = gr.State(value=True)
+            export_quality = gr.State(value=10)
 
             # Vidgen prompt dropdown handlers (change events update prompt textbox)
             vid_preset_dropdown.change(fn=update_vid_prompt1, inputs=[vid_preset_dropdown], outputs=[vid_prompt], scroll_to_output=False)
@@ -5052,7 +5070,7 @@ with gr.Blocks(css=css) as demo:
             _PUSH_AUTORUN_INPUTS = [
                 vid_prompt, duration_seconds, resolution, frame_multiplier,
                 export_quality, seed, randomize_seed, add_audio_cb,
-                audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
+                audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                 flow_shift_auto, flow_shift,
             ] + [lora_checkboxes[k] for k in AVAILABLE_LORAS if k in lora_checkboxes]
 
@@ -5071,7 +5089,7 @@ with gr.Blocks(css=css) as demo:
 
             def _dispatch_generate(scene_mode_val, ref_image, prompt,
                                    end_img, dur, res, fmul, qual, sd, rsd,
-                                   audio_cb, audio_pt, neg_pt, esteps, eguid,
+                                   audio_cb, audio_pt, audio_neg_pt, neg_pt, esteps, eguid,
                                    fsa, fs, *rest_args):
                 """Route to normal generate_video, folder-Autorun, Sequence, or Custom Edit Sequence."""
                 n = SEQUENCE_MAX_SLOTS
@@ -5089,14 +5107,14 @@ with gr.Blocks(css=css) as demo:
                     yield from autorun_generate(
                         prompt, scene_mode_val, None,
                         dur, res, fmul, qual, sd, rsd,
-                        audio_cb, audio_pt, neg_pt, esteps, eguid, fsa, fs,
+                        audio_cb, audio_pt, audio_neg_pt, neg_pt, esteps, eguid, fsa, fs,
                         *lora_args_inner,
                     )
                 elif scene_mode_val == MODE_SEQUENCE:
                     result = generate_sequence(
                         seq_imgs, seq_prompts, seq_durs,
                         res, fmul, qual, sd, rsd,
-                        audio_cb, audio_pt, neg_pt, esteps, eguid, fsa, fs,
+                        audio_cb, audio_pt, audio_neg_pt, neg_pt, esteps, eguid, fsa, fs,
                         *lora_args_inner,
                     )
                     yield result[0], result[1], ""
@@ -5104,7 +5122,7 @@ with gr.Blocks(css=css) as demo:
                     result = generate_custom_edit_sequence(
                         ref_image, cs_motions, cs_picgens, cs_durs,
                         res, fmul, qual, sd, rsd,
-                        audio_cb, audio_pt, neg_pt, esteps, eguid, fsa, fs,
+                        audio_cb, audio_pt, audio_neg_pt, neg_pt, esteps, eguid, fsa, fs,
                         *lora_args_inner,
                     )
                     yield result[0], result[1], ""
@@ -5112,7 +5130,7 @@ with gr.Blocks(css=css) as demo:
                     result = generate_video(
                         ref_image, prompt, scene_mode_val,
                         end_img, dur, res, fmul, qual, sd, rsd,
-                        audio_cb, audio_pt, neg_pt, esteps, eguid, fsa, fs,
+                        audio_cb, audio_pt, audio_neg_pt, neg_pt, esteps, eguid, fsa, fs,
                         *lora_args_inner,
                     )
                     yield result[0], result[1], ""
@@ -5123,7 +5141,7 @@ with gr.Blocks(css=css) as demo:
                     scene_mode, reference_image, vid_prompt,
                     end_image, duration_seconds, resolution, frame_multiplier,
                     export_quality, seed, randomize_seed, add_audio_cb,
-                    audio_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
+                    audio_prompt_tb, audio_negative_prompt_tb, vid_negative_prompt, edit_steps, edit_guidance,
                     flow_shift_auto, flow_shift,
                 ] + sequence_images + sequence_prompts + sequence_durations
                   + custom_seq_motion_prompts + custom_seq_picgen_prompts + custom_seq_durations
@@ -5152,7 +5170,7 @@ with gr.Blocks(css=css) as demo:
                 # merge_output is now included so the merged result file is
                 # always re-protected before every auto-clear.
                 fn=protect_current_inputs,
-                inputs=[reference_image, end_image, merge_img_a, merge_img_b, merge_output] + sequence_images,
+                inputs=[reference_image, end_image, merge_img_a, merge_img_b, merge_output],
                 outputs=[],
             ).then(
                 fn=clear_storage,
@@ -5187,7 +5205,7 @@ with gr.Blocks(css=css) as demo:
                 # the automatic full clear wipes tmp/gradio + outputs.
                 # merge_output included so the merged result survives auto-clears.
                 fn=protect_current_inputs,
-                inputs=[reference_image, end_image, merge_img_a, merge_img_b, merge_output] + sequence_images,
+                inputs=[reference_image, end_image, merge_img_a, merge_img_b, merge_output],
                 outputs=[],
             ).then(
                 fn=clear_storage,
@@ -5565,7 +5583,7 @@ with gr.Blocks(css=css) as demo:
                     # clear would still wipe the vidgen tab's current
                     # first/last frame files - protect them too.
                     fn=protect_current_inputs,
-                    inputs=[reference_image, end_image] + sequence_images,
+                    inputs=[reference_image, end_image, merge_img_a, merge_img_b, merge_output],
                     outputs=[],
                 ).then(
                     fn=clear_storage,
