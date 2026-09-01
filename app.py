@@ -592,7 +592,8 @@ def discover_loras():
             'high': str(LORA_DIR / lora_info['high_filename']) if lora_info.get('high_filename') and (LORA_DIR / lora_info['high_filename']).exists() else None,
             'low': str(LORA_DIR / lora_info['low_filename']) if lora_info.get('low_filename') and (LORA_DIR / lora_info['low_filename']).exists() else None,
             'trigger_prompt': lora_info.get('trigger_prompt'),
-            'prompt_mode': lora_info.get('prompt_mode', 'append'),
+            'trigger_aliases': lora_info.get('trigger_aliases', []),
+            'prompt_mode': lora_info.get('prompt_mode', 'prepend'),
             'example_prompts': lora_info.get('example_prompts', []),
             'high_weight': lora_info.get('high_weight', 1.0),
             'low_weight': lora_info.get('low_weight', 1.0),
@@ -791,14 +792,19 @@ def apply_lora_prompt_modifications(base_prompt, selected_loras_info):
     """
     Apply trigger prompts from active LoRAs to the user's base prompt.
 
+    Alias matching: if any trigger_alias appears in the user's prompt (whole-word
+    match), the trigger is considered already satisfied — the alias IS the trigger
+    for prompt-routing purposes.  The trigger token itself is still prepended/appended
+    so the LoRA keys fire, but we don't double-inject if the user already wrote it.
+
     Modes:
-    - append:  add trigger to the end if not already present (deduplicates)
-    - prepend: add trigger to the front if not already present (deduplicates)
+    - prepend: add trigger to the front (default for identity LoRAs — T5 gives
+               front tokens more context weight, which is critical for face recall)
+    - append:  add trigger to the end (for style/motion LoRAs where the trigger
+               word is a technical suffix, not a subject description)
     - replace: the trigger IS the prompt — replaces the base prompt entirely.
                Used for LoRAs (like deepthroat) that require a very specific
-               prompt structure; the user should use the example prompt dropdown
-               which loads the full prompt, but if they haven't done so we still
-               inject the trigger so the LoRA isn't silently doing nothing.
+               prompt structure.
     """
     modified_prompt = base_prompt.strip()
 
@@ -807,23 +813,47 @@ def apply_lora_prompt_modifications(base_prompt, selected_loras_info):
         if not trigger:
             continue
 
-        mode = lora_info.get('prompt_mode', 'append')
+        mode = lora_info.get('prompt_mode', 'prepend')
+
+        # Check if the trigger word is already present in the prompt (exact token)
+        trigger_present = trigger.lower() in modified_prompt.lower()
+
+        # Check if any alias is present in the prompt (whole-word boundary match)
+        aliases = lora_info.get('trigger_aliases', [])
+        alias_present = False
+        if aliases and not trigger_present:
+            prompt_lower = modified_prompt.lower()
+            for alias in aliases:
+                alias_lower = alias.strip().lower()
+                if not alias_lower:
+                    continue
+                # Whole-word match: alias must be surrounded by word boundaries
+                # (start/end of string, space, comma, punctuation)
+                import re
+                pattern = r'(?<![a-z0-9_])' + re.escape(alias_lower) + r'(?![a-z0-9_])'
+                if re.search(pattern, prompt_lower):
+                    alias_present = True
+                    break
+
+        # If trigger or an alias is present, the LoRA is already contextually anchored.
+        # For identity LoRAs we still prepend the trigger token so the LoRA weights fire,
+        # but we only do so when the trigger itself is absent (not the alias — the alias
+        # being present is enough to prove the user intended this LoRA for this prompt).
+        already_anchored = trigger_present or alias_present
 
         if mode == 'replace':
-            # Only replace if the user hasn't already typed anything meaningful.
-            # If the prompt is empty or just the default placeholder, use the trigger.
-            # Otherwise prepend the trigger so it's present without destroying the user's work.
             if not modified_prompt:
                 modified_prompt = trigger
-            elif trigger.lower() not in modified_prompt.lower():
+            elif not trigger_present:
+                # Prepend trigger even in replace mode if user wrote a custom prompt
                 modified_prompt = f"{trigger}, {modified_prompt}"
 
         elif mode == 'prepend':
-            if trigger.lower() not in modified_prompt.lower():
+            if not trigger_present:
                 modified_prompt = f"{trigger}, {modified_prompt}"
 
-        else:  # append (default) — also handles undocumented modes like 'natural'
-            if trigger.lower() not in modified_prompt.lower():
+        else:  # append (default for style/motion LoRAs) — also handles 'natural'
+            if not trigger_present:
                 modified_prompt = f"{modified_prompt}, {trigger}"
 
     return modified_prompt.strip().strip(',').strip()
@@ -978,8 +1008,10 @@ MAX_DURATION = 600.0        # 10 minutes max via chaining
 
 # Frame geometry. Area-based, matching the official sizing recipe.
 # mod 16 == vae_scale_factor_spatial (8) * transformer patch_size (2).
-AREA_720P = 1280 * 720
-AREA_480P = 832 * 480
+AREA_1080P = 1920 * 1080
+AREA_720P  = 1280 * 720
+AREA_600P  = 1024 * 576   # in-between: ~16:9 at ~600p
+AREA_480P  = 832  * 480
 MULTIPLE_OF = 16
 
 wan_pipe = None
@@ -1132,6 +1164,11 @@ def _is_protected(item_path) -> bool:
         protected_now = set(_protected_image_paths)
     if _current_input_image_path:
         protected_now.add(_current_input_image_path)
+    # Always protect the current merge output so it survives auto-clears
+    with _merge_output_lock:
+        _mop = _current_merge_output_path
+    if _mop:
+        protected_now.add(_mop)
     for p in protected_now:
         if not p:
             continue
@@ -1149,6 +1186,13 @@ def _is_protected(item_path) -> bool:
 
 
 _current_input_image_path = None
+
+# Path of the most recently merged result image. Protected from clear_storage()
+# permanently (until replaced by a new merge or process restart) so the merged
+# file survives the automatic post-generation storage wipe and remains valid
+# as the reference_image input on every subsequent generate call.
+_current_merge_output_path = None
+_merge_output_lock = threading.Lock()
 
 
 def _set_flow_shift(pipe, flow_shift):
@@ -1305,7 +1349,14 @@ def resize_image_for_wan(image: Image.Image, resolution: str = "720p") -> Image.
     if cached is not None:
         return cached
     
-    max_area = AREA_480P if resolution == "480p" else AREA_720P
+    if resolution == "480p":
+        max_area = AREA_480P
+    elif resolution == "600p":
+        max_area = AREA_600P
+    elif resolution == "1080p":
+        max_area = AREA_1080P
+    else:
+        max_area = AREA_720P
 
     aspect = image.height / image.width
     height = int(round(np.sqrt(max_area * aspect))) // MULTIPLE_OF * MULTIPLE_OF
@@ -1387,32 +1438,39 @@ def merge_photos_fn(img_a, img_b) -> Image.Image | None:
     # Target output size (Wan 2.2 native landscape)
     OUT_W, OUT_H = 1280, 720
 
-    # Scale both subjects to the same height — use 85% of output height so
-    # there is breathing room top and bottom, then center vertically
-    TARGET_H = int(OUT_H * 0.85)
+    # Fill 95% of height — minimal white bars top/bottom so it reads as a
+    # single scene rather than a letterboxed panel layout.
+    TARGET_H = int(OUT_H * 0.95)
 
     def scale_to_height(rgba: Image.Image, h: int) -> Image.Image:
         aspect = rgba.width / rgba.height
         w = max(1, int(h * aspect))
         return rgba.resize((w, h), Image.LANCZOS)
 
-    scaled_a = scale_to_height(rgba_a, TARGET_H)
-    scaled_b = scale_to_height(rgba_b, TARGET_H)
+    def feather_edges(rgba: Image.Image, radius: int = 6) -> Image.Image:
+        """Soften the alpha edges so subjects blend into the white background
+        naturally rather than looking like hard product-shot cutouts."""
+        from PIL import ImageFilter
+        r, g, b, a = rgba.split()
+        a_soft = a.filter(ImageFilter.GaussianBlur(radius=radius))
+        return Image.merge("RGBA", (r, g, b, a_soft))
+
+    scaled_a = feather_edges(scale_to_height(rgba_a, TARGET_H))
+    scaled_b = feather_edges(scale_to_height(rgba_b, TARGET_H))
 
     # Build white canvas
     canvas = Image.new("RGBA", (OUT_W, OUT_H), (255, 255, 255, 255))
 
-    # Center both subjects horizontally in their respective halves,
-    # center vertically on the canvas
     half_w = OUT_W // 2
     y_offset = (OUT_H - TARGET_H) // 2
 
-    # Person A — right-aligned within left half (they face inward naturally)
-    x_a = max(0, half_w - scaled_a.width - 10)
+    # Person A — right edge sits exactly at the canvas centre (no gap).
+    # A tiny 4px overlap past centre ensures there is no white seam at all.
+    x_a = max(0, half_w - scaled_a.width + 4)
     canvas.paste(scaled_a, (x_a, y_offset), scaled_a)
 
-    # Person B — left-aligned within right half
-    x_b = half_w + 10
+    # Person B — left edge sits exactly at the canvas centre, mirroring A.
+    x_b = half_w - 4
     canvas.paste(scaled_b, (x_b, y_offset), scaled_b)
 
     # Flatten to white RGB
@@ -1870,7 +1928,7 @@ def generate_video(
     duration_seconds=3.5,
     resolution="480p",
     frame_multiplier=16,
-    export_quality=7,
+    export_quality=10,
     seed=42,
     randomize_seed=True,
     add_audio_cb=True,
@@ -3730,9 +3788,17 @@ body, .gradio-container { margin: 0 !important; padding: 0 !important; max-width
 .uploader-toolbar { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
 .tb-btn { display: inline-flex; align-items: center; gap: 5px; padding: 5px 12px; border: 1px solid var(--border-color-primary); border-radius: 6px; background: var(--background-fill-secondary); cursor: pointer; font-size: 12px; font-weight: 500; transition: all .15s; }
 .tb-btn:hover { border-color: var(--color-accent); }
-/* Constrain reference photo and generated video to fit on screen */
-#vidgen-reference img, #vidgen-reference video { max-height: 320px !important; width: 100% !important; object-fit: contain !important; }
-#generated-video video { max-height: 320px !important; width: 100% !important; object-fit: contain !important; }
+/* Input photo fits inside its container without expanding it */
+#vidgen-reference { overflow: hidden !important; }
+#vidgen-reference img, #vidgen-reference video { max-height: 320px !important; max-width: 100% !important; width: auto !important; height: auto !important; object-fit: contain !important; display: block !important; margin: 0 auto !important; }
+/* Output video fits fully without cropping */
+#generated-video { overflow: hidden !important; }
+#generated-video video { max-height: 360px !important; max-width: 100% !important; width: auto !important; height: auto !important; object-fit: contain !important; display: block !important; margin: 0 auto !important; }
+/* Merge result fixed height, no resize when image appears */
+#merge-output-img { overflow: hidden !important; }
+#merge-output-img img { max-height: 200px !important; max-width: 100% !important; width: auto !important; height: auto !important; object-fit: contain !important; display: block !important; margin: 0 auto !important; }
+/* Keep the hidden video upload widget completely out of the layout */
+#last-frame-upload-file { height: 0 !important; overflow: hidden !important; opacity: 0 !important; position: absolute !important; pointer-events: none !important; }
 /* Show Media = off: hide actual media pixels but keep every container/upload-zone intact.
    Uses visibility:hidden so the container box stays; only the rendered image/video disappears. */
 body.hide-media #vidgen-reference img,
@@ -4042,17 +4108,15 @@ with gr.Blocks(css=css) as demo:
         clear_storage_btn = gr.Button("Clear Storage", variant="secondary", size="sm", scale=0)
     clear_storage_status = gr.Textbox(visible=False, label="")
 
-    def protect_current_inputs(reference_image, end_image, *sequence_images):
+    def protect_current_inputs(reference_image, end_image, merge_a, merge_b, merge_out, *sequence_images):
         """Explicit pre-clear protection step for the automatic storage clear.
 
         Runs as a .then() step BEFORE clear_storage() in the generate/download
-        chains: reads the first frame (reference), last frame (end), and any
-        Sequence-mode slot images currently loaded in the input widgets, and
-        registers their on-disk paths in the protected set so the full
-        storage wipe that follows cannot delete them out from under the
-        widgets. The previous per-generation protection (inside
-        generate_video) only covered images of the run in flight; this step
-        additionally covers the widgets' *current* inputs at clear time.
+        chains: reads the first frame (reference), last frame (end), merge-photo
+        inputs, the merged result, and any Sequence-mode slot images currently
+        loaded in the input widgets, and registers their on-disk paths in the
+        protected set so the full storage wipe that follows cannot delete them
+        out from under the widgets.
 
         Two protection layers are applied:
           1. Full path registered in _protected_image_paths (existing behaviour).
@@ -4080,7 +4144,16 @@ with gr.Blocks(css=css) as demo:
         with _protected_filenames_lock:
             _protected_image_filenames.clear()
 
-        for img in (reference_image, end_image, *sequence_images):
+        # Also re-protect the persistent merge output path (it lives in
+        # outputs/images/ so the path set is the only guard we need, but
+        # re-adding it here keeps both layers consistent).
+        with _merge_output_lock:
+            _mop = _current_merge_output_path
+        if _mop:
+            _protect_path(_mop)
+            _protect_filename(_mop)
+
+        for img in (reference_image, end_image, merge_a, merge_b, merge_out, *sequence_images):
             p = _path_of(img)
             if p:
                 _protect_path(p)
@@ -4374,10 +4447,10 @@ with gr.Blocks(css=css) as demo:
                         "", visible=False, elem_id="vidgen-progress"
                     )
                     video_output = gr.Video(
-                        label="Generated Video",
+                        label="Generated Video / Upload Video",
                         elem_id="generated-video",
                         autoplay=True,
-                        interactive=False,
+                        interactive=True,
                     )
                     
                     # Generate button directly under video output
@@ -4406,6 +4479,7 @@ with gr.Blocks(css=css) as demo:
                         download_frame_btn = gr.Button(
                             "Download Frame",
                             "Download Frame",
+                            visible=False,
                         )
                     
                     # Compact 4x2 grid layout for preset prompts
@@ -4785,35 +4859,52 @@ with gr.Blocks(css=css) as demo:
                         outputs=[lora_compat_status, edit_steps],
                     )
 
-            # Download Frame output gr.File shows a clickable download link when populated
-            download_file_output = gr.File(label="Click to Download Frame", visible=True)
+            # Download Frame output — hidden (section removed from UI)
+            download_file_output = gr.File(label="Click to Download Frame", visible=False)
 
             # ── Merge Photos ──────────────────────────────────────────────────────
-            with gr.Accordion("Merge Photos", open=False):
+            with gr.Accordion("Merge Photos", open=True):
                 gr.Markdown(
                     "Upload two photos. Backgrounds are removed and both subjects are "
                     "placed side by side on a white canvas (1280×720), ready to use as "
                     "a first frame for video generation."
                 )
-                with gr.Row():
-                    with gr.Column(scale=1):
+                with gr.Row(equal_height=True):
+                    with gr.Column(scale=1, min_width=140):
                         merge_img_a = gr.Image(
                             label="Person A",
                             type="pil",
                             sources=["upload", "clipboard"],
+                            elem_id="merge-img-a",
+                            height=200,
                         )
+                    with gr.Column(scale=1, min_width=140):
                         merge_img_b = gr.Image(
                             label="Person B",
                             type="pil",
                             sources=["upload", "clipboard"],
+                            elem_id="merge-img-b",
+                            height=200,
                         )
-                        merge_btn = gr.Button("Merge", variant="primary", size="lg")
-                    with gr.Column(scale=1):
+                    with gr.Column(scale=2):
+                        # type="filepath" so Gradio never re-serialises the PIL
+                        # through a volatile tmp/gradio temp file — we write the
+                        # merged image ourselves to outputs/images/ which is never
+                        # wiped by clear_storage(), and the returned filepath is
+                        # both stable and directly usable as reference_image input.
                         merge_output = gr.Image(
                             label="Merged Result (1280×720)",
-                            type="pil",
+                            type="filepath",
                             interactive=False,
+                            elem_id="merge-output-img",
+                            height=200,
                         )
+                # Merge button spans Person A + Person B columns (scale=2),
+                # Use as First Frame button spans the Result column (scale=2).
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        merge_btn = gr.Button("Merge", variant="primary", size="lg")
+                    with gr.Column(scale=2):
                         use_as_first_frame_btn = gr.Button(
                             "Use as First Frame",
                             variant="secondary",
@@ -4821,10 +4912,33 @@ with gr.Blocks(css=css) as demo:
                         )
 
                 def _do_merge(a, b):
+                    """Merge two PIL images and save to outputs/images/ (never tmp/gradio).
+
+                    Saving to outputs/images/ (not tmp/gradio) means the file:
+                    • is not wiped by the post-generation clear_storage() auto-clear
+                    • has a stable, known path registered in _current_merge_output_path
+                    • is protected by _is_protected() via the merge-output lock
+                    so subsequent generate calls always find the full merged image.
+                    """
+                    global _current_merge_output_path
                     if a is None or b is None:
                         return gr.update()
                     result = merge_photos_fn(a, b)
-                    return gr.update(value=result)
+                    if result is None:
+                        return gr.update()
+                    # Save to outputs/images/ — clear_storage() never deletes this dir's
+                    # outputs while they're protected, and _is_protected() below guards it.
+                    out_path = unique_output_path("merge", ".png")
+                    result.save(str(out_path), format="PNG")
+                    # Register for permanent protection (survives all auto-clears)
+                    with _merge_output_lock:
+                        # Unprotect old merge result before replacing
+                        if _current_merge_output_path:
+                            _unprotect_path(_current_merge_output_path)
+                        _current_merge_output_path = str(out_path)
+                    _protect_path(str(out_path))
+                    _protect_filename(str(out_path))
+                    return gr.update(value=str(out_path))
 
                 merge_btn.click(
                     fn=_do_merge,
@@ -4832,10 +4946,21 @@ with gr.Blocks(css=css) as demo:
                     outputs=[merge_output],
                 )
 
-                def _use_merged_as_first_frame(merged):
-                    if merged is None:
+                def _use_merged_as_first_frame(merged_path):
+                    """Copy the stable merge filepath into the reference_image widget.
+
+                    Both widgets are now type="filepath" so no PIL→file conversion
+                    occurs here — the path handed to generate_video() is the exact
+                    outputs/images/ file we saved in _do_merge(), which is both
+                    stable and protected from clear_storage().
+                    """
+                    if not merged_path or not os.path.exists(str(merged_path)):
+                        gr.Warning("No merged result yet — click Merge first.")
                         return gr.update()
-                    return gr.update(value=merged)
+                    # Re-protect in case a prior clear cycle ran
+                    _protect_path(str(merged_path))
+                    _protect_filename(str(merged_path))
+                    return gr.update(value=str(merged_path))
 
                 use_as_first_frame_btn.click(
                     fn=_use_merged_as_first_frame,
@@ -4844,11 +4969,12 @@ with gr.Blocks(css=css) as demo:
                 )
             # ── End Merge Photos ──────────────────────────────────────────────────
 
-            with gr.Accordion("Advanced Settings", open=False):
+            with gr.Accordion("Advanced Settings", open=True):
                 with gr.Row():
                     resolution = gr.Radio(
-                        choices=["720p", "480p"], value="480p",
+                        choices=["480p", "600p", "720p", "1080p"], value="480p",
                         label="Resolution",
+                        info="480p=fast, 600p=balanced, 720p=high quality, 1080p=max (slow, VRAM heavy)",
                     )
                     frame_multiplier = gr.Slider(
                         16, 64, value=16, step=16,
@@ -4858,7 +4984,7 @@ with gr.Blocks(css=css) as demo:
                     seed = gr.Number(label="Seed", value=42, precision=0)
                     randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
                     export_quality = gr.Slider(
-                        1, 10, value=7, step=1, label="Export Quality",
+                        1, 10, value=10, step=1, label="Export Quality",
                     )
                 with gr.Row():
                     edit_guidance = gr.Slider(
@@ -5023,8 +5149,10 @@ with gr.Blocks(css=css) as demo:
             ).then(
                 # Protect the widgets' current first/last frame inputs before
                 # the automatic full clear wipes tmp/gradio + outputs.
+                # merge_output is now included so the merged result file is
+                # always re-protected before every auto-clear.
                 fn=protect_current_inputs,
-                inputs=[reference_image, end_image] + sequence_images,
+                inputs=[reference_image, end_image, merge_img_a, merge_img_b, merge_output] + sequence_images,
                 outputs=[],
             ).then(
                 fn=clear_storage,
@@ -5057,8 +5185,9 @@ with gr.Blocks(css=css) as demo:
             ).then(
                 # Protect the widgets' current first/last frame inputs before
                 # the automatic full clear wipes tmp/gradio + outputs.
+                # merge_output included so the merged result survives auto-clears.
                 fn=protect_current_inputs,
-                inputs=[reference_image, end_image] + sequence_images,
+                inputs=[reference_image, end_image, merge_img_a, merge_img_b, merge_output] + sequence_images,
                 outputs=[],
             ).then(
                 fn=clear_storage,
@@ -5122,10 +5251,16 @@ with gr.Blocks(css=css) as demo:
                 print(f" Frame extracted: {frame_path}")
                 return frame_path
 
-            # Use Frame as Reference  reads timestamp from number box, puts frame into reference_image
+            # Use Frame as Reference — reads timestamp from number box, puts frame into reference_image.
+            # video_output is now interactive (accepts uploads too), so prefer it as the video source;
+            # fall back to the hidden video_file if video_output is somehow empty.
+            def _use_frame_from_video_output_or_file(video_out, video_f, timestamp):
+                source = video_out if video_out else video_f
+                return get_frame_as_file(source, timestamp)
+
             use_as_reference_btn.click(
-                fn=get_frame_as_file,
-                inputs=[video_file, frame_time_input],
+                fn=_use_frame_from_video_output_or_file,
+                inputs=[video_output, video_file, frame_time_input],
                 outputs=[reference_image],
             )
 
@@ -5159,6 +5294,10 @@ with gr.Blocks(css=css) as demo:
                 inputs=[],
                 outputs=[reference_image],
             )
+
+            # Note: "Last Frame From Video (Upload)" button removed.
+            # video_output is now interactive=True so users can drag/upload any video
+            # directly into it, then use "Use Frame as Reference" with any timestamp.
 
             # Track image-input changes so a new upload is protected from
             # clear_storage() and the PREVIOUS file stops being protected
@@ -5227,6 +5366,19 @@ with gr.Blocks(css=css) as demo:
                     inputs=[_seq_img_comp],
                     outputs=[],
                 )
+
+            # Wire merge-photo inputs into the same tracker so they survive
+            # the auto clear_storage() sweep just like first/last frame images.
+            merge_img_a.change(
+                fn=_make_image_tracker(),
+                inputs=[merge_img_a],
+                outputs=[],
+            )
+            merge_img_b.change(
+                fn=_make_image_tracker(),
+                inputs=[merge_img_b],
+                outputs=[],
+            )
 
         # ------------------------------------------------------------------ #
         #  TAB 2  PHOTO EDITOR (picgen)                                      #
@@ -5555,6 +5707,54 @@ with gr.Blocks(css=css) as demo:
 """
     demo.load(fn=None, js=video_time_sync_js)
 
+    # Video memory caching: as soon as the generated video gets a src, fetch
+    # its bytes into a Blob URL and swap the element to that blob. The video
+    # then keeps playing from memory even after clear_storage() deletes the
+    # file on disk.
+    video_memory_cache_js = """
+() => {
+    let _lastBlobUrl = null;
+
+    function cacheVideoInMemory(video) {
+        if (!video || !video.src || video.src.startsWith('blob:') || video.src === '') return;
+        const src = video.src;
+        fetch(src)
+            .then(r => r.blob())
+            .then(blob => {
+                if (_lastBlobUrl) URL.revokeObjectURL(_lastBlobUrl);
+                const blobUrl = URL.createObjectURL(blob);
+                _lastBlobUrl = blobUrl;
+                const t = video.currentTime;
+                const paused = video.paused;
+                video.src = blobUrl;
+                video.load();
+                video.currentTime = t;
+                if (!paused) video.play().catch(() => {});
+            })
+            .catch(e => console.warn('[VideoMemCache] fetch failed:', e));
+    }
+
+    function watchForVideo() {
+        const container = document.querySelector('#generated-video');
+        if (!container) { setTimeout(watchForVideo, 500); return; }
+        const obs = new MutationObserver(() => {
+            const vid = container.querySelector('video');
+            if (vid && vid.src && !vid.src.startsWith('blob:') && vid.src !== '') {
+                setTimeout(() => cacheVideoInMemory(vid), 300);
+            }
+        });
+        obs.observe(container, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+        // Handle video already present on load
+        const vid = container.querySelector('video');
+        if (vid && vid.src && !vid.src.startsWith('blob:') && vid.src !== '') {
+            setTimeout(() => cacheVideoInMemory(vid), 300);
+        }
+    }
+    setTimeout(watchForVideo, 1000);
+}
+"""
+    demo.load(fn=None, js=video_memory_cache_js)
+
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     _start_push_api()
@@ -5643,6 +5843,44 @@ if __name__ == "__main__":
                 import traceback; traceback.print_exc()
 
         threading.Thread(target=_bg_load, daemon=True).start()
+
+        def _bg_download_loras():
+            """After startup, auto-download all LoRAs that have download URLs."""
+            try:
+                # Wait for Gradio to be fully up and secondary model to start loading
+                time.sleep(5.0)
+                config = load_lora_config()
+                if not config:
+                    return
+                downloaded_any = False
+                for lora_id, lora_info in config.items():
+                    for side in ('high', 'low'):
+                        url_key = f'{side}_url'
+                        file_key = f'{side}_filename'
+                        url = lora_info.get(url_key)
+                        filename = lora_info.get(file_key)
+                        if not url or not filename:
+                            continue
+                        dest = LORA_DIR / filename
+                        if dest.exists():
+                            continue
+                        print(f"[AutoDownload] Downloading LoRA {lora_id} ({side}): {filename}")
+                        success, msg = download_lora_file(url, filename)
+                        if success:
+                            downloaded_any = True
+                            print(f"[AutoDownload] OK: {filename}")
+                        else:
+                            print(f"[AutoDownload] FAILED: {filename} — {msg}")
+                if downloaded_any:
+                    global AVAILABLE_LORAS, LORA_STATUS
+                    AVAILABLE_LORAS = discover_loras()
+                    LORA_STATUS = check_lora_status(config)
+                    print("[AutoDownload] LoRA catalog refreshed — new files ready without restart.")
+            except Exception as e:
+                print(f"[AutoDownload] Error during LoRA auto-download: {e}")
+                import traceback; traceback.print_exc()
+
+        threading.Thread(target=_bg_download_loras, daemon=True).start()
 
 
 

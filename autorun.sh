@@ -56,7 +56,9 @@ do_start() {
             echo "[autorun] Started (PID $(cat "$PID_FILE")). Gradio is up."
             echo "[autorun] Confirm AutorunAPI:"
             grep "AutorunAPI\|Running on" "$LOG" | tail -5
-            echo "[autorun] Tail log with:  bash autorun.sh logs"
+            echo ""
+            echo "[autorun] ── Live log (Ctrl+C to detach, app keeps running) ──"
+            tail -n 80 -f "$LOG"
             return
         fi
         if ! is_running; then
@@ -65,7 +67,10 @@ do_start() {
             exit 1
         fi
     done
-    echo "[autorun] Still starting (taking longer than usual). Tail with:  bash autorun.sh logs"
+    echo "[autorun] Still starting (taking longer than usual)."
+    echo ""
+    echo "[autorun] ── Live log (Ctrl+C to detach, app keeps running) ──"
+    tail -n 80 -f "$LOG"
 }
 
 case "${1:-start}" in
