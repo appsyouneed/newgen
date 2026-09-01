@@ -44,6 +44,14 @@ pip3 install sageattention --break-system-packages --no-cache-dir 2>/dev/null ||
     }
 }
 
+echo "Installing rembg (BiRefNet background removal for Merge Photos)..."
+pip3 install "rembg[gpu]" --break-system-packages --no-cache-dir 2>/dev/null || {
+    echo "rembg[gpu] failed — trying CPU-only rembg..."
+    pip3 install rembg --break-system-packages --no-cache-dir 2>/dev/null || {
+        echo "⚠️  rembg install failed — Merge Photos will use original images without background removal."
+    }
+}
+
 echo "Fixing pyOpenSSL..."
 python3 -c "from OpenSSL import SSL" 2>/dev/null || pip3 install pyopenssl --break-system-packages
 

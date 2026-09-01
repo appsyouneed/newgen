@@ -1339,6 +1339,89 @@ def resize_and_crop_to_match(target_image, reference_image):
     return resized.crop((left, top, left + ref_width, top + ref_height))
 
 
+def _remove_background_rembg(pil_image: Image.Image) -> Image.Image:
+    """
+    Remove background from a PIL image using rembg with birefnet-general model.
+    Returns RGBA image. Falls back to original image converted to RGBA if rembg unavailable.
+    """
+    try:
+        from rembg import remove, new_session
+        session = new_session("birefnet-general")
+        rgba = remove(pil_image.convert("RGBA"), session=session)
+        return rgba
+    except ImportError:
+        print("rembg not installed — background removal skipped. Install with: pip install rembg[gpu]")
+        return pil_image.convert("RGBA")
+    except Exception as e:
+        print(f"Background removal failed: {e} — using original image")
+        return pil_image.convert("RGBA")
+
+
+def merge_photos_fn(img_a, img_b) -> Image.Image | None:
+    """
+    Merge two photos side by side on a white background.
+    Removes backgrounds using BiRefNet, centers both subjects vertically,
+    outputs a 1280x720 landscape image ready for Wan 2.2.
+    """
+    if img_a is None or img_b is None:
+        return None
+
+    # Load both images
+    pil_a = _ensure_pil(img_a)
+    pil_b = _ensure_pil(img_b)
+
+    # Remove backgrounds from both
+    rgba_a = _remove_background_rembg(pil_a)
+    rgba_b = _remove_background_rembg(pil_b)
+
+    # Trim transparent padding to tight bounding box of each subject
+    def trim_to_subject(rgba: Image.Image) -> Image.Image:
+        bbox = rgba.getbbox()
+        if bbox:
+            return rgba.crop(bbox)
+        return rgba
+
+    rgba_a = trim_to_subject(rgba_a)
+    rgba_b = trim_to_subject(rgba_b)
+
+    # Target output size (Wan 2.2 native landscape)
+    OUT_W, OUT_H = 1280, 720
+
+    # Scale both subjects to the same height — use 85% of output height so
+    # there is breathing room top and bottom, then center vertically
+    TARGET_H = int(OUT_H * 0.85)
+
+    def scale_to_height(rgba: Image.Image, h: int) -> Image.Image:
+        aspect = rgba.width / rgba.height
+        w = max(1, int(h * aspect))
+        return rgba.resize((w, h), Image.LANCZOS)
+
+    scaled_a = scale_to_height(rgba_a, TARGET_H)
+    scaled_b = scale_to_height(rgba_b, TARGET_H)
+
+    # Build white canvas
+    canvas = Image.new("RGBA", (OUT_W, OUT_H), (255, 255, 255, 255))
+
+    # Center both subjects horizontally in their respective halves,
+    # center vertically on the canvas
+    half_w = OUT_W // 2
+    y_offset = (OUT_H - TARGET_H) // 2
+
+    # Person A — right-aligned within left half (they face inward naturally)
+    x_a = max(0, half_w - scaled_a.width - 10)
+    canvas.paste(scaled_a, (x_a, y_offset), scaled_a)
+
+    # Person B — left-aligned within right half
+    x_b = half_w + 10
+    canvas.paste(scaled_b, (x_b, y_offset), scaled_b)
+
+    # Flatten to white RGB
+    final = Image.new("RGB", (OUT_W, OUT_H), (255, 255, 255))
+    final.paste(canvas.convert("RGB"), mask=canvas.split()[3])
+
+    return final
+
+
 def get_num_frames(duration_seconds: float) -> int:
     """
     Frame count for a duration, snapped to the 4n+1 layout Wan's VAE requires
@@ -4704,6 +4787,62 @@ with gr.Blocks(css=css) as demo:
 
             # Download Frame output gr.File shows a clickable download link when populated
             download_file_output = gr.File(label="Click to Download Frame", visible=True)
+
+            # ── Merge Photos ──────────────────────────────────────────────────────
+            with gr.Accordion("Merge Photos", open=False):
+                gr.Markdown(
+                    "Upload two photos. Backgrounds are removed and both subjects are "
+                    "placed side by side on a white canvas (1280×720), ready to use as "
+                    "a first frame for video generation."
+                )
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        merge_img_a = gr.Image(
+                            label="Person A",
+                            type="pil",
+                            sources=["upload", "clipboard"],
+                        )
+                        merge_img_b = gr.Image(
+                            label="Person B",
+                            type="pil",
+                            sources=["upload", "clipboard"],
+                        )
+                        merge_btn = gr.Button("Merge", variant="primary", size="lg")
+                    with gr.Column(scale=1):
+                        merge_output = gr.Image(
+                            label="Merged Result (1280×720)",
+                            type="pil",
+                            interactive=False,
+                        )
+                        use_as_first_frame_btn = gr.Button(
+                            "Use as First Frame",
+                            variant="secondary",
+                            size="lg",
+                        )
+
+                def _do_merge(a, b):
+                    if a is None or b is None:
+                        return gr.update()
+                    result = merge_photos_fn(a, b)
+                    return gr.update(value=result)
+
+                merge_btn.click(
+                    fn=_do_merge,
+                    inputs=[merge_img_a, merge_img_b],
+                    outputs=[merge_output],
+                )
+
+                def _use_merged_as_first_frame(merged):
+                    if merged is None:
+                        return gr.update()
+                    return gr.update(value=merged)
+
+                use_as_first_frame_btn.click(
+                    fn=_use_merged_as_first_frame,
+                    inputs=[merge_output],
+                    outputs=[reference_image],
+                )
+            # ── End Merge Photos ──────────────────────────────────────────────────
 
             with gr.Accordion("Advanced Settings", open=False):
                 with gr.Row():
