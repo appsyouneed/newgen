@@ -9,6 +9,23 @@ if [ "$EUID" -ne 0 ]; then
     exec sudo bash "$0" "$@"
 fi
 
+# Detect the Python that will actually run the app — prefer the one that already
+# has torch/gradio (if any), otherwise fall back to python3.
+_detect_python() {
+    for py in python3.12 python3.11 python3.10 python3; do
+        if command -v "$py" &>/dev/null; then
+            # Prefer the one that can import torch
+            if "$py" -c "import torch" &>/dev/null 2>&1; then
+                echo "$py"; return
+            fi
+        fi
+    done
+    echo "python3"
+}
+PYTHON="$(_detect_python)"
+PIP="$PYTHON -m pip"
+echo "Using Python: $PYTHON ($($PYTHON --version 2>&1))"
+
 echo "Installing system dependencies..."
 if lsof /var/lib/dpkg/lock-frontend > /dev/null 2>&1; then
     lsof -t /var/lib/dpkg/lock-frontend | xargs kill -9 2>/dev/null || true
@@ -27,17 +44,20 @@ mkdir -p /root/.cache/huggingface
 chmod 1777 /root/newgen/tmp
 
 echo "Installing PyTorch..."
-pip3 uninstall -y torch torchvision torchaudio --break-system-packages 2>/dev/null || true
-pip3 install torch torchvision torchaudio --break-system-packages --no-cache-dir
+$PIP uninstall -y torch torchvision torchaudio --break-system-packages 2>/dev/null || true
+$PIP install torch torchvision torchaudio --break-system-packages --no-cache-dir
 
 echo "Installing Python dependencies..."
-pip3 install -r "$SCRIPT_DIR/requirements.txt" --break-system-packages --ignore-installed typing-extensions --no-cache-dir
+$PIP install -r "$SCRIPT_DIR/requirements.txt" --break-system-packages --ignore-installed typing-extensions --no-cache-dir
 
 echo "Ensuring critical packages..."
-pip3 install Pillow "transformers>=4.50.0,<5.0" "huggingface-hub>=0.34.0,<1.0" "numpy<2.1" "diffusers>=0.33.0,<0.38.0" "safetensors>=0.4.0" torchao accelerate --break-system-packages --no-cache-dir --force-reinstall
+$PIP install Pillow "transformers>=4.50.0,<5.0" "huggingface-hub>=0.34.0,<1.0" "numpy<2.1" "diffusers>=0.33.0,<0.38.0" "safetensors>=0.4.0" torchao accelerate --break-system-packages --no-cache-dir --force-reinstall
 
 echo "Pinning gradio to 4.43.0 (supports js= on event handlers; avoids 4.44.1 jinja2 regression)..."
-pip3 install "gradio==4.43.0" --break-system-packages --no-cache-dir --force-reinstall
+$PIP install "gradio==4.43.0" "gradio-client==1.3.0" --break-system-packages --no-cache-dir --force-reinstall
+
+echo "Pinning pydantic<2.10 (>=2.10 renamed is_stdlib_dataclass breaking gradio 4.43.0)..."
+$PIP install "pydantic>=2.0,<2.10" --break-system-packages --no-cache-dir --force-reinstall
 
 echo "Patching gradio/oauth.py for huggingface_hub >= 0.26 compatibility..."
 # huggingface_hub removed HfFolder in 0.26.0. gradio 4.43.0 still imports it at module
@@ -124,23 +144,23 @@ for sp in [*site.getsitepackages(), *sys.path]:
 PYPATCH
 
 echo "Installing SageAttention for accelerated inference..."
-pip3 install sageattention --break-system-packages --no-cache-dir 2>/dev/null || {
+$PIP install sageattention --break-system-packages --no-cache-dir 2>/dev/null || {
     echo "Pre-built SageAttention not available for this GPU arch — building from source..."
-    pip3 install "git+https://github.com/thu-ml/SageAttention.git" --break-system-packages --no-cache-dir 2>/dev/null || {
+    $PIP install "git+https://github.com/thu-ml/SageAttention.git" --break-system-packages --no-cache-dir 2>/dev/null || {
         echo "⚠️  SageAttention install failed — will fall back to standard SDPA at runtime."
     }
 }
 
 echo "Installing rembg (BiRefNet background removal for Merge Photos)..."
-pip3 install "rembg[gpu]" --break-system-packages --no-cache-dir 2>/dev/null || {
+$PIP install "rembg[gpu]" --break-system-packages --no-cache-dir 2>/dev/null || {
     echo "rembg[gpu] failed — trying CPU-only rembg..."
-    pip3 install rembg --break-system-packages --no-cache-dir 2>/dev/null || {
+    $PIP install rembg --break-system-packages --no-cache-dir 2>/dev/null || {
         echo "⚠️  rembg install failed — Merge Photos will use original images without background removal."
     }
 }
 
 echo "Fixing pyOpenSSL..."
-python3 -c "from OpenSSL import SSL" 2>/dev/null || pip3 install pyopenssl --break-system-packages
+$PYTHON -c "from OpenSSL import SSL" 2>/dev/null || $PIP install pyopenssl --break-system-packages
 
 echo "Setting up RIFE interpolation model..."
 if [ ! -d "/root/newgen/train_log/model" ] || [ ! -f "/root/newgen/train_log/RIFE_HDv3.py" ]; then
