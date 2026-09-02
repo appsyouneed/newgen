@@ -2275,19 +2275,19 @@ def _merge_into_person_photo(
     add_side: str,
 ) -> Image.Image:
     """
-    Build the "Person A" / "Person B" result, in this exact order:
+    Build the "Person A" / "Person B" result FAST (one Qwen pass) and SEAMLESS
+    (no dividing line):
 
-    1. Body-complete the chosen person ON THEIR OWN PHOTO — add only any
-       missing (cropped) body parts via generative fill, without altering them
-       or their background at all. (Done by the caller via
-       _complete_body_on_photo before this function is called.)
-    2. Generative-fill (outpaint) to EXTEND their environment to one side,
-       enlarging the scene. The person and their original photo are never
-       changed — after the Qwen pass we hard-restore the full original photo
-       region, so the chosen person can NEVER be duplicated or edited; only the
-       newly added strip comes from Qwen.
-    3. The OTHER person (already body-completed) is background-removed (cropped)
-       and placed into that added space, without altering them further.
+    - The chosen person's photo (already body-completed by the caller) is the
+      base scene, anchored to one side and edge-replicated to fill the whole
+      canvas so there is never any raw white.
+    - The OTHER person (already body-completed, background-removed) is placed
+      into the added space beside them.
+    - ONE Qwen pass then blends the whole thing into a single continuous scene
+      with no visible seam between the two halves.
+    - Finally the base person is restored with a FEATHERED inner edge, so the
+      person stays unaltered while the boundary toward the other person has no
+      hard dividing line.
 
     add_side = "right"  -> base photo on the LEFT,  other person on the RIGHT
                            (used by the "Person A" option)
@@ -2296,8 +2296,8 @@ def _merge_into_person_photo(
     """
     OUT_W, OUT_H = 1280, 720
 
-    # --- Fit the (already body-completed) base photo to full canvas height,
-    #     anchored to one side; the opposite side stays empty for outpainting.
+    # Fit the base photo to full canvas height, anchored to its side. The
+    # opposite side is the added space for the other person.
     base_region_w = int(OUT_W * 0.55)
     base_rgb = base_photo.convert("RGB")
     scale = min(base_region_w / base_rgb.width, OUT_H / base_rgb.height)
@@ -2308,29 +2308,59 @@ def _merge_into_person_photo(
     y_off = (OUT_H - bh) // 2
     base_x = 0 if add_side == "right" else (OUT_W - bw)
 
-    canvas_rgb = Image.new("RGB", (OUT_W, OUT_H), (255, 255, 255))
-    canvas_rgb.paste(base_fit, (base_x, y_off))
+    # Pre-fill the WHOLE canvas by edge-replicating the base photo outward, so
+    # there is never any raw white (fixes the white-blankness glitch even if the
+    # refine pass misses a region).
+    bf_arr = np.array(base_fit, dtype=np.uint8)
+    canvas_arr = np.pad(
+        bf_arr,
+        ((max(0, y_off), max(0, OUT_H - bh - y_off)),
+         (max(0, base_x), max(0, OUT_W - bw - base_x)),
+         (0, 0)),
+        mode="edge",
+    )[:OUT_H, :OUT_W, :]
+    if canvas_arr.shape[0] != OUT_H or canvas_arr.shape[1] != OUT_W:
+        tmp = np.zeros((OUT_H, OUT_W, 3), dtype=np.uint8)
+        tmp[:canvas_arr.shape[0], :canvas_arr.shape[1], :] = canvas_arr[:OUT_H, :OUT_W, :]
+        canvas_arr = tmp
+    canvas = Image.fromarray(canvas_arr, mode="RGB").convert("RGBA")
 
-    # --- Outpaint the empty side so the environment extends naturally.
-    extend_dir = "to the right" if add_side == "right" else "to the left"
-    outpaint_instruction = (
-        f"Extend and continue this photo's background and environment {extend_dir} "
-        "into the empty area, seamlessly matching the existing scene, lighting, "
-        "colors and perspective. Keep everything already visible unchanged. "
-        "Do not add any people — only extend the empty background scenery."
+    # Place the OTHER (cropped, body-completed) person into the added space,
+    # scaled to match the base person's height, bottom-aligned to the floor.
+    added_w = OUT_W - bw
+    if added_w < 8:
+        added_w = OUT_W // 2
+    target_h = min(bh, int(OUT_H * 0.95))
+    other = _scale_subject_to_fit(other_rgba, max(1, added_w - 8), target_h)
+    base_baseline = y_off + bh
+    other_y = max(0, base_baseline - other.height)
+    strip_left = bw if add_side == "right" else 0
+    other_x = strip_left + max(0, (added_w - other.width) // 2)
+    other_x = max(0, min(other_x, OUT_W - other.width))
+    canvas.paste(other, (other_x, other_y), other)
+
+    # ONE Qwen pass over the fully-assembled canvas: it blends the seam between
+    # the base photo and the extended background AND settles the second person
+    # into the same scene/lighting, so there is no visible dividing line. Fewer
+    # steps keeps the merge fast.
+    instruction = (
+        "Blend this into a single seamless photo of two people together in one "
+        "continuous background scene. Merge the two halves so there is NO visible "
+        "seam, dividing line, or border between them, matching lighting, colors "
+        "and perspective across the whole image. Keep both people's faces and "
+        "bodies unchanged; do not add, remove or duplicate anyone."
     )
-
-    extended_bg = canvas_rgb
+    blended = canvas.convert("RGB")
     try:
         activate_pic()
         torch.cuda.set_device(PIC_DEVICE)
         with torch.cuda.device(PIC_DEVICE):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 result = pic_pipe(
-                    image=[canvas_rgb],
-                    prompt=outpaint_instruction,
-                    negative_prompt="people, person, extra person, duplicate, seam, border, frame",
-                    num_inference_steps=4,
+                    image=[canvas.convert("RGB")],
+                    prompt=instruction,
+                    negative_prompt="seam, dividing line, border, frame, split, collage, duplicate, extra person, blank, white space",
+                    num_inference_steps=3,
                     true_cfg_scale=1.0,
                     generator=torch.Generator(device=PIC_DEVICE).manual_seed(
                         random.randint(0, np.iinfo(np.int32).max)
@@ -2339,38 +2369,30 @@ def _merge_into_person_photo(
         gen = result.images[0]
         if gen.size != (OUT_W, OUT_H):
             gen = gen.resize((OUT_W, OUT_H), Image.LANCZOS)
-        extended_bg = gen
+        blended = gen.convert("RGB")
     except Exception as e:
-        print(f"[merge] background outpaint failed ({e}); using un-extended scene")
-        extended_bg = canvas_rgb
+        print(f"[merge] blend pass failed ({e}); using un-blended composite")
+        blended = canvas.convert("RGB")
 
-    # --- Hard-restore the ORIGINAL base photo region. This is the guarantee
-    #     against duplicating/editing the chosen person: whatever Qwen produced
-    #     inside the base region (including any hallucinated duplicate) is
-    #     overwritten by the real, unaltered base photo. Only the added strip
-    #     (outside the base region) keeps Qwen's extended scenery.
-    final = extended_bg.copy()
-    final.paste(base_fit, (base_x, y_off))
+    # Restore the base person with a FEATHERED inner edge so the boundary
+    # between the (unaltered) base photo and the blended extension has no hard
+    # line. The outer canvas edges keep the base pixels fully; only the inner
+    # edge (facing the other person) fades over ~40px into the blended result,
+    # removing the dividing line while keeping the person unaltered.
+    feather = min(40, max(1, bw // 4))
+    marr = np.full((bh, bw), 255.0, dtype=np.float32)
+    ramp = np.linspace(0.0, 1.0, feather, dtype=np.float32)  # 0 -> 1
+    if add_side == "right":
+        # inner edge is the RIGHT edge: fade 255 -> 0 approaching the edge.
+        marr[:, bw - feather:] *= ramp[::-1][np.newaxis, :]
+    else:
+        # inner edge is the LEFT edge: fade 0 -> 255 leaving the edge.
+        marr[:, :feather] *= ramp[np.newaxis, :]
+    soft_mask = Image.fromarray(marr.clip(0, 255).astype(np.uint8), mode="L")
 
-    # --- Place the OTHER (cropped, body-completed) person into the added space,
-    #     scaled to match the base person's height, bottom-aligned to the base
-    #     photo's floor. They are only cropped + placed, never edited further.
-    added_w = OUT_W - bw
-    if added_w < 8:
-        added_w = OUT_W // 2  # safety fallback
-
-    target_h = min(bh, int(OUT_H * 0.95))
-    other = _scale_subject_to_fit(other_rgba, max(1, added_w - 8), target_h)
-
-    base_baseline = y_off + bh  # base photo's floor line
-    other_y = max(0, base_baseline - other.height)
-    strip_left = bw if add_side == "right" else 0
-    other_x = strip_left + max(0, (added_w - other.width) // 2)
-    other_x = max(0, min(other_x, OUT_W - other.width))
-
-    final_rgba = final.convert("RGBA")
-    final_rgba.paste(other, (other_x, other_y), other)
-    return final_rgba.convert("RGB")
+    final = blended.copy()
+    final.paste(base_fit, (base_x, y_off), soft_mask)
+    return final
 
 
 def merge_photos_fn(img_a, img_b, bg_choice: str | None = None) -> Image.Image | None:
@@ -2414,15 +2436,19 @@ def merge_photos_fn(img_a, img_b, bg_choice: str | None = None) -> Image.Image |
     # The chosen person is never duplicated — see _merge_into_person_photo.
     # Only the cutout that is actually used gets the (Qwen) body-completion, so
     # no diffusion work is wasted.
+    # Person A / Person B: the chosen person's photo is the base scene; the
+    # other person is placed into edge-filled space beside them and everything
+    # is blended in ONE Qwen pass (no separate normalize/outpaint passes — keeps
+    # it fast). Body-completion only runs if a subject is actually clipped.
     if bg_choice == "Person A":
-        print("[merge] Person A: completing A on-photo, extending right, placing B...")
-        base_a = _complete_body_on_photo(pil_a)          # step 1
-        rgba_b = _complete_body_safe(rgba_b)             # step 3 (other person)
+        print("[merge] Person A: complete A on-photo, place B, blend...")
+        base_a = _complete_body_on_photo(pil_a)          # missing parts only (skipped if whole)
+        rgba_b = _complete_body_safe(rgba_b)             # missing parts only (skipped if whole)
         return _merge_into_person_photo(base_a, rgba_b, add_side="right")
     if bg_choice == "Person B":
-        print("[merge] Person B: completing B on-photo, extending left, placing A...")
-        base_b = _complete_body_on_photo(pil_b)          # step 1
-        rgba_a = _complete_body_safe(rgba_a)             # step 3 (other person)
+        print("[merge] Person B: complete B on-photo, place A, blend...")
+        base_b = _complete_body_on_photo(pil_b)          # missing parts only (skipped if whole)
+        rgba_a = _complete_body_safe(rgba_a)             # missing parts only (skipped if whole)
         return _merge_into_person_photo(base_b, rgba_a, add_side="left")
 
     # All other backgrounds (white / Qwen scene): body-complete both cutouts,
@@ -4587,8 +4613,13 @@ body, .gradio-container { margin: 0 !important; padding: 0 !important; max-width
 .image-gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; padding: 12px; align-content: start; }
 #merge-bg-radio .wrap { display: flex !important; flex-wrap: nowrap !important; flex-direction: row !important; gap: 4px 8px !important; align-items: center !important; }
 #merge-bg-radio .wrap label { white-space: nowrap !important; flex: 1 1 0 !important; font-size: 12px !important; }
-#merge-custom-gallery .grid-wrap { display: grid !important; grid-template-columns: repeat(4, 1fr) !important; gap: 8px !important; }
-#merge-custom-gallery .thumbnail-item { cursor: pointer !important; border: 3px solid transparent !important; border-radius: 8px !important; overflow: hidden !important; transition: border-color .15s !important; }
+/* Custom-mode results: 4 large landscape images spanning the FULL section
+   width, side by side in a single row. */
+#merge-custom-gallery { width: 100% !important; }
+#merge-custom-gallery .grid-wrap,
+#merge-custom-gallery .grid-container { width: 100% !important; max-width: 100% !important; display: grid !important; grid-template-columns: repeat(4, 1fr) !important; gap: 8px !important; }
+#merge-custom-gallery .thumbnail-item { width: 100% !important; aspect-ratio: 16 / 9 !important; height: auto !important; cursor: pointer !important; border: 3px solid transparent !important; border-radius: 8px !important; overflow: hidden !important; transition: border-color .15s !important; }
+#merge-custom-gallery .thumbnail-item img { width: 100% !important; height: 100% !important; object-fit: cover !important; }
 #merge-custom-gallery .thumbnail-item.selected { border-color: var(--color-accent) !important; }
 .gallery-thumb { position: relative; aspect-ratio: 1; border-radius: 8px; overflow: hidden; cursor: pointer; border: 2px solid var(--border-color-primary); transition: border-color .2s ease, box-shadow .2s ease; background: var(--background-fill-primary); display: flex; align-items: center; justify-content: center; }
 .gallery-thumb:hover { border-color: var(--color-accent); }
@@ -5586,7 +5617,10 @@ with gr.Blocks(css=css) as demo:
                     type="pil",
                     columns=4,
                     rows=1,
-                    height=220,
+                    # Tall enough that the 4 landscape (16:9) results shown side
+                    # by side span the full section width at a large size. The
+                    # CSS below forces full-width and proper aspect fit.
+                    height=None,
                     visible=False,
                     elem_id="merge-custom-gallery",
                     interactive=False,
