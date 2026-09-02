@@ -39,6 +39,11 @@ $PIP install -r "$SCRIPT_DIR/requirements.txt" --break-system-packages --ignore-
 echo "Ensuring critical packages..."
 $PIP install Pillow "transformers>=4.52.0,<5.0" "huggingface-hub>=0.34.0,<1.0" "numpy<2.1" "diffusers>=0.33.0,<0.38.0" "safetensors>=0.4.0" torchao accelerate --break-system-packages --no-cache-dir --force-reinstall
 
+echo "Installing torchcodec (required by torchaudio.save for Foley audio)..."
+# torchaudio 2.9+ routes torchaudio.save() through TorchCodec; without it the
+# HunyuanVideo-Foley step crashes and videos come out silent.
+$PIP install torchcodec --break-system-packages --no-cache-dir || true
+
 echo "Patching gradio/oauth.py for huggingface_hub >= 0.26 compatibility..."
 # huggingface_hub removed HfFolder in 0.26.0. gradio 4.43.0 still imports it at module
 # level, crashing the entire process on startup even when OAuth is never used.

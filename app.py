@@ -1,4 +1,4 @@
-import os
+﻿import os
 import shutil
 import subprocess
 import sys
@@ -29,10 +29,25 @@ logging.getLogger("absl").setLevel(logging.ERROR)
 logging.getLogger("diffusers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("torchao").setLevel(logging.ERROR)
+# The local qwenimage pipeline logs via diffusers' logger under its own module
+# name, so silence it too (it emits the noisy "classifier-free guidance is not
+# enabled since true_cfg_scale <= 1" / "negative_prompt is passed but ..."
+# warnings on every generation).
+logging.getLogger("qwenimage").setLevel(logging.ERROR)
+logging.getLogger("qwenimage.pipeline_qwenimage_edit_plus").setLevel(logging.ERROR)
 
 class _TorchaoFilter(logging.Filter):
     def filter(self, record):
-        return "torchao" not in record.getMessage().lower()
+        msg = record.getMessage().lower()
+        if "torchao" in msg:
+            return False
+        # Drop the classifier-free guidance / negative_prompt noise from the
+        # Qwen pipeline regardless of which logger emits it.
+        if "classifier-free guidance is not enabled" in msg:
+            return False
+        if "negative_prompt is passed but classifier-free guidance" in msg:
+            return False
+        return True
 
 logging.getLogger().addFilter(_TorchaoFilter())
 
@@ -162,7 +177,7 @@ def _self_heal_gradio_version():
             _cur_gradio = None
         if _cur_gradio != _pinned_gradio:
             print(f"[SelfHeal] gradio version is {_cur_gradio!r}, expected "
-                  f"{_pinned_gradio!r} — reinstalling pinned gradio stack...")
+                  f"{_pinned_gradio!r} â€” reinstalling pinned gradio stack...")
             import subprocess as _sp
             _sp.run(
                 [sys.executable, "-m", "pip", "install", "--quiet",
@@ -217,7 +232,7 @@ def _self_heal_transformers_version():
         if _cur is None or _parse(_cur) < _min_transformers:
             _want = ".".join(str(x) for x in _min_transformers)
             print(f"[SelfHeal] transformers version is {_cur!r}, need "
-                  f">={_want} for Qwen-Image-Edit-2511 — upgrading...")
+                  f">={_want} for Qwen-Image-Edit-2511 â€” upgrading...")
             import subprocess as _sp
             _sp.run(
                 [sys.executable, "-m", "pip", "install", "--quiet",
@@ -320,7 +335,7 @@ def _derive_media_key(browser_secret_hex: str) -> bytes:
     """Derive a 32-byte AES-256-GCM key from the browser's localStorage secret.
 
     Uses HKDF-SHA256 with a fixed salt and info so the same secret always
-    produces the same key — but the key is never transmitted, only the secret.
+    produces the same key â€” but the key is never transmitted, only the secret.
     """
     try:
         secret_bytes = bytes.fromhex(browser_secret_hex)
@@ -639,8 +654,8 @@ def interpolate_bits(frames_np, multiplier=2, scale=1.0):
 def encode_frames_to_bytes(frames: list, fps: int, quality: int = 8) -> bytes:
     """Encode a list of frames (PIL Images or numpy HxWx3 float/uint8) to MP4 in memory.
 
-    Returns raw MP4 bytes — nothing is written to disk.
-    `quality` maps to libx264's CRF (1=best, 51=worst; default 8 ≈ high quality).
+    Returns raw MP4 bytes â€” nothing is written to disk.
+    `quality` maps to libx264's CRF (1=best, 51=worst; default 8 â‰ˆ high quality).
     animate_frame() returns numpy float32 arrays in [0,1]; this function handles both.
     """
     import av as _av
@@ -691,16 +706,26 @@ def encode_frames_to_bytes(frames: list, fps: int, quality: int = 8) -> bytes:
 # Dual Audio Engine: F5-TTS (voice cloning) + HunyuanVideo-Foley (SFX/Foley)
 # Replaces MMAudio completely.
 #
-# F5-TTS    — pip install f5-tts  (already installed or installed on first run)
-# HunyuanVideo-Foley — cloned repo at /root/newgen/HunyuanVideo-Foley,
+# F5-TTS    â€” installed into its own venv at /root/newgen/.f5tts-venv and
+#              invoked via subprocess (isolated on purpose, see below).
+# HunyuanVideo-Foley â€” cloned repo at /root/newgen/HunyuanVideo-Foley,
 #              called via subprocess (it has no installable Python package).
 # ---------------------------------------------------------------------------
 
 FOLEY_REPO_DIR  = Path("/root/newgen/HunyuanVideo-Foley")
 FOLEY_MODEL_DIR = Path("/root/newgen/HunyuanVideo-Foley-weights")
 
+# F5-TTS lives in its own venv (see _ensure_audio_engines) because its
+# dependency chain needs protobuf>=6.33.5 while HunyuanVideo-Foley's
+# descript-audiotools dependency needs protobuf<5.0.0 in the SAME process's
+# site-packages. Running it as a subprocess with a separate interpreter and
+# separate site-packages means each engine's protobuf install never touches
+# the other's, and neither is affected by whatever protobuf the main app
+# process happened to import first.
+F5_VENV_DIR = Path("/root/newgen/.f5tts-venv")
+F5_VENV_PY  = F5_VENV_DIR / "bin" / "python"
+
 _AUDIO_ENGINE_AVAILABLE = False   # set True once both engines verified usable
-_f5_model = None                  # lazy-loaded F5TTS instance
 
 
 def _ensure_audio_engines():
@@ -711,36 +736,64 @@ def _ensure_audio_engines():
     """
     global _AUDIO_ENGINE_AVAILABLE
 
-    # --- F5-TTS -------------------------------------------------------
+    # --- torchcodec (required by torchaudio.save) ---------------------
+    # torchaudio 2.9+ routes torchaudio.save() through TorchCodec and no longer
+    # ships the built-in sox/soundfile save backends. Without torchcodec,
+    # HunyuanVideo-Foley's infer.py crashes at torchaudio.save() with
+    # "ModuleNotFoundError: No module named 'torchcodec'" and the whole video
+    # ends up silent. Install it so the Foley WAV can be written.
     try:
-        import f5_tts  # noqa: F401 — just checking installability
+        import torchcodec  # noqa: F401
     except ImportError:
-        print("[AudioEngine] Installing f5-tts...")
-        # f5-tts's own metadata requires numpy<=1.26.4 while our pinned stack
-        # already satisfies everything else it needs (torch, torchaudio,
-        # transformers, accelerate, gradio, tqdm, safetensors...). Installing
-        # its declared deps verbatim just downgrades numpy and produces the
-        # noisy "pip's dependency resolver" conflict warnings against
-        # opencv-python/tifffile without fixing anything real, so we skip
-        # dependency resolution and rely on requirements.txt for the rest.
+        print("[AudioEngine] Installing torchcodec (needed by torchaudio.save)...")
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet",
+                 "--disable-pip-version-check", "torchcodec"],
+                check=True,
+            )
+            print("[AudioEngine] torchcodec installed.")
+        except Exception as _e:
+            print(f"[AudioEngine] torchcodec install failed (non-fatal): {_e}")
+
+    # --- F5-TTS (isolated venv) -----------------------------------------
+    # F5-TTS's dependency chain (via cached_path -> google-cloud-storage ->
+    # google-api-core) needs protobuf>=6.33.5, while HunyuanVideo-Foley's
+    # descript-audiotools dependency pins protobuf<5.0.0. Both requirements
+    # are real for the code paths that use them, so they cannot share one
+    # site-packages: installing whichever runs second just uninstalls the
+    # other's protobuf on disk. Worse, even if that install "worked", the
+    # main app process would still have the OLD protobuf module cached in
+    # sys.modules from whatever imported it first at startup — a pip install
+    # after import never takes effect in the same process. So F5-TTS gets
+    # its own venv (like HunyuanVideo-Foley gets its own subprocess/cwd) and
+    # is invoked as a subprocess via _run_f5tts(), never imported in-process.
+    if not F5_VENV_PY.exists():
+        # Deliberately NOT --system-site-packages: if the venv could see the
+        # main env's protobuf, pip would treat it as "already satisfied" and
+        # skip installing the venv's own copy, defeating the isolation this
+        # venv exists for. Torch/torchaudio get reinstalled here too (an
+        # extra multi-GB download, one-time) so the venv's site-packages are
+        # fully self-contained and immune to whatever the main env does later.
+        print("[AudioEngine] Creating isolated venv for F5-TTS (this downloads "
+              "torch/torchaudio again, ~one-time cost, for full isolation)...")
+        subprocess.run([sys.executable, "-m", "venv", str(F5_VENV_DIR)], check=True)
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet",
-             "--disable-pip-version-check", "--no-deps", "f5-tts==1.1.4"],
+            [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
+             "--disable-pip-version-check", "--upgrade", "pip"],
             check=True,
         )
-        # Ensure the handful of f5-tts runtime deps not already covered by
-        # requirements.txt are present (small, non-conflicting packages).
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet",
-             "--disable-pip-version-check",
-             "cached_path", "click", "datasets", "ema_pytorch>=0.5.2",
-             "hydra-core>=1.3.0", "jieba", "librosa", "matplotlib",
-             "pydub", "pypinyin", "tomli", "torchdiffeq",
-             "transformers_stream_generator", "vocos", "wandb",
-             "x_transformers>=1.31.14", "bitsandbytes>0.37.0"],
+            [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
+             "--disable-pip-version-check", "torch", "torchaudio"],
             check=True,
         )
-        print("[AudioEngine] f5-tts installed.")
+        subprocess.run(
+            [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
+             "--disable-pip-version-check", "f5-tts==1.1.4"],
+            check=True,
+        )
+        print("[AudioEngine] F5-TTS venv ready.")
 
     # --- HunyuanVideo-Foley repo --------------------------------------
     if not FOLEY_REPO_DIR.exists():
@@ -757,11 +810,13 @@ def _ensure_audio_engines():
         # and repeats torch/torchvision/torchaudio/numpy. Installing those
         # verbatim downgrades our pinned gradio==4.43.0 mid-run, which is what
         # caused "ImportError: cannot import name 'http_server' from 'gradio'"
-        # at demo.launch() — gradio's package files ended up a mix of two
+        # at demo.launch() â€” gradio's package files ended up a mix of two
         # incompatible versions. Everything else in that file (av, einops,
         # omegaconf, pyyaml, scipy, timm, sentencepiece, accelerate, pandas,
         # pyarrow, loguru, easydict, descript-audiotools, etc.) is safe to
-        # install as-is.
+        # install as-is here -- audiotools' protobuf<5.0.0 pin is fine in
+        # this env now that F5-TTS (the only thing that needed protobuf>=6.33)
+        # runs in its own isolated venv instead of this shared site-packages.
         _CONFLICTING_PREFIXES = (
             "torch", "gradio", "transformers", "numpy", "urllib3",
         )
@@ -823,15 +878,56 @@ def _ensure_audio_engines():
     print("[AudioEngine] Dual audio engine ready (F5-TTS + HunyuanVideo-Foley).")
 
 
-def _ensure_f5_loaded():
-    """Lazy-load the F5TTS model on first use."""
-    global _f5_model
-    if _f5_model is not None:
-        return
+F5_INFER_SCRIPT = Path("/root/newgen/.f5tts_infer_worker.py")
+
+_F5_INFER_WORKER_SOURCE = '''\
+"""Standalone F5-TTS inference worker. Run inside F5_VENV_PY only.
+Isolated from the main app process/site-packages -- see _ensure_audio_engines
+in app.py for why. Args: ref_file gen_text out_wav
+"""
+import sys
+
+def main():
+    ref_file, gen_text, out_wav = sys.argv[1], sys.argv[2], sys.argv[3]
     from f5_tts.api import F5TTS
-    print("[AudioEngine] Loading F5-TTS model...")
-    _f5_model = F5TTS(model_type="F5-TTS")
-    print("[AudioEngine] F5-TTS loaded.")
+    model = F5TTS(model_type="F5-TTS")
+    model.infer(
+        ref_file=ref_file,
+        ref_text="",
+        gen_text=gen_text,
+        file_wave=out_wav,
+        remove_silence=False,
+    )
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _run_f5tts(ref_file: str, gen_text: str, out_wav: str) -> bool:
+    """Run F5-TTS voice cloning in its isolated venv via subprocess.
+
+    Returns True if out_wav was produced with nonzero size.
+    """
+    if not F5_VENV_PY.exists():
+        print("[AudioEngine] F5-TTS venv missing, skipping voice track.")
+        return False
+    if not F5_INFER_SCRIPT.exists():
+        F5_INFER_SCRIPT.write_text(_F5_INFER_WORKER_SOURCE)
+
+    cmd = [str(F5_VENV_PY), str(F5_INFER_SCRIPT), ref_file, gen_text, out_wav]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if result.returncode != 0:
+            print(f"[AudioEngine] F5-TTS worker stderr: {result.stderr[-2000:]}")
+            return False
+        return os.path.exists(out_wav) and os.path.getsize(out_wav) > 0
+    except subprocess.TimeoutExpired:
+        print("[AudioEngine] F5-TTS worker timed out.")
+        return False
+    except Exception as e:
+        print(f"[AudioEngine] F5-TTS worker error: {e}")
+        return False
 
 
 def _run_foley(video_path: str, sfx_prompt: str, output_wav: str) -> bool:
@@ -840,8 +936,8 @@ def _run_foley(video_path: str, sfx_prompt: str, output_wav: str) -> bool:
     Returns True on success, False on failure.
 
     infer.py writes two files per video:
-      <stem>_generated.wav   — audio only
-      <stem>_with_audio.mp4  — merged video+audio
+      <stem>_generated.wav   â€” audio only
+      <stem>_with_audio.mp4  â€” merged video+audio
     We grab the .wav and rename it to output_wav.
     """
     foley_script = FOLEY_REPO_DIR / "infer.py"
@@ -906,9 +1002,9 @@ def add_audio_to_video(
 ) -> bytes:
     """Dual-engine audio synthesis for a generated video.
 
-    Branch A (Foley)  — HunyuanVideo-Foley reads the video frames and
+    Branch A (Foley)  â€” HunyuanVideo-Foley reads the video frames and
                         generates synchronized physical sound effects / ambience.
-    Branch B (Voice)  — F5-TTS clones the supplied reference voice and speaks
+    Branch B (Voice)  â€” F5-TTS clones the supplied reference voice and speaks
                         the dialogue_text. Skipped when either field is empty.
 
     Both branches produce a .wav file; FFmpeg mixes them and muxes into the
@@ -952,7 +1048,7 @@ def add_audio_to_video(
         if has_foley:
             print("[AudioEngine] Foley track generated.")
         else:
-            print("[AudioEngine] Foley failed — continuing without SFX track.")
+            print("[AudioEngine] Foley failed â€” continuing without SFX track.")
 
         # ---- Branch B: Voice cloning ---------------------------------
         # gr.File (Gradio 3.x) returns an object with .name; gr.Audio returns a path string.
@@ -972,25 +1068,19 @@ def add_audio_to_video(
         )
         if voice_active:
             try:
-                _ensure_f5_loaded()
                 print("[AudioEngine] Running F5-TTS voice clone...")
-                _f5_model.infer(
-                    ref_file=_ref_path,
-                    ref_text="",
-                    gen_text=dialogue_text.strip(),
-                    file_wave=voice_wav,
-                    remove_silence=False,
-                )
-                has_voice = os.path.exists(voice_wav) and os.path.getsize(voice_wav) > 0
+                has_voice = _run_f5tts(_ref_path, dialogue_text.strip(), voice_wav)
                 if has_voice:
                     print("[AudioEngine] Voice track generated.")
+                else:
+                    print("[AudioEngine] F5-TTS produced no output â€” continuing without voice track.")
             except Exception as ve:
                 print(f"[AudioEngine] F5-TTS failed: {ve}")
                 has_voice = False
 
         # ---- Neither branch succeeded --------------------------------
         if not has_foley and not has_voice:
-            print("[AudioEngine] Both audio branches failed — returning silent video.")
+            print("[AudioEngine] Both audio branches failed â€” returning silent video.")
             _cleanup()
             return video_buf
 
@@ -1003,7 +1093,7 @@ def add_audio_to_video(
                 "-i", voice_wav,
                 "-i", foley_wav,
                 "-filter_complex",
-                "[1:a]volume=1.0[v];[2:a]volume=0.65[f];[v][f]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+                "[1:a]volume=1.0[v];[2:a]volume=0.65[f];[v][f]amix=inputs=2:duration=longest[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
                 "-c:v", "copy",
@@ -1019,7 +1109,6 @@ def add_audio_to_video(
                 "-map", "1:a",
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "192k",
-                "-shortest",
                 out_vid_tmp,
             ]
         else:  # foley only
@@ -1031,7 +1120,6 @@ def add_audio_to_video(
                 "-map", "1:a",
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "192k",
-                "-shortest",
                 out_vid_tmp,
             ]
 
@@ -1219,22 +1307,22 @@ def discover_loras():
 
 _active_loras = {}  # {base_name: {"high": path, "low": path}}
 
-def _wan_flat_key_to_module_path(flat_key: str) -> str | None:  # unused — kept for reference
+def _wan_flat_key_to_module_path(flat_key: str) -> str | None:  # unused â€” kept for reference
     """
     Convert a Wan-native flat LoRA key to a dotted transformer parameter path.
 
     Wan LoRA files encode the full module path in a flat underscore-separated
     prefix.  For example:
-        lora_unet_blocks_0_self_attn_q   →   blocks.0.self_attn.q
-        lora_unet_blocks_27_ffn_0        →   blocks.27.ffn.0
-        lora_unet_blocks_3_cross_attn_k  →   blocks.3.cross_attn.k
+        lora_unet_blocks_0_self_attn_q   â†’   blocks.0.self_attn.q
+        lora_unet_blocks_27_ffn_0        â†’   blocks.27.ffn.0
+        lora_unet_blocks_3_cross_attn_k  â†’   blocks.3.cross_attn.k
 
     The mapping rules:
       - Strip leading "lora_unet_" (or "lora_" alone if no "unet_").
       - Replace "_blocks_N_" with ".blocks.N." (N is an integer).
       - The remainder maps component names: self_attn, cross_attn, ffn stay as-is
         but use dots; the trailing single-letter (q/k/v/o) stays as-is.
-      - ffn layers: ffn_0 → ffn.0, ffn_2 → ffn.2
+      - ffn layers: ffn_0 â†’ ffn.0, ffn_2 â†’ ffn.2
 
     Returns a dotted path string, or None if the key cannot be decoded.
     """
@@ -1273,8 +1361,8 @@ def load_loras_to_pipeline(pipe, selected_loras):
     Load selected LoRAs into the Wan 2.2 dual-transformer pipeline using PEFT native API.
 
     Wan 2.2 I2V has two transformer experts:
-      pipe.transformer   — high-noise denoising expert (early steps)
-      pipe.transformer_2 — low-noise denoising expert (late steps)
+      pipe.transformer   â€” high-noise denoising expert (early steps)
+      pipe.transformer_2 â€” low-noise denoising expert (late steps)
 
     Uses diffusers/PEFT's built-in load_lora_weights() which correctly handles
     all LoRA key formats automatically.
@@ -1298,7 +1386,7 @@ def load_loras_to_pipeline(pipe, selected_loras):
     _active_loras = {}
 
     if not selected_loras:
-        print("[LoRA] No LoRAs selected — all unloaded.")
+        print("[LoRA] No LoRAs selected â€” all unloaded.")
         return
 
     loaded_count = 0
@@ -1336,7 +1424,7 @@ def load_loras_to_pipeline(pipe, selected_loras):
             _active_loras[base_name] = lora_info
             loaded_count += 1
         else:
-            print(f"[LoRA] WARNING: '{base_name}' — no files loaded (high={high_path}, low={low_path})")
+            print(f"[LoRA] WARNING: '{base_name}' â€” no files loaded (high={high_path}, low={low_path})")
 
     if loaded_count:
         print(f"[LoRA] {loaded_count} LoRA(s) loaded and activated successfully.")
@@ -1349,16 +1437,16 @@ def apply_lora_prompt_modifications(base_prompt, selected_loras_info):
     Apply trigger prompts from active LoRAs to the user's base prompt.
 
     Alias matching: if any trigger_alias appears in the user's prompt (whole-word
-    match), the trigger is considered already satisfied — the alias IS the trigger
+    match), the trigger is considered already satisfied â€” the alias IS the trigger
     for prompt-routing purposes.  The trigger token itself is still prepended/appended
     so the LoRA keys fire, but we don't double-inject if the user already wrote it.
 
     Modes:
-    - prepend: add trigger to the front (default for identity LoRAs — T5 gives
+    - prepend: add trigger to the front (default for identity LoRAs â€” T5 gives
                front tokens more context weight, which is critical for face recall)
     - append:  add trigger to the end (for style/motion LoRAs where the trigger
                word is a technical suffix, not a subject description)
-    - replace: the trigger IS the prompt — replaces the base prompt entirely.
+    - replace: the trigger IS the prompt â€” replaces the base prompt entirely.
                Used for LoRAs (like deepthroat) that require a very specific
                prompt structure.
     """
@@ -1399,7 +1487,7 @@ def apply_lora_prompt_modifications(base_prompt, selected_loras_info):
             if not trigger_present:
                 modified_prompt = f"{trigger}, {modified_prompt}"
 
-        else:  # append (default for style/motion LoRAs) — also handles 'natural'
+        else:  # append (default for style/motion LoRAs) â€” also handles 'natural'
             if not trigger_present:
                 modified_prompt = f"{modified_prompt}, {trigger}"
 
@@ -1476,7 +1564,7 @@ def apply_lora_settings(selected_loras_info, user_steps, user_flow_shift, flow_s
     Apply LoRA-recommended settings when a LoRA is active.
 
     Rules:
-    - recommended_steps: ALWAYS applied when a LoRA is active — overrides whatever
+    - recommended_steps: ALWAYS applied when a LoRA is active â€” overrides whatever
       the slider currently shows. The UI already sets the slider on checkbox change
       via update_lora_compatibility_and_steps, so this ensures the actual generation
       call uses the right value even if the slider drifted.
@@ -1484,7 +1572,7 @@ def apply_lora_settings(selected_loras_info, user_steps, user_flow_shift, flow_s
       manual mode (flow_shift_auto=False AND they moved it off the LoRA recommendation).
       When in auto mode the LoRA recommendation always wins.
     - high_weight / low_weight: used by load_loras_to_pipeline which reads them from
-      the lora_info dict — no extra action needed here.
+      the lora_info dict â€” no extra action needed here.
     """
     if not selected_loras_info:
         return user_steps, user_flow_shift, ""
@@ -1509,7 +1597,7 @@ def apply_lora_settings(selected_loras_info, user_steps, user_flow_shift, flow_s
             messages.append(f"Flow shift set to {recommended_flow} (LoRA recommendation)")
 
     if not is_compatible and len(selected_loras_info) > 1:
-        messages.append("Note: multiple LoRAs with conflicting settings — using first recommendation.")
+        messages.append("Note: multiple LoRAs with conflicting settings â€” using first recommendation.")
 
     return final_steps, final_flow_shift, "\n".join(messages)
 
@@ -1659,7 +1747,7 @@ def _is_protected(item_path) -> bool:
 
     Two layers of protection:
     1. Full-path set: _protected_image_paths (and legacy _current_input_image_path).
-    2. Filename set: _protected_image_filenames — any item whose *basename*
+    2. Filename set: _protected_image_filenames â€” any item whose *basename*
        matches a currently-live first-frame or last-frame filename is skipped,
        even if the full path lookup misses (e.g. Gradio moved/renamed the file).
     """
@@ -1820,10 +1908,10 @@ def _ensure_pil(image):
     Normalize a Gradio image value to a PIL Image (or None).
 
     Handles:
-      - None / "" / falsy  → None
-      - /media/<key>/...  → resolve from _media_store, open as PIL
-      - file path string   → Image.open()
-      - PIL Image          → returned as-is
+      - None / "" / falsy  â†’ None
+      - /media/<key>/...  â†’ resolve from _media_store, open as PIL
+      - file path string   â†’ Image.open()
+      - PIL Image          â†’ returned as-is
     """
     if not image:
         return None
@@ -1902,10 +1990,10 @@ def _remove_background_rembg(pil_image: Image.Image) -> Image.Image:
         rgba = remove(pil_image.convert("RGBA"), session=session)
         return rgba
     except ImportError:
-        print("rembg not installed — background removal skipped. Install with: pip install rembg[gpu]")
+        print("rembg not installed â€” background removal skipped. Install with: pip install rembg[gpu]")
         return pil_image.convert("RGBA")
     except Exception as e:
-        print(f"Background removal failed: {e} — using original image")
+        print(f"Background removal failed: {e} â€” using original image")
         return pil_image.convert("RGBA")
 
 
@@ -1945,13 +2033,21 @@ MERGE_BG_PROMPTS = {
         "filtering through leaves, green grass, natural earthy environment"
     ),
     "Back Seat Of Vehicle": (
-        "in the back seat of a large luxury SUV or limousine, leather interior, "
-        "tinted windows with city lights outside, soft cabin lighting"
+        "sitting side by side together in the back seat of a large luxury SUV or "
+        "limousine, leather interior, tinted windows with city lights outside, "
+        "soft cabin lighting"
     ),
 }
 
+# Options that must stay as close to the original photos as possible: only the
+# background/setting changes, and the people are preserved with maximum
+# fidelity (faces fully identical and visible, all visible body parts exactly
+# unchanged). These use MERGE_BG_INSTRUCTION_PRESERVE instead of the standard
+# instruction, and skip the heavier "reposition into the scene" fit wording.
+MERGE_BG_MINIMAL_CHANGE = {"Hotel On Bed", "Back Seat Of Vehicle"}
+
 MERGE_BG_INSTRUCTION = (
-    "Keep both people exactly as they are — identical faces, facial features, hair, "
+    "Keep both people exactly as they are â€” identical faces, facial features, hair, "
     "body shape, proportions and skin tone. Do not alter their identities or bodies, "
     "and do not add, remove or duplicate any person. "
     "Replace the entire background and environment with: {prompt}. "
@@ -1969,6 +2065,21 @@ MERGE_FIT_INSTRUCTION = (
     "has one, with proper contact and perspective). Show BOTH people's FULL "
     "bodies head-to-toe, entirely inside the frame, with nothing cut off at any "
     "edge. Keep both faces and bodies unchanged."
+)
+
+# Maximum-preservation instruction for options that should barely change the
+# people (Hotel On Bed, Back Seat Of Vehicle). Only the background/setting is
+# swapped; the people themselves must stay as close to their original photos as
+# possible â€” faces fully identical and clearly visible, every visible body part
+# exactly unchanged. Kept short and firm so the model does the minimum edit.
+MERGE_BG_INSTRUCTION_PRESERVE = (
+    "Change ONLY the background and setting to: {prompt}. "
+    "Keep both people exactly as in the original photos â€” do not alter, restyle, "
+    "or move them. Their FACES must remain fully identical and clearly visible, "
+    "and every visible body part (skin, hair, hands, limbs, torso) must stay "
+    "exactly the same, unchanged. Make the smallest possible change: only "
+    "replace the surroundings and relight subtly to match. Do not add, remove or "
+    "duplicate any person, and keep both people's full bodies visible in frame."
 )
 
 
@@ -1991,7 +2102,7 @@ def _complete_body_safe(rgba: Image.Image) -> Image.Image:
       generated alpha bleed into and mangle the visible body.
 
     Returns an RGBA image (trimmed to its bbox). If nothing is clipped, the
-    input is returned untouched (no diffusion call → fast).
+    input is returned untouched (no diffusion call â†’ fast).
     """
     if rgba is None:
         return rgba
@@ -2007,7 +2118,7 @@ def _complete_body_safe(rgba: Image.Image) -> Image.Image:
     top_clipped = bool(np.any(alpha_arr[:EDGE, :] > 128))
 
     if not bottom_clipped and not top_clipped:
-        return rgba  # full body already visible — nothing to fill
+        return rgba  # full body already visible â€” nothing to fill
 
     pad_bottom = int(H * 0.40) if bottom_clipped else 0
     pad_top = int(H * 0.40) if top_clipped else 0
@@ -2031,7 +2142,7 @@ def _complete_body_safe(rgba: Image.Image) -> Image.Image:
         f"The person's {what} is cropped off. Extend and complete ONLY the "
         "missing body parts into the empty area, matching their exact skin "
         "tone, body shape, and proportions. Do NOT change, redraw, or move any "
-        "part of the body that is already visible — keep it pixel-for-pixel "
+        "part of the body that is already visible â€” keep it pixel-for-pixel "
         "identical. Only paint into the empty space."
     )
 
@@ -2132,9 +2243,15 @@ def _apply_merge_background(
     bg_choice: str | None,
     pil_a: Image.Image,
     pil_b: Image.Image,
+    extra_prompt: str | None = None,
 ) -> Image.Image:
-    """Composite the merged subjects onto the chosen background."""
+    """Composite the merged subjects onto the chosen background.
+
+    `extra_prompt` is optional free text from the always-visible custom box;
+    when present it is combined with the chosen option's scene prompt.
+    """
     OUT_W, OUT_H = 1280, 720
+    extra = (extra_prompt or "").strip()
 
     if not bg_choice:
         bg = Image.new("RGB", (OUT_W, OUT_H), (255, 255, 255))
@@ -2147,11 +2264,22 @@ def _apply_merge_background(
     # not handled here.
     if True:
         prompt_text = MERGE_BG_PROMPTS.get(bg_choice)
+        # Combine the option's scene prompt with any extra custom text.
+        if prompt_text and extra:
+            prompt_text = f"{prompt_text}. {extra}"
+        elif extra and not prompt_text:
+            prompt_text = extra
         if not prompt_text:
             bg = Image.new("RGB", (OUT_W, OUT_H), (255, 255, 255))
         else:
             try:
-                instruction = MERGE_BG_INSTRUCTION.format(prompt=prompt_text) + MERGE_FIT_INSTRUCTION
+                # Minimal-change options (Hotel On Bed, Back Seat Of Vehicle)
+                # use the maximum-preservation instruction so faces/bodies stay
+                # as in the originals; others use the standard swap + fit wording.
+                if bg_choice in MERGE_BG_MINIMAL_CHANGE:
+                    instruction = MERGE_BG_INSTRUCTION_PRESERVE.format(prompt=prompt_text)
+                else:
+                    instruction = MERGE_BG_INSTRUCTION.format(prompt=prompt_text) + MERGE_FIT_INSTRUCTION
                 white_canvas = Image.new("RGB", (OUT_W, OUT_H), (255, 255, 255))
                 base = white_canvas.copy()
                 _m = merged_rgba if merged_rgba.mode == "RGBA" else merged_rgba.convert("RGBA")
@@ -2197,7 +2325,7 @@ def _complete_body_on_photo(photo: Image.Image) -> Image.Image:
     is used ONLY in the added padding rows.
 
     If the person is not clipped at top/bottom, the photo is returned untouched
-    (no diffusion call → fast).
+    (no diffusion call â†’ fast).
     """
     if photo is None:
         return photo
@@ -2217,7 +2345,7 @@ def _complete_body_on_photo(photo: Image.Image) -> Image.Image:
     bottom_clipped = bool(np.any(subj_alpha[-EDGE:, :] > 128))
     top_clipped = bool(np.any(subj_alpha[:EDGE, :] > 128))
     if not bottom_clipped and not top_clipped:
-        return rgb  # full body already in frame — nothing to add
+        return rgb  # full body already in frame â€” nothing to add
 
     pad_top = int(H * 0.40) if top_clipped else 0
     pad_bottom = int(H * 0.40) if bottom_clipped else 0
@@ -2238,7 +2366,7 @@ def _complete_body_on_photo(photo: Image.Image) -> Image.Image:
         f"The person's {what} is cropped off. Extend and complete ONLY the "
         "missing body parts and the surrounding background into the empty area, "
         "matching their exact skin tone, body shape and the existing scene. Do "
-        "NOT change, move or redraw anything already visible — keep it identical. "
+        "NOT change, move or redraw anything already visible â€” keep it identical. "
         "Only paint into the empty space."
     )
 
@@ -2308,59 +2436,29 @@ def _merge_into_person_photo(
     y_off = (OUT_H - bh) // 2
     base_x = 0 if add_side == "right" else (OUT_W - bw)
 
-    # Pre-fill the WHOLE canvas by edge-replicating the base photo outward, so
-    # there is never any raw white (fixes the white-blankness glitch even if the
-    # refine pass misses a region).
-    bf_arr = np.array(base_fit, dtype=np.uint8)
-    canvas_arr = np.pad(
-        bf_arr,
-        ((max(0, y_off), max(0, OUT_H - bh - y_off)),
-         (max(0, base_x), max(0, OUT_W - bw - base_x)),
-         (0, 0)),
-        mode="edge",
-    )[:OUT_H, :OUT_W, :]
-    if canvas_arr.shape[0] != OUT_H or canvas_arr.shape[1] != OUT_W:
-        tmp = np.zeros((OUT_H, OUT_W, 3), dtype=np.uint8)
-        tmp[:canvas_arr.shape[0], :canvas_arr.shape[1], :] = canvas_arr[:OUT_H, :OUT_W, :]
-        canvas_arr = tmp
-    canvas = Image.fromarray(canvas_arr, mode="RGB").convert("RGBA")
+    canvas_rgb = Image.new("RGB", (OUT_W, OUT_H), (255, 255, 255))
+    canvas_rgb.paste(base_fit, (base_x, y_off))
 
-    # Place the OTHER (cropped, body-completed) person into the added space,
-    # scaled to match the base person's height, bottom-aligned to the floor.
-    added_w = OUT_W - bw
-    if added_w < 8:
-        added_w = OUT_W // 2
-    target_h = min(bh, int(OUT_H * 0.95))
-    other = _scale_subject_to_fit(other_rgba, max(1, added_w - 8), target_h)
-    base_baseline = y_off + bh
-    other_y = max(0, base_baseline - other.height)
-    strip_left = bw if add_side == "right" else 0
-    other_x = strip_left + max(0, (added_w - other.width) // 2)
-    other_x = max(0, min(other_x, OUT_W - other.width))
-    canvas.paste(other, (other_x, other_y), other)
-
-    # ONE Qwen pass over the fully-assembled canvas: it blends the seam between
-    # the base photo and the extended background AND settles the second person
-    # into the same scene/lighting, so there is no visible dividing line. Fewer
-    # steps keeps the merge fast.
-    instruction = (
-        "Blend this into a single seamless photo of two people together in one "
-        "continuous background scene. Merge the two halves so there is NO visible "
-        "seam, dividing line, or border between them, matching lighting, colors "
-        "and perspective across the whole image. Keep both people's faces and "
-        "bodies unchanged; do not add, remove or duplicate anyone."
+    # --- Outpaint the empty side so the environment extends naturally.
+    extend_dir = "to the right" if add_side == "right" else "to the left"
+    outpaint_instruction = (
+        f"Extend and continue this photo's background and environment {extend_dir} "
+        "into the empty area, seamlessly matching the existing scene, lighting, "
+        "colors and perspective. Keep everything already visible unchanged. "
+        "Do not add any people â€” only extend the empty background scenery."
     )
-    blended = canvas.convert("RGB")
+
+    extended_bg = canvas_rgb
     try:
         activate_pic()
         torch.cuda.set_device(PIC_DEVICE)
         with torch.cuda.device(PIC_DEVICE):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 result = pic_pipe(
-                    image=[canvas.convert("RGB")],
-                    prompt=instruction,
-                    negative_prompt="seam, dividing line, border, frame, split, collage, duplicate, extra person, blank, white space",
-                    num_inference_steps=3,
+                    image=[canvas_rgb],
+                    prompt=outpaint_instruction,
+                    negative_prompt="people, person, extra person, duplicate, seam, border, frame",
+                    num_inference_steps=4,
                     true_cfg_scale=1.0,
                     generator=torch.Generator(device=PIC_DEVICE).manual_seed(
                         random.randint(0, np.iinfo(np.int32).max)
@@ -2369,33 +2467,41 @@ def _merge_into_person_photo(
         gen = result.images[0]
         if gen.size != (OUT_W, OUT_H):
             gen = gen.resize((OUT_W, OUT_H), Image.LANCZOS)
-        blended = gen.convert("RGB")
+        extended_bg = gen
     except Exception as e:
-        print(f"[merge] blend pass failed ({e}); using un-blended composite")
-        blended = canvas.convert("RGB")
+        print(f"[merge] background outpaint failed ({e}); using un-extended scene")
+        extended_bg = canvas_rgb
 
-    # Restore the base person with a FEATHERED inner edge so the boundary
-    # between the (unaltered) base photo and the blended extension has no hard
-    # line. The outer canvas edges keep the base pixels fully; only the inner
-    # edge (facing the other person) fades over ~40px into the blended result,
-    # removing the dividing line while keeping the person unaltered.
-    feather = min(40, max(1, bw // 4))
-    marr = np.full((bh, bw), 255.0, dtype=np.float32)
-    ramp = np.linspace(0.0, 1.0, feather, dtype=np.float32)  # 0 -> 1
+    # --- Hard-restore the ORIGINAL base photo region so the chosen person is
+    #     never duplicated or edited; only the added strip keeps Qwen scenery.
+    final = extended_bg.copy()
+    final.paste(base_fit, (base_x, y_off))
+
+    # --- Place the OTHER (cropped, body-completed) person into the added space,
+    #     scaled to match the base person's height, bottom-aligned to the floor.
+    added_w = OUT_W - bw
+    if added_w < 8:
+        added_w = OUT_W // 2  # safety fallback
+
+    target_h = min(bh, int(OUT_H * 0.95))
+    other = _scale_subject_to_fit(other_rgba, max(1, added_w - 8), target_h)
+
+    base_baseline = y_off + bh          # base person's feet line (approx)
+    other_y = max(0, base_baseline - other.height)
     if add_side == "right":
-        # inner edge is the RIGHT edge: fade 255 -> 0 approaching the edge.
-        marr[:, bw - feather:] *= ramp[::-1][np.newaxis, :]
+        strip_left = bw
     else:
-        # inner edge is the LEFT edge: fade 0 -> 255 leaving the edge.
-        marr[:, :feather] *= ramp[np.newaxis, :]
-    soft_mask = Image.fromarray(marr.clip(0, 255).astype(np.uint8), mode="L")
+        strip_left = 0
+    other_x = strip_left + max(0, (added_w - other.width) // 2)
+    other_x = max(0, min(other_x, OUT_W - other.width))
 
-    final = blended.copy()
-    final.paste(base_fit, (base_x, y_off), soft_mask)
-    return final
+    final_rgba = final.convert("RGBA")
+    final_rgba.paste(other, (other_x, other_y), other)
+    return final_rgba.convert("RGB")
 
 
-def merge_photos_fn(img_a, img_b, bg_choice: str | None = None) -> Image.Image | None:
+def merge_photos_fn(img_a, img_b, bg_choice: str | None = None,
+                    extra_prompt: str | None = None) -> Image.Image | None:
     """
     Merge two photos side by side on a chosen background.
 
@@ -2407,7 +2513,7 @@ def merge_photos_fn(img_a, img_b, bg_choice: str | None = None) -> Image.Image |
     4. Bottom-align both subjects so feet sit at the same baseline.
     5. Composite onto the chosen background (white, Person A/B photo, or Qwen scene).
 
-    Subjects are never regenerated — each person is composited using the exact
+    Subjects are never regenerated â€” each person is composited using the exact
     pixels rembg extracts from their original photo, so their bodies are kept
     at 100% original quality with nothing altered or hallucinated.
     """
@@ -2433,12 +2539,12 @@ def merge_photos_fn(img_a, img_b, bg_choice: str | None = None) -> Image.Image |
     #   2. outpaint to extend their environment to one side,
     #   3. body-complete the OTHER person, crop them, and place them into the
     #      added space without altering them further.
-    # The chosen person is never duplicated — see _merge_into_person_photo.
+    # The chosen person is never duplicated â€” see _merge_into_person_photo.
     # Only the cutout that is actually used gets the (Qwen) body-completion, so
     # no diffusion work is wasted.
     # Person A / Person B: the chosen person's photo is the base scene; the
     # other person is placed into edge-filled space beside them and everything
-    # is blended in ONE Qwen pass (no separate normalize/outpaint passes — keeps
+    # is blended in ONE Qwen pass (no separate normalize/outpaint passes â€” keeps
     # it fast). Body-completion only runs if a subject is actually clipped.
     if bg_choice == "Person A":
         print("[merge] Person A: complete A on-photo, place B, blend...")
@@ -2463,7 +2569,7 @@ def merge_photos_fn(img_a, img_b, bg_choice: str | None = None) -> Image.Image |
 
     # BOTH subjects are always scaled to fit fully inside their half-canvas
     # slot. This is what guarantees both full bodies are visible and neither
-    # person is oversized or cropped by the canvas edges — regardless of which
+    # person is oversized or cropped by the canvas edges â€” regardless of which
     # background is chosen. (Previously the "Person A/B" options pasted that
     # person's full-resolution photo as the background, so they appeared huge
     # and cropped. Now they are a fitted cutout like everyone else, and their
@@ -2481,18 +2587,25 @@ def merge_photos_fn(img_a, img_b, bg_choice: str | None = None) -> Image.Image |
     canvas = Image.new("RGBA", (OUT_W, OUT_H), (0, 0, 0, 0))
     canvas.paste(rgba_a, (x_a, y_a), rgba_a)
     canvas.paste(rgba_b, (x_b, y_b), rgba_b)
-    return _apply_merge_background(canvas, bg_choice, pil_a, pil_b)
+    return _apply_merge_background(canvas, bg_choice, pil_a, pil_b, extra_prompt)
 
 
 def get_num_frames(duration_seconds: float) -> int:
     """
-    Frame count for a duration, snapped to the 4n+1 layout Wan's VAE requires
-    and capped at MAX_FRAMES_MODEL (97 frames = ~6s) to stay within the quality
-    window before prompt degradation occurs.
+    Frame count for a duration, snapped to the NEAREST 4n+1 layout Wan's VAE
+    requires and capped at MAX_FRAMES_MODEL (97 frames = ~6s) to stay within
+    the quality window before prompt degradation occurs.
+
+    Snapping to the nearest 4n+1 (rather than always rounding down) keeps each
+    segment's real length as close as possible to what was asked for, so the
+    chained total doesn't drift short. e.g. 6.06s (97 frames) is reachable
+    instead of collapsing to 93 frames / 5.81s.
     """
     raw = int(round(float(duration_seconds) * FIXED_FPS))
     raw = int(np.clip(raw, MIN_FRAMES_MODEL, MAX_FRAMES_MODEL))
-    frames = ((raw - 1) // 4) * 4 + 1
+    # nearest n such that frames = 4n+1
+    n = round((raw - 1) / 4)
+    frames = int(n) * 4 + 1
     return max(9, min(MAX_FRAMES_MODEL, frames))
 
 
@@ -2686,14 +2799,41 @@ def animate_frame(
             output_type="np",
         )
 
+        # Drive the caller's step-progress callback (expects a 0..1 fraction of
+        # THIS segment) from the diffusion pipeline's per-step callback, so the
+        # output-box progress advances smoothly during denoising instead of
+        # freezing at the segment's starting percentage.
+        if callable(progress):
+            _total_steps = max(1, int(steps))
+
+            def _step_cb(pipe, step_index, timestep, cb_kwargs):
+                try:
+                    progress((step_index + 1) / _total_steps)
+                except Exception:
+                    pass
+                return cb_kwargs
+
+            kwargs["callback_on_step_end"] = _step_cb
+
+        def _run(**kw):
+            try:
+                return wan_pipe(**kw).frames[0]
+            except TypeError as e:
+                # Older pipeline without callback_on_step_end support: retry
+                # without the callback rather than failing.
+                if "callback_on_step_end" in str(e) and "callback_on_step_end" in kw:
+                    kw.pop("callback_on_step_end", None)
+                    return wan_pipe(**kw).frames[0]
+                raise
+
         if last_frame is None:
-            return wan_pipe(**kwargs).frames[0]
+            return _run(**kwargs)
 
         try:
-            return wan_pipe(last_image=last_frame, **kwargs).frames[0]
+            return _run(last_image=last_frame, **kwargs)
         except TypeError as e:
             print(f"End frame not supported by this pipeline ({e}); ignoring it.")
-            return wan_pipe(**kwargs).frames[0]
+            return _run(**kwargs)
 
 
 def concatenate_videos(segment_bufs: list) -> bytes:
@@ -2758,7 +2898,7 @@ def _last_frame_of(video_buf: bytes):
     """Read the final frame of an in-memory MP4 as a PIL Image, for chaining.
 
     Accepts raw MP4 bytes (never a file path). Returns a PIL Image or None.
-    PyAV writing to BytesIO may produce duration=0 — so we always decode
+    PyAV writing to BytesIO may produce duration=0 â€” so we always decode
     all frames without seeking and return the last one.
     """
     import av as _av
@@ -3069,7 +3209,7 @@ def generate_video(
 
     current_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
     started = time.time()
-    segment_bufs = []  # list[bytes] — in-memory MP4 segments
+    segment_bufs = []  # list[bytes] â€” in-memory MP4 segments
 
     try:
         if progress is not None:
@@ -3093,21 +3233,52 @@ def generate_video(
         seg_seed = current_seed
         seg_index = 0
 
+        # Total number of segments this whole generation will produce, so the
+        # progress bar reflects overall progress across ALL segments (and, for
+        # a single segment, spans the whole 0.15->0.90 range as its steps run)
+        # instead of freezing at the segment's start percentage.
+        import math as _math
+        total_segments = max(1, _math.ceil(float(duration_seconds) / SEGMENT_DURATION))
+        # Progress band reserved for animation (after the 0.15 setup, before the
+        # final 0.90->1.0 encode/audio).
+        _P_START, _P_END = 0.15, 0.90
+
         while remaining > 0.01:
             seg_duration = min(remaining, SEGMENT_DURATION)
             num_frames = get_num_frames(seg_duration)
+            # Actual playback length of this segment once snapped to the 4n+1
+            # frame grid -- this is what actually ends up in the video, so the
+            # chain must account for THIS, not the requested seg_duration, or
+            # the accumulated rounding makes the final video come up short
+            # (e.g. asking for 18s and getting ~15s).
+            actual_seg_duration = num_frames / FIXED_FPS
             seg_index += 1
-            is_last_segment = (remaining - seg_duration) <= 0.01
+            is_last_segment = (remaining - actual_seg_duration) <= 0.01
 
             seg_end = processed_end if is_last_segment else None
-            if progress is not None:
-                progress(min(0.15 + 0.75 * (seg_index - 1) / max(1, int(duration_seconds / SEGMENT_DURATION + 1)), 0.90), desc=f"Generating segment {seg_index}")
+
+            # Per-step progress: map this segment's denoising steps into its
+            # slice of the overall [_P_START, _P_END] band across all segments.
+            _seg_i0 = seg_index - 1
+
+            def _seg_progress(step_frac, _i0=_seg_i0, _label=seg_index):
+                if progress is None:
+                    return
+                overall = (_i0 + max(0.0, min(1.0, step_frac))) / total_segments
+                frac = _P_START + (_P_END - _P_START) * overall
+                if total_segments > 1:
+                    desc = f"Generating segment {_label} of {total_segments}"
+                else:
+                    desc = "Generating video"
+                progress(min(frac, _P_END), desc=desc)
+
+            _seg_progress(0.0)
             raw_frames = animate_frame(
                 current_frame, seg_end, prompt, negative_prompt,
                 num_frames, seg_seed, flow_shift, edit_steps,
                 lora_selections,
                 selected_loras_info,
-                progress,
+                _seg_progress,
             )
 
             factor = max(1, int(frame_multiplier) // FIXED_FPS)
@@ -3119,10 +3290,10 @@ def generate_video(
 
             seg_buf = encode_frames_to_bytes(seg_frames, fps=seg_fps, quality=int(export_quality))
             segment_bufs.append(seg_buf)
-            print(f"Segment {seg_index} complete ({seg_duration:.1f}s, "
+            print(f"Segment {seg_index} complete ({actual_seg_duration:.2f}s, "
                   f"{len(seg_frames)} frames @ {seg_fps} fps)")
 
-            remaining -= seg_duration
+            remaining -= actual_seg_duration
             if remaining <= 0.01:
                 break
 
@@ -3247,7 +3418,7 @@ def generate_sequence(
 
     current_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
     started = time.time()
-    all_segment_bufs = []  # list[bytes] — in-memory MP4 segments
+    all_segment_bufs = []  # list[bytes] â€” in-memory MP4 segments
 
     try:
         n_slots = len(slots)
@@ -3292,9 +3463,10 @@ def generate_sequence(
             while remaining > 0.01:
                 seg_duration = min(remaining, SEGMENT_DURATION)
                 num_frames = get_num_frames(seg_duration)
+                actual_seg_duration = num_frames / FIXED_FPS
                 part_seg_index += 1
                 seg_counter += 1
-                is_last_segment_of_part = (remaining - seg_duration) <= 0.01
+                is_last_segment_of_part = (remaining - actual_seg_duration) <= 0.01
                 seg_end = target_end if is_last_segment_of_part else None
 
                 if progress is not None:
@@ -3317,9 +3489,9 @@ def generate_sequence(
                 seg_buf = encode_frames_to_bytes(seg_frames, fps=seg_fps, quality=int(export_quality))
                 all_segment_bufs.append(seg_buf)
                 print(f"Sequence part {slot_idx + 1}/{n_slots} segment {part_seg_index} "
-                      f"complete ({seg_duration:.1f}s, {len(seg_frames)} frames @ {seg_fps} fps)")
+                      f"complete ({actual_seg_duration:.2f}s, {len(seg_frames)} frames @ {seg_fps} fps)")
 
-                remaining -= seg_duration
+                remaining -= actual_seg_duration
                 if remaining <= 0.01:
                     break
 
@@ -3446,7 +3618,7 @@ def generate_custom_edit_sequence(
 
     current_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
     started = time.time()
-    all_segment_bufs = []  # list[bytes] — in-memory MP4 segments
+    all_segment_bufs = []  # list[bytes] â€” in-memory MP4 segments
     n_slots = len(slots)
     total_segments = sum(
         max(1, math.ceil((s["duration"] - 0.01) / SEGMENT_DURATION)) for s in slots
@@ -3511,9 +3683,10 @@ def generate_custom_edit_sequence(
             while remaining > 0.01:
                 seg_duration = min(remaining, SEGMENT_DURATION)
                 num_frames = get_num_frames(seg_duration)
+                actual_seg_duration = num_frames / FIXED_FPS
                 part_seg_index += 1
                 seg_counter += 1
-                is_last_segment_of_part = (remaining - seg_duration) <= 0.01
+                is_last_segment_of_part = (remaining - actual_seg_duration) <= 0.01
                 seg_end = processed_end if is_last_segment_of_part else None
 
                 if progress is not None:
@@ -3538,15 +3711,15 @@ def generate_custom_edit_sequence(
                 seg_buf = encode_frames_to_bytes(seg_frames, fps=seg_fps, quality=int(export_quality))
                 all_segment_bufs.append(seg_buf)
                 print(f"Custom seq {slot_idx + 1}/{n_slots} vidgen seg {part_seg_index} "
-                      f"complete ({seg_duration:.1f}s, {len(seg_frames)} frames @ {seg_fps} fps)")
+                      f"complete ({actual_seg_duration:.2f}s, {len(seg_frames)} frames @ {seg_fps} fps)")
 
-                remaining -= seg_duration
+                remaining -= actual_seg_duration
                 if remaining <= 0.01:
                     break
 
                 nxt = _last_frame_of(seg_buf)
                 if nxt is None:
-                    print("Could not read segment tail frame — stopping chain here.")
+                    print("Could not read segment tail frame â€” stopping chain here.")
                     break
                 current_frame = nxt
                 seg_seed = random.randint(0, MAX_SEED)
@@ -3570,7 +3743,7 @@ def generate_custom_edit_sequence(
         filename = _media_name("vidgen_custom_seq", ".mp4")
         filepath = _write_video_tmp(final_buf, filename)
         _cache_last_frame_from_video(filepath)
-        print(f"Custom edit sequence done in {time.time() - started:.1f}s — "
+        print(f"Custom edit sequence done in {time.time() - started:.1f}s â€” "
               f"{n_slots} segment(s) -> {filename}")
         if progress is not None:
             progress(1.0, desc="Custom edit sequence complete")
@@ -3622,7 +3795,7 @@ def autorun_generate(
     completed = 0
 
     for idx, img_path in enumerate(autorun_files, start=1):
-        status = f"Autorun: {idx}/{total} â€” processing {img_path.name}"
+        status = f"Autorun: {idx}/{total} Ã¢â‚¬â€ processing {img_path.name}"
         print(f"\n[Autorun] {status}")
 
         _current_input_image_path = str(img_path)
@@ -3632,7 +3805,7 @@ def autorun_generate(
         except Exception as e:
             raise gr.Error(
                 f"Autorun stopped at {idx}/{total}: "
-                f"failed to open {img_path.name} â€” {e}"
+                f"failed to open {img_path.name} Ã¢â‚¬â€ {e}"
             )
 
         try:
@@ -3665,14 +3838,14 @@ def autorun_generate(
         except Exception as e:
             raise gr.Error(
                 f"Autorun stopped at {idx}/{total}: "
-                f"failed to process {img_path.name} â€” {e}"
+                f"failed to process {img_path.name} Ã¢â‚¬â€ {e}"
             )
 
         completed += 1
         completion_status = (
             f"Autorun complete: {completed}/{total} videos generated"
             if completed == total
-            else f"Autorun: {completed}/{total} done, downloading…"
+            else f"Autorun: {completed}/{total} done, downloadingâ€¦"
         )
 
         yield None, video_path, completion_status
@@ -4436,7 +4609,6 @@ def infer(
     return filepaths, seed, urls_json
 
 
-
 gallery_js = r"""
 () => {
 function init() {
@@ -4509,18 +4681,11 @@ function init() {
         });
         html += '<div class="gallery-add-card" id="gallery-add-card"><span class="add-icon">+</span><span class="add-text">Add</span></div>';
         galleryGrid.innerHTML = html;
-        galleryGrid.querySelectorAll('.gallery-thumb').forEach(thumb => {
-            thumb.addEventListener('click', (e) => {
-                if (e.target.closest('.thumb-remove')) return;
-                const idx = parseInt(thumb.dataset.idx);
-                showLightbox(images[idx].b64);
-            });
-        });
-        galleryGrid.querySelectorAll('.thumb-remove').forEach(btn => {
-            btn.addEventListener('click', (e) => { e.stopPropagation(); removeImage(parseInt(btn.dataset.remove)); });
-        });
-        const addCard = document.getElementById('gallery-add-card');
-        if (addCard) addCard.addEventListener('click', () => fileInput.click());
+        // Click handling is done ONCE via delegation on galleryGrid (see the
+        // capture-phase listener attached in init), so we do NOT attach any
+        // per-element listeners here. Delegation on the container survives
+        // innerHTML re-renders and cannot be blocked by child stacking/overlay
+        // quirks that were swallowing the X / Add clicks.
     }
 
     function showLightbox(b64) {
@@ -4534,8 +4699,10 @@ function init() {
                 + '<button id="picgen-lb-close" style="position:fixed;top:16px;right:20px;width:36px;height:36px;border-radius:50%;background:rgba(0,0,0,0.7);color:#fff;border:1px solid rgba(255,255,255,0.3);cursor:pointer;font-size:20px;line-height:1;display:flex;align-items:center;justify-content:center;z-index:10000;">\u00d7</button>'
                 + '</div>';
             document.body.appendChild(lb);
-            lb.addEventListener('click', (e) => { if (e.target === lb || e.target.id === 'picgen-lightbox') lb.style.display = 'none'; });
-            document.getElementById('picgen-lb-close').addEventListener('click', () => lb.style.display = 'none');
+            // Any click anywhere on the lightbox closes it, so a full-screen
+            // fixed overlay can never be left open and block the buttons under it.
+            lb.addEventListener('click', () => { lb.style.display = 'none'; });
+            document.getElementById('picgen-lb-close').addEventListener('click', (e) => { e.stopPropagation(); lb.style.display = 'none'; });
             document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && lb.style.display === 'flex') lb.style.display = 'none'; });
         }
         document.getElementById('picgen-lb-img').src = b64;
@@ -4582,6 +4749,38 @@ function init() {
     fileInput.addEventListener('change', (e) => { processFiles(e.target.files); e.target.value = ''; });
     if (uploadClick) uploadClick.addEventListener('click', () => fileInput.click());
     if (btnUpload) btnUpload.addEventListener('click', () => fileInput.click());
+
+    // SINGLE delegated click handler on the grid, in the CAPTURE phase, so it
+    // fires before anything on the children and cannot be swallowed by child
+    // stacking contexts / overlays. This replaces the per-element listeners
+    // and the drop-zone catch-all that were failing to register X / Add clicks.
+    galleryGrid.addEventListener('click', (e) => {
+        const removeBtn = e.target.closest('.thumb-remove');
+        if (removeBtn) {
+            e.preventDefault(); e.stopPropagation();
+            removeImage(parseInt(removeBtn.dataset.remove));
+            return;
+        }
+        if (e.target.closest('.gallery-add-card')) {
+            e.preventDefault(); e.stopPropagation();
+            fileInput.click();
+            return;
+        }
+        const thumb = e.target.closest('.gallery-thumb');
+        if (thumb) {
+            e.preventDefault(); e.stopPropagation();
+            const idx = parseInt(thumb.dataset.idx);
+            if (!isNaN(idx) && images[idx]) showLightbox(images[idx].b64);
+            return;
+        }
+    }, true);  // capture
+
+    // Clicking empty space in the drop zone (not on the grid) opens the picker.
+    dropZone.addEventListener('click', (e) => {
+        if (e.target.closest('#image-gallery-grid') ||
+            e.target.closest('#upload-click-area')) return;
+        fileInput.click();
+    });
     if (btnRemove) btnRemove.addEventListener('click', () => { if (selectedIdx >= 0) removeImage(selectedIdx); });
     if (btnClear) btnClear.addEventListener('click', clearAll);
     dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); });
@@ -4604,29 +4803,40 @@ body, .gradio-container { margin: 0 !important; padding: 0 !important; max-width
 .hidden-input { display: none !important; height: 0 !important; overflow: hidden !important; margin: 0 !important; padding: 0 !important; }
 #gallery-drop-zone { position: relative; min-height: 320px; overflow: auto; border: 1px solid var(--border-color-primary); border-radius: 8px; margin-bottom: 8px; }
 #gallery-drop-zone.drag-over { outline: 2px solid var(--color-accent); outline-offset: -2px; }
-.upload-prompt-modern { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 20; }
+.upload-prompt-modern { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 1; }
+/* The upload prompt is a centered absolute overlay. Only its inner click area
+   should capture clicks; the rest must let clicks through to the thumbnails
+   and their remove/add buttons underneath. */
+.upload-prompt-modern { pointer-events: none; }
+.upload-prompt-modern #upload-click-area, #upload-click-area { pointer-events: auto; }
+/* The thumbnail grid must sit ABOVE the absolute upload prompt so its X and
+   Add buttons are always clickable (previously they shared/were under the
+   prompt's stacking context and got blocked). */
+#image-gallery-grid { position: relative; z-index: 5; }
+.gallery-thumb, .gallery-add-card { position: relative; z-index: 5; }
 .upload-click-area { display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; padding: 36px 52px; border: 2px dashed var(--border-color-primary); border-radius: 16px; transition: all .2s ease; gap: 8px; }
 .upload-click-area:hover { border-color: var(--color-accent); transform: scale(1.03); }
 .upload-click-area svg { width: 64px; height: 64px; }
 .upload-main-text { font-size: 14px; font-weight: 500; margin-top: 4px; }
 .upload-sub-text { font-size: 12px; color: var(--body-text-color-subdued); }
 .image-gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; padding: 12px; align-content: start; }
+/* Picgen tool buttons: three side by side, spaced, together full width. */
+#picgen-tool-row { display: flex !important; flex-direction: row !important; flex-wrap: nowrap !important; gap: 10px !important; width: 100% !important; margin-bottom: 8px !important; }
+#picgen-tool-row > * { flex: 1 1 0 !important; min-width: 0 !important; }
 #merge-bg-radio .wrap { display: flex !important; flex-wrap: nowrap !important; flex-direction: row !important; gap: 4px 8px !important; align-items: center !important; }
 #merge-bg-radio .wrap label { white-space: nowrap !important; flex: 1 1 0 !important; font-size: 12px !important; }
-/* Custom-mode results: 4 large landscape images spanning the FULL section
-   width, side by side in a single row. */
+/* Custom-mode results: 4 large landscape images side by side, full width.
+   Keep this minimal â€” let Gradio render the gallery natively (heavy DOM
+   overrides collapsed the images into blank space). We only force full width
+   and let images size to their container. */
 #merge-custom-gallery { width: 100% !important; }
-#merge-custom-gallery .grid-wrap,
-#merge-custom-gallery .grid-container { width: 100% !important; max-width: 100% !important; display: grid !important; grid-template-columns: repeat(4, 1fr) !important; gap: 8px !important; }
-#merge-custom-gallery .thumbnail-item { width: 100% !important; aspect-ratio: 16 / 9 !important; height: auto !important; cursor: pointer !important; border: 3px solid transparent !important; border-radius: 8px !important; overflow: hidden !important; transition: border-color .15s !important; }
-#merge-custom-gallery .thumbnail-item img { width: 100% !important; height: 100% !important; object-fit: cover !important; }
-#merge-custom-gallery .thumbnail-item.selected { border-color: var(--color-accent) !important; }
+#merge-custom-gallery img { object-fit: contain !important; }
 .gallery-thumb { position: relative; aspect-ratio: 1; border-radius: 8px; overflow: hidden; cursor: pointer; border: 2px solid var(--border-color-primary); transition: border-color .2s ease, box-shadow .2s ease; background: var(--background-fill-primary); display: flex; align-items: center; justify-content: center; }
 .gallery-thumb:hover { border-color: var(--color-accent); }
 .gallery-thumb.selected { border-color: var(--color-accent) !important; box-shadow: 0 0 0 3px rgba(var(--color-accent-soft), .3); }
 .gallery-thumb img { width: 100%; height: 100%; object-fit: contain; display: block !important; }
 .thumb-badge { position: absolute; top: 5px; left: 5px; background: var(--color-accent); color: #fff; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 600; display: block; text-align: left; }
-.thumb-remove { position: absolute; top: 5px; right: 5px; width: 22px; height: 22px; background: rgba(0,0,0,.7); color: #fff; border: 1px solid rgba(255,255,255,.2); border-radius: 50%; cursor: pointer; display: none; align-items: center; justify-content: center; font-size: 11px; transition: background .15s; line-height: 1; z-index: 10; }
+.thumb-remove { position: absolute; top: 5px; right: 5px; width: 24px; height: 24px; background: rgba(0,0,0,.75); color: #fff; border: 1px solid rgba(255,255,255,.35); border-radius: 50%; cursor: pointer; display: flex !important; align-items: center; justify-content: center; font-size: 12px; transition: background .15s; line-height: 1; z-index: 50; padding: 0; pointer-events: auto !important; }
 .gallery-thumb:hover .thumb-remove { display: flex !important; }
 .thumb-remove:hover { background: #e53e3e !important; }
 .gallery-add-card { aspect-ratio: 1; border-radius: 8px; border: 2px dashed var(--border-color-primary); display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; transition: all .2s ease; gap: 4px; }
@@ -4926,7 +5136,7 @@ def autorun_push_generate(
 
         time.sleep(1)
         _do_clear_storage()
-        print(f"[AutorunPush] storage cleared after #{completed} — waiting for /autorun/ready")
+        print(f"[AutorunPush] storage cleared after #{completed} â€” waiting for /autorun/ready")
 
         while not _push_cancel.is_set():
             with _push_lock:
@@ -5016,7 +5226,7 @@ with gr.Blocks(css=css) as demo:
                         pass
                 break
 
-        return gr.update(visible=True, value=f"✓ Cleared {cleaned} upload(s).")
+        return gr.update(visible=True, value=f"âœ“ Cleared {cleaned} upload(s).")
 
 
 
@@ -5034,9 +5244,9 @@ with gr.Blocks(css=css) as demo:
             info="When checked, displays input images and generated output on screen.",
         )
 
-    with gr.Tabs(selected=(0 if STARTUP_MODE == "vidgen" else 1)):
+    with gr.Tabs(selected=("picgen" if STARTUP_MODE == "picgen" else "vidgen")):
 
-        with gr.Tab(" Video Generator"):
+        with gr.Tab(" Video Generator", id="vidgen"):
             gr.Markdown(model_title())
 
             with gr.Row():
@@ -5151,7 +5361,7 @@ with gr.Blocks(css=css) as demo:
                                 placeholder="e.g. music, silence, noise",
                                 lines=3,
                             )
-                        gr.Markdown("**Voice Cloning (optional)** — upload a 5-10s reference clip and type the dialogue to speak. Leave blank to skip.")
+                        gr.Markdown("**Voice Cloning (optional)** â€” upload a 5-10s reference clip and type the dialogue to speak. Leave blank to skip.")
                         with gr.Row():
                             ref_audio_input = gr.File(
                                 label="Voice Reference Clip (upload .wav/.mp3, 5-10s)",
@@ -5277,7 +5487,7 @@ with gr.Blocks(css=css) as demo:
 
             with gr.Group(visible=False) as sequence_group:
                 gr.Markdown(
-                    "**Sequence** — fill in as many of the parts below as you need "
+                    "**Sequence** â€” fill in as many of the parts below as you need "
                     "(others left empty are skipped). Each part's image is animated "
                     "with its own prompt and duration (chaining internally past "
                     f"{SEGMENT_DURATION}s automatically) and ends exactly on the next "
@@ -5316,12 +5526,12 @@ with gr.Blocks(css=css) as demo:
 
             with gr.Group(visible=False) as custom_seq_group:
                 gr.Markdown(
-                    "**Custom Edit Sequence** — uses your Reference Photo (top-left) as the "
+                    "**Custom Edit Sequence** â€” uses your Reference Photo (top-left) as the "
                     "starting image. For each segment below, picgen generates the last frame "
                     "from the current image using your picgen prompt, then vidgen animates from "
                     "the current image to that generated last frame using your motion prompt. "
                     "The generated last frame becomes the next segment's first image. "
-                    "The main Motion & Scene Prompt above is **ignored** — each segment uses its own motion prompt."
+                    "The main Motion & Scene Prompt above is **ignored** â€” each segment uses its own motion prompt."
                 )
                 custom_seq_motion_prompts = []
                 custom_seq_picgen_prompts = []
@@ -5373,7 +5583,14 @@ with gr.Blocks(css=css) as demo:
                     lora_download_status = gr.Markdown("", visible=False)
                     
                     def download_lora_handler(lora_id):
-                        """Download missing LoRA files for a specific LoRA."""
+                        """Download missing LoRA files for a specific LoRA, then
+                        make it usable IMMEDIATELY (no app restart / page refresh):
+                        we re-discover the LoRAs so the backend sees the new
+                        files, and return UI updates that enable this LoRA's
+                        checkbox and hide its download button right away.
+
+                        Returns: (status_markdown, checkbox_update, download_btn_update)
+                        """
                         global AVAILABLE_LORAS, LORA_STATUS
                         config = LORA_CONFIG.get(lora_id, {})
                         results = []
@@ -5397,13 +5614,26 @@ with gr.Blocks(css=css) as demo:
                             else:
                                 results.append(f"**Low:** Already downloaded")
                         if not results:
-                            return gr.update(visible=True, value="Nothing to download")
+                            return (gr.update(visible=True, value="Nothing to download"),
+                                    gr.update(), gr.update())
+
+                        # Refresh backend view so generation picks up the new files.
                         AVAILABLE_LORAS = discover_loras()
                         LORA_STATUS = check_lora_status(LORA_CONFIG)
+
+                        # Is this LoRA now usable (at least one file present)?
+                        info_now = AVAILABLE_LORAS.get(lora_id, {})
+                        can_use_now = bool(info_now.get('high')) or bool(info_now.get('low'))
+
                         status_msg = "\n".join(results)
-                        if success_count > 0:
-                            status_msg += f"\n\n**{success_count} file(s) downloaded.** Refresh page to enable checkbox."
-                        return gr.update(visible=True, value=status_msg)
+                        if success_count > 0 and can_use_now:
+                            status_msg += f"\n\n**{success_count} file(s) downloaded â€” ready to use now.**"
+
+                        # Enable the checkbox and hide the download button immediately.
+                        checkbox_update = gr.update(interactive=can_use_now) if can_use_now else gr.update()
+                        btn_update = gr.update(visible=False) if can_use_now else gr.update()
+                        return (gr.update(visible=True, value=status_msg),
+                                checkbox_update, btn_update)
                     
                     card_index = 0
                     current_row = None
@@ -5421,8 +5651,8 @@ with gr.Blocks(css=css) as demo:
                         needs_download = (not high_exists and high_downloadable) or (not low_exists and low_downloadable)
                         can_use = high_exists or low_exists
                         
-                        high_status = "âœ“" if high_exists else ("â†“" if high_downloadable else "âœ—")
-                        low_status = "âœ“" if low_exists else ("â†“" if low_downloadable else "âœ—")
+                        high_status = "Ã¢Å“â€œ" if high_exists else ("Ã¢â€ â€œ" if high_downloadable else "Ã¢Å“â€”")
+                        low_status = "Ã¢Å“â€œ" if low_exists else ("Ã¢â€ â€œ" if low_downloadable else "Ã¢Å“â€”")
                         high_cls = "lora-badge-ok" if high_exists else ("lora-badge-dl" if high_downloadable else "lora-badge-miss")
                         low_cls = "lora-badge-ok" if low_exists else ("lora-badge-dl" if low_downloadable else "lora-badge-miss")
                         
@@ -5466,7 +5696,7 @@ with gr.Blocks(css=css) as demo:
                                 if not low_exists and low_downloadable:
                                     dl_parts.append("Low")
                                 lora_download_btns[lora_id] = gr.Button(
-                                    f"â†“ Download {' + '.join(dl_parts)}",
+                                    f"Ã¢â€ â€œ Download {' + '.join(dl_parts)}",
                                     size="sm",
                                     variant="secondary",
                                 )
@@ -5499,10 +5729,17 @@ with gr.Blocks(css=css) as demo:
                             current_row.__exit__(None, None, None)
                     
                     for lora_id, btn in lora_download_btns.items():
+                        # Output to: status message + this LoRA's checkbox (to
+                        # enable it) + this download button (to hide it) â€” so the
+                        # LoRA becomes usable immediately with no restart/refresh.
+                        _cb = lora_checkboxes.get(lora_id)
+                        _outs = [lora_download_status]
+                        _outs.append(_cb if _cb is not None else lora_download_status)
+                        _outs.append(btn)
                         btn.click(
                             fn=lambda lid=lora_id: download_lora_handler(lid),
                             inputs=[],
-                            outputs=[lora_download_status],
+                            outputs=_outs,
                         )
                 
                 else:
@@ -5563,7 +5800,7 @@ with gr.Blocks(css=css) as demo:
             with gr.Accordion("Merge Photos", open=True):
                 gr.Markdown(
                     "Upload two photos. Backgrounds are removed and both subjects are "
-                    "placed side by side on a white canvas (1280×720), ready to use as "
+                    "placed side by side on a white canvas (1280Ã—720), ready to use as "
                     "a first frame for video generation."
                 )
                 with gr.Row(equal_height=True):
@@ -5587,7 +5824,7 @@ with gr.Blocks(css=css) as demo:
                         )
                     with gr.Column(scale=2):
                         merge_output = gr.Image(
-                            label="Merged Result (1280×720)",
+                            label="Merged Result (1280Ã—720)",
                             type="pil",
                             interactive=False,
                             elem_id="merge-output-img",
@@ -5604,23 +5841,22 @@ with gr.Blocks(css=css) as demo:
                         label="Background  (leave unselected for all-white)",
                         elem_id="merge-bg-radio",
                     )
-                with gr.Column(visible=False) as merge_custom_prompt_row:
+                with gr.Column(visible=True) as merge_custom_prompt_row:
                     merge_custom_prompt = gr.Textbox(
-                        label="Custom background prompt",
-                        placeholder="Describe the background / scene you want…",
+                        label="Custom prompt (optional â€” added to whichever option you pick, or used alone with the Custom option)",
+                        placeholder="Describe the background / scene or any extra detail you wantâ€¦",
                         lines=2,
                     )
                 # Gallery shown only for Custom mode (4 images, user picks one)
                 merge_custom_gallery = gr.Gallery(
-                    label="Choose a result — click to select, then Use as First Frame",
-                    show_label=True,
+                    show_label=False,
                     type="pil",
                     columns=4,
                     rows=1,
-                    # Tall enough that the 4 landscape (16:9) results shown side
-                    # by side span the full section width at a large size. The
-                    # CSS below forces full-width and proper aspect fit.
-                    height=None,
+                    # Fixed height so the 4 landscape results render as a proper
+                    # side-by-side row (height=None collapsed them to blank).
+                    height=260,
+                    object_fit="contain",
                     visible=False,
                     elem_id="merge-custom-gallery",
                     interactive=False,
@@ -5641,11 +5877,12 @@ with gr.Blocks(css=css) as demo:
                             size="lg",
                         )
 
-                # Show/hide the custom prompt row when the radio changes
+                # The custom prompt box is ALWAYS visible now (it can be added to
+                # any option, or used alone with the Custom option). On mode
+                # change we only reset the gallery/selection.
                 def _on_merge_bg_change(choice):
-                    is_custom = choice == "Custom"
                     return (
-                        gr.update(visible=is_custom),   # merge_custom_prompt_row
+                        gr.update(visible=True),         # merge_custom_prompt_row (always shown)
                         gr.update(visible=False),        # hide gallery on mode change
                         None,                            # reset selection state
                     )
@@ -5656,16 +5893,25 @@ with gr.Blocks(css=css) as demo:
                     outputs=[merge_custom_prompt_row, merge_custom_gallery, merge_gallery_selection],
                 )
 
-                def _do_merge(a, b, bg_choice, custom_prompt):
+                def _do_merge(a, b, bg_choice, custom_prompt,
+                              progress=gr.Progress(track_tqdm=True)):
                     """Merge two PIL images onto the chosen background.
 
                     For Custom mode: generate 4 variants with pic_pipe using the
                     user-supplied prompt, return them as a gallery list.
                     For all other modes: single result returned to merge_output.
+
+                    `progress` drives Gradio's built-in progress bar on the
+                    event's output components (merge_output on the right for the
+                    8 preset/Person options, merge_custom_gallery below for
+                    Custom), matching how vidgen shows progress.
                     """
                     global _current_merge_output_path
                     if a is None or b is None:
                         raise gr.Error("Please upload both Person A and Person B photos.")
+
+                    if progress is not None:
+                        progress(0.02, desc="Preparing photos")
 
                     if bg_choice == "Custom":
                         prompt_text = (custom_prompt or "").strip()
@@ -5675,19 +5921,21 @@ with gr.Blocks(css=css) as demo:
                         # Build the merged subjects on a white canvas. With
                         # bg_choice=None, merge_photos_fn already returns a
                         # flattened RGB 1280x720 image of both fitted subjects
-                        # on white — exactly the base pic_pipe needs. (It is
+                        # on white â€” exactly the base pic_pipe needs. (It is
                         # NOT an RGBA image, so we must not call .split()[3] on
-                        # it — that was the "tuple index out of range" crash.)
+                        # it â€” that was the "tuple index out of range" crash.)
                         OUT_W, OUT_H = 1280, 720
+                        if progress is not None:
+                            progress(0.10, desc="Merging subjects")
                         base = merge_photos_fn(a, b, None)
                         if base is None:
-                            raise gr.Error("Merge failed — could not process images.")
+                            raise gr.Error("Merge failed â€” could not process images.")
                         base = base.convert("RGB")
                         if base.size != (OUT_W, OUT_H):
                             base = base.resize((OUT_W, OUT_H), Image.LANCZOS)
 
                         # The user's custom prompt only needs to describe the
-                        # scene — the identity-preserving wrapper AND the
+                        # scene â€” the identity-preserving wrapper AND the
                         # fit/placement instructions (both full bodies visible,
                         # correctly sized, posed naturally in the scene) are
                         # appended automatically so they don't have to include
@@ -5699,7 +5947,10 @@ with gr.Blocks(css=css) as demo:
                         images = []
                         with torch.cuda.device(PIC_DEVICE):
                             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                                for _ in range(4):
+                                for _i in range(4):
+                                    if progress is not None:
+                                        progress(0.20 + 0.75 * (_i / 4.0),
+                                                 desc=f"Generating result {_i + 1} of 4")
                                     gen = torch.Generator(device=PIC_DEVICE).manual_seed(
                                         random.randint(0, np.iinfo(np.int32).max)
                                     )
@@ -5715,6 +5966,8 @@ with gr.Blocks(css=css) as demo:
                                     if img.size != (OUT_W, OUT_H):
                                         img = img.resize((OUT_W, OUT_H), Image.LANCZOS)
                                     images.append(img)
+                        if progress is not None:
+                            progress(1.0, desc="Done")
 
                         # Return: single output hidden, gallery shown, selection reset
                         return (
@@ -5724,9 +5977,17 @@ with gr.Blocks(css=css) as demo:
                         )
 
                     else:
-                        result = merge_photos_fn(a, b, bg_choice or None)
+                        if progress is not None:
+                            progress(0.15, desc="Merging & generating background")
+                        # Any text in the always-visible custom box is combined
+                        # with the chosen option's scene prompt (or used alone if
+                        # no option prompt applies).
+                        extra = (custom_prompt or "").strip() or None
+                        result = merge_photos_fn(a, b, bg_choice or None, extra_prompt=extra)
                         if result is None:
-                            raise gr.Error("Merge failed — could not process images.")
+                            raise gr.Error("Merge failed â€” could not process images.")
+                        if progress is not None:
+                            progress(0.95, desc="Finalizing")
                         buf = BytesIO()
                         result.save(buf, format="PNG")
                         filename = _media_name("merge", ".png")
@@ -5761,14 +6022,14 @@ with gr.Blocks(css=css) as demo:
                     """Push the selected result into the reference_image widget."""
                     if bg_choice == "Custom":
                         if not gallery_imgs:
-                            gr.Warning("No merged results yet — click Merge first.")
+                            gr.Warning("No merged results yet â€” click Merge first.")
                             return gr.update()
                         if selection is None:
                             gr.Warning("Click one of the 4 images to select it, then click Use as First Frame.")
                             return gr.update()
                         idx = int(selection)
                         if idx < 0 or idx >= len(gallery_imgs):
-                            gr.Warning("Selection out of range — please click an image to select it.")
+                            gr.Warning("Selection out of range â€” please click an image to select it.")
                             return gr.update()
                         item = gallery_imgs[idx]
                         # gallery items are (PIL.Image, caption) tuples or plain PIL images
@@ -5776,7 +6037,7 @@ with gr.Blocks(css=css) as demo:
                         return gr.update(value=pil)
                     else:
                         if merged_img is None:
-                            gr.Warning("No merged result yet — click Merge first.")
+                            gr.Warning("No merged result yet â€” click Merge first.")
                             return gr.update()
                         return gr.update(value=merged_img)
 
@@ -5837,10 +6098,10 @@ with gr.Blocks(css=css) as demo:
 
             with gr.Row(visible=False) as push_autorun_row:
                 push_autorun_btn = gr.Button(
-                    "â–¶ Start Push Autorun (waiting for local feeder)",
+                    "Ã¢â€“Â¶ Start Push Autorun (waiting for local feeder)",
                     variant="primary", size="lg",
                 )
-                push_cancel_btn = gr.Button("â–  Cancel", variant="stop", size="lg")
+                push_cancel_btn = gr.Button("Ã¢â€“Â  Cancel", variant="stop", size="lg")
 
             def _scene_mode_visibility(m):
                 is_seq = (m == MODE_SEQUENCE)
@@ -6128,7 +6389,7 @@ with gr.Blocks(css=css) as demo:
                 """Returns a change-handler closure with its own 'last path' state.
 
                 When the user replaces an input image while a generation is still
-                running, the old file must NOT be unprotected — the in-flight job
+                running, the old file must NOT be unprotected â€” the in-flight job
                 is still reading it.  We check _is_generation_active() before
                 calling _unprotect_path() so the file stays protected until the
                 generation finishes and _generation_release() is called.
@@ -6183,7 +6444,7 @@ with gr.Blocks(css=css) as demo:
                 outputs=[],
             )
 
-        with gr.Tab("Photo Editor"):
+        with gr.Tab("Photo Editor", id="picgen"):
             with gr.Column(elem_id="col-container"):
 
                 gr.HTML("""
@@ -6233,6 +6494,18 @@ with gr.Blocks(css=css) as demo:
                             <div id="image-gallery-grid" class="image-gallery-grid" style="display:none;"></div>
                         </div>
                         """)
+                        # Three tools, side by side, together spanning the full
+                        # width of the Generate button below.
+                        with gr.Row(elem_id="picgen-tool-row"):
+                            pic_complete_body_btn = gr.Button(
+                                "Completed Body", variant="secondary", scale=1,
+                            )
+                            pic_add_l2r_btn = gr.Button(
+                                "Add Left To Right", variant="secondary", scale=1,
+                            )
+                            pic_add_r2l_btn = gr.Button(
+                                "Add Right To Left", variant="secondary", scale=1,
+                            )
                         pic_run_button_top = gr.Button("Generate", variant="primary", size="lg")
                         pic_num_images = gr.Slider(
                             label="Number of images", minimum=1, maximum=4, step=1, value=1,
@@ -6263,7 +6536,7 @@ with gr.Blocks(css=css) as demo:
                             format="png",
                         )
                         use_output_btn = gr.Button("Use as input", variant="secondary", size="sm")
-                        pic_download_btn = gr.Button("Download Images", variant="secondary", size="sm")
+                        pic_download_btn = gr.Button("Download All currently outputted Images", variant="secondary", size="sm")
                         picgen_urls = gr.Textbox(visible=False, value="", elem_id="picgen-urls")
 
                         with gr.Row():
@@ -6349,6 +6622,68 @@ with gr.Blocks(css=css) as demo:
                 _wire_picgen_btn(pic_run_button_top.click)
                 _wire_picgen_btn(pic_prompt.submit)
 
+                # Tool buttons (Completed Body / Add L->R / Add R->L). These are
+                # just PRESET PROMPTS: each button drops its preset text into the
+                # prompt box, then runs the normal Qwen generate flow (same as
+                # clicking Generate). No special pipeline.
+                PICGEN_TOOL_PRESETS = {
+                    "complete_body": (
+                        "Complete and extend the person's full body naturally, "
+                        "filling in any parts that are cropped or cut off at the "
+                        "edges (head, feet, limbs), keeping their face, skin tone, "
+                        "body shape and proportions exactly the same. Do not change "
+                        "anything already visible â€” only add the missing parts."
+                    ),
+                    "add_l2r": (
+                        "Take the person from the first image and place them "
+                        "naturally into the scene of the second image, next to the "
+                        "person already there, correctly sized and lit to match. "
+                        "Keep both people's faces and bodies exactly the same. Show "
+                        "both full bodies clearly in the result."
+                    ),
+                    "add_r2l": (
+                        "Take the person from the second image and place them "
+                        "naturally into the scene of the first image, next to the "
+                        "person already there, correctly sized and lit to match. "
+                        "Keep both people's faces and bodies exactly the same. Show "
+                        "both full bodies clearly in the result."
+                    ),
+                }
+
+                def _set_prompt(text):
+                    """Return the preset text to load into the prompt box."""
+                    return text
+
+                def _wire_picgen_tool_preset(button, preset_key):
+                    # 1) set the preset prompt into the prompt box, then
+                    # 2) run the exact same generate flow as the Generate button.
+                    button.click(
+                        fn=lambda k=preset_key: PICGEN_TOOL_PRESETS[k],
+                        inputs=[],
+                        outputs=[pic_prompt],
+                    ).then(
+                        fn=infer_with_preclear,
+                        inputs=_pic_infer_inputs,
+                        js=_pic_infer_js,
+                        outputs=[pic_result, pic_seed, picgen_urls],
+                    ).then(
+                        fn=lambda: __import__('time').sleep(2),
+                        inputs=[],
+                        outputs=[],
+                    ).then(
+                        fn=protect_current_inputs,
+                        inputs=[reference_image, end_image, merge_img_a, merge_img_b],
+                        outputs=None,
+                    ).then(
+                        fn=clear_storage,
+                        inputs=[],
+                        outputs=[clear_storage_status],
+                    )
+
+                _wire_picgen_tool_preset(pic_complete_body_btn, "complete_body")
+                _wire_picgen_tool_preset(pic_add_l2r_btn, "add_l2r")
+                _wire_picgen_tool_preset(pic_add_r2l_btn, "add_r2l")
+
 
                 def output_to_b64(output_images):
                     """Convert gallery items to base64 JPEG list for the input gallery.
@@ -6384,49 +6719,60 @@ with gr.Blocks(css=css) as demo:
 
                 pic_download_btn.click(
                     fn=None,
-                    inputs=[picgen_urls],
+                    inputs=[],
                     outputs=[],
                     js="""
-                    async (urlsJson) => {
-                        let urls = [];
-                        try { urls = JSON.parse(urlsJson || '[]'); } catch(e) {}
-                        if (!Array.isArray(urls) || urls.length === 0) {
-                            alert('No images to download — generate images first.');
-                            return;
-                        }
-                        let waited = 0;
-                        while (!window.__ngSecretHex && waited < 5000) {
-                            await new Promise(r => setTimeout(r, 100));
-                            waited += 100;
-                        }
-                        for (let i = 0; i < urls.length; i++) {
-                            const url = urls[i];
-                            if (!url || !url.startsWith('/media/')) continue;
-                            const filename = url.split('/').pop().split('?')[0] || ('picgen_' + (i+1) + '.png');
+                    async () => {
+                        // Download every image currently shown in the result
+                        // gallery. We read the actual <img> src values from the
+                        // DOM (works for Gradio /file= URLs, blob: and data:
+                        // URLs, and encrypted /media/ URLs alike) rather than a
+                        // separate URL list that could be out of sync.
+                        const gal = document.getElementById('picgen-result-gallery');
+                        if (!gal) { alert('No images to download â€” generate images first.'); return; }
+                        const imgEls = Array.from(gal.querySelectorAll('img'));
+                        // De-duplicate by src (galleries can render thumb + preview).
+                        const seen = new Set();
+                        const srcs = [];
+                        imgEls.forEach(im => {
+                            const s = im.currentSrc || im.src;
+                            if (s && !seen.has(s)) { seen.add(s); srcs.push(s); }
+                        });
+                        if (srcs.length === 0) { alert('No images to download â€” generate images first.'); return; }
+
+                        const _f = window.__ngOrigFetch || window.fetch;
+                        for (let i = 0; i < srcs.length; i++) {
+                            const src = srcs[i];
+                            let filename = 'picgen_' + (i + 1) + '.png';
+                            try {
+                                const clean = src.split('?')[0].split('#')[0];
+                                const last = clean.split('/').pop();
+                                if (last && last.indexOf('.') !== -1) filename = decodeURIComponent(last);
+                            } catch (e) {}
                             try {
                                 const headers = {};
-                                if (window.__ngSecretHex) headers['X-NG-Secret'] = window.__ngSecretHex;
-                                const _f = window.__ngOrigFetch || window.fetch;
-                                const resp = await _f(url, { headers });
-                                if (!resp.ok) continue;
-                                const encrypted = resp.headers.get('X-NG-Encrypted');
+                                const isMedia = src.indexOf('/media/') !== -1;
+                                if (isMedia && window.__ngSecretHex) headers['X-NG-Secret'] = window.__ngSecretHex;
+                                const resp = await _f(src, { headers });
+                                if (!resp.ok) { console.warn('[PicDL] fetch failed', src, resp.status); continue; }
                                 let plainBytes;
+                                const encrypted = resp.headers.get('X-NG-Encrypted');
                                 if (encrypted === '1' && window.__ngKey) {
                                     const buf = await resp.arrayBuffer();
                                     try {
                                         plainBytes = await crypto.subtle.decrypt(
-                                            { name: 'AES-GCM', iv: buf.slice(0,12) },
+                                            { name: 'AES-GCM', iv: buf.slice(0, 12) },
                                             window.__ngKey, buf.slice(12)
                                         );
-                                    } catch(e) { console.warn('[PicDL] decrypt:', e); continue; }
+                                    } catch (e) { console.warn('[PicDL] decrypt:', e); continue; }
                                 } else {
                                     plainBytes = await resp.arrayBuffer();
                                 }
-                                const ext = filename.split('.').pop().toLowerCase();
-                                const mime = ext === 'png' ? 'image/png' : 'image/jpeg';
+                                const ext = (filename.split('.').pop() || 'png').toLowerCase();
+                                const mime = ext === 'png' ? 'image/png'
+                                           : (ext === 'webp' ? 'image/webp' : 'image/jpeg');
                                 const blob = new Blob([plainBytes], { type: mime });
                                 const blobUrl = URL.createObjectURL(blob);
-                                await new Promise(resolve => setTimeout(resolve, i * 300));
                                 const a = document.createElement('a');
                                 a.href = blobUrl;
                                 a.download = filename;
@@ -6434,7 +6780,9 @@ with gr.Blocks(css=css) as demo:
                                 a.click();
                                 document.body.removeChild(a);
                                 setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
-                            } catch(e) { console.warn('[PicDL] failed:', url, e); }
+                                // Small stagger so the browser accepts multiple downloads.
+                                await new Promise(r => setTimeout(r, 350));
+                            } catch (e) { console.warn('[PicDL] failed:', src, e); }
                         }
                     }
                     """,
@@ -6580,7 +6928,7 @@ with gr.Blocks(css=css) as demo:
             img.loading = 'eager';
             img.src = '/starters/' + n;
             img.onerror = function() {
-                // No image found — show a numbered placeholder
+                // No image found â€” show a numbered placeholder
                 const ph = document.createElement('div');
                 ph.className = 'starter-thumb-placeholder';
                 ph.textContent = n;
@@ -6662,7 +7010,7 @@ with gr.Blocks(css=css) as demo:
         if (window.__ngKey) return;  // already initialised
 
         // Retrieve or generate the 32-byte device secret stored in localStorage.
-        // This secret never leaves the browser — the server never sees the key,
+        // This secret never leaves the browser â€” the server never sees the key,
         // only the secret from which it derives the matching key server-side.
         let secretHex = localStorage.getItem('__ngSecret__');
         if (!secretHex || secretHex.length !== 64) {
@@ -6758,7 +7106,7 @@ with gr.Blocks(css=css) as demo:
         }
         const es = new EventSource('/logs/stream?_=' + Date.now());
 
-        // We can't add custom headers to EventSource — use a modified URL approach:
+        // We can't add custom headers to EventSource â€” use a modified URL approach:
         // close EventSource and switch to fetch-based SSE with the secret header.
         es.close();
 
@@ -6878,7 +7226,7 @@ async def _export_api_md():
         args_obj = "{ " + ", ".join(n + ": <value>" for n in param_names) + " }" if param_names else "{}"
         return (
             "```javascript\n"
-            "// Node.js — requires: npm install @gradio/client\n"
+            "// Node.js â€” requires: npm install @gradio/client\n"
             "import { Client } from \"@gradio/client\";\n\n"
             "const client = await Client.connect(\"http://0.0.0.0:7860\");\n"
             "const result = await client.predict(\"" + api_name + "\", " + args_obj + ");\n"
@@ -7146,12 +7494,12 @@ if __name__ == "__main__":
                             downloaded_any = True
                             print(f"[AutoDownload] OK: {filename}")
                         else:
-                            print(f"[AutoDownload] FAILED: {filename} — {msg}")
+                            print(f"[AutoDownload] FAILED: {filename} â€” {msg}")
                 if downloaded_any:
                     global AVAILABLE_LORAS, LORA_STATUS
                     AVAILABLE_LORAS = discover_loras()
                     LORA_STATUS = check_lora_status(config)
-                    print("[AutoDownload] LoRA catalog refreshed — new files ready without restart.")
+                    print("[AutoDownload] LoRA catalog refreshed â€” new files ready without restart.")
             except Exception as e:
                 print(f"[AutoDownload] Error during LoRA auto-download: {e}")
                 import traceback; traceback.print_exc()
@@ -7166,7 +7514,7 @@ if __name__ == "__main__":
                 while time.time() - _t0 < 300:
                     time.sleep(10)
                     if _AUDIO_ENGINE_AVAILABLE:
-                        print("[Predownload] Audio engine already ready — skipping.")
+                        print("[Predownload] Audio engine already ready â€” skipping.")
                         return
                     if time.time() - _t0 > 100:
                         break
@@ -7190,7 +7538,7 @@ if __name__ == "__main__":
                     _ensure_audio_engines()
                     print("[Predownload] Audio engine assets ready.")
                 else:
-                    print("[Predownload] Audio engine already ready — OK.")
+                    print("[Predownload] Audio engine already ready â€” OK.")
             except Exception as _e:
                 print(f"[Predownload] Audio engine failed (non-fatal): {_e}")
                 import traceback; traceback.print_exc()
@@ -7198,7 +7546,6 @@ if __name__ == "__main__":
             print("[Predownload] All background pre-downloads complete.")
 
         threading.Thread(target=_bg_predownload_assets, daemon=True).start()
-
 
 
 

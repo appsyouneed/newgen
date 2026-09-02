@@ -18,6 +18,14 @@ transformers>=4.52.0,<5.0
 diffusers>=0.33.0,<0.38.0
 safetensors>=0.4.0
 numpy<2.1
+# No explicit protobuf pin needed here: descript-audiotools (pulled in via
+# HunyuanVideo-Foley's requirements.txt) pins protobuf<5.0, and nothing else
+# in this shared environment needs newer than that. F5-TTS's dependency
+# chain (which does need protobuf>=6.33.5, via cached_path ->
+# google-cloud-storage -> google-api-core) runs in its own isolated venv
+# (/root/newgen/.f5tts-venv, created by _ensure_audio_engines() in app.py)
+# specifically so its protobuf requirement never has to coexist with
+# audiotools' in the same site-packages.
 
 # Model dependencies
 accelerate
