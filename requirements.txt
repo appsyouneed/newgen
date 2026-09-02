@@ -1,8 +1,12 @@
-# Core (torch installed separately in setup.sh)
+# Core (torch stack installed separately in setup.sh)
 # torch
 # torchvision
+# torchaudio  ← installed alongside torch in setup.sh; required by HunyuanVideo-Foley
+# torchcodec  ← required by torchaudio>=2.6 for audio save; installed in setup.sh
 
-# Pinned compatible stack — huggingface-hub must stay <1.0 for transformers<5
+# Pinned compatible stack — huggingface-hub must stay <1.0 for transformers<5.
+# gradio==4.43.0 imports HfFolder which was removed in huggingface-hub>=0.26.
+# setup.sh patches gradio/oauth.py with a shim after install so this is safe.
 huggingface-hub>=0.34.0,<1.0
 transformers>=4.50.0,<5.0
 diffusers>=0.33.0,<0.38.0
@@ -23,7 +27,12 @@ Pillow
 rembg[gpu]
 
 # UI and utilities
-gradio
+# gradio 4.43.0: supports js= on event handlers and gr.on(), avoids 4.44.1 jinja2 bug
+# gradio-client must be pinned to exactly what gradio 4.43.0 requires — a newer
+# gradio-client passes bool schemas (from pydantic v2 additionalProperties:false) into
+# get_type() which expects a dict, crashing with "argument of type 'bool' is not iterable"
+gradio==4.43.0
+gradio-client==1.3.0
 ftfy
 tqdm
 typing-extensions

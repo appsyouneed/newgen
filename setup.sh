@@ -28,13 +28,100 @@ chmod 1777 /root/newgen/tmp
 
 echo "Installing PyTorch..."
 pip3 uninstall -y torch torchvision torchaudio --break-system-packages 2>/dev/null || true
-pip3 install torch torchvision --break-system-packages --no-cache-dir
+pip3 install torch torchvision torchaudio --break-system-packages --no-cache-dir
 
 echo "Installing Python dependencies..."
 pip3 install -r "$SCRIPT_DIR/requirements.txt" --break-system-packages --ignore-installed typing-extensions --no-cache-dir
 
 echo "Ensuring critical packages..."
 pip3 install Pillow "transformers>=4.50.0,<5.0" "huggingface-hub>=0.34.0,<1.0" "numpy<2.1" "diffusers>=0.33.0,<0.38.0" "safetensors>=0.4.0" torchao accelerate --break-system-packages --no-cache-dir --force-reinstall
+
+echo "Pinning gradio to 4.43.0 (supports js= on event handlers; avoids 4.44.1 jinja2 regression)..."
+pip3 install "gradio==4.43.0" --break-system-packages --no-cache-dir --force-reinstall
+
+echo "Patching gradio/oauth.py for huggingface_hub >= 0.26 compatibility..."
+# huggingface_hub removed HfFolder in 0.26.0. gradio 4.43.0 still imports it at module
+# level, crashing the entire process on startup even when OAuth is never used.
+# This patch replaces the broken import with a shim class that replicates the only
+# method gradio calls (HfFolder.get_token), backed by the replacement API (get_token).
+# The shim is only activated when HfFolder is actually absent, so this is a no-op on
+# older huggingface_hub installations.
+python3 - <<'PYPATCH'
+import sys, pathlib
+
+oauth_path = pathlib.Path(
+    next(p for p in sys.path if "dist-packages" in p or "site-packages" in p),
+    "gradio", "oauth.py"
+)
+if not oauth_path.exists():
+    # try the other path variant
+    import site
+    for sp in site.getsitepackages():
+        candidate = pathlib.Path(sp, "gradio", "oauth.py")
+        if candidate.exists():
+            oauth_path = candidate
+            break
+
+text = oauth_path.read_text()
+
+OLD = "from huggingface_hub import HfFolder, whoami"
+NEW = """\
+try:
+    from huggingface_hub import HfFolder, whoami
+except ImportError:
+    # huggingface_hub >= 0.26 removed HfFolder. Provide a shim so gradio can
+    # still import cleanly. The real HfFolder.get_token() path is only reached
+    # when running locally with a mocked OAuth login button, which this app
+    # does not use.
+    from huggingface_hub import whoami
+    try:
+        from huggingface_hub import get_token as _get_token
+    except ImportError:
+        _get_token = lambda: None  # noqa: E731
+
+    class HfFolder:  # noqa: N801
+        @staticmethod
+        def get_token():
+            return _get_token()"""
+
+if OLD in text:
+    oauth_path.write_text(text.replace(OLD, NEW, 1))
+    print(f"  Patched: {oauth_path}")
+else:
+    print(f"  Already patched or pattern not found: {oauth_path}")
+PYPATCH
+
+echo "Patching gradio_client/utils.py for pydantic v2 bool-schema compatibility..."
+# pydantic v2 emits additionalProperties: false (a bool) in JSON schemas.
+# gradio_client's _json_schema_to_python_type and get_type both assume schema is
+# always a dict, crashing with "argument of type 'bool' is not iterable".
+# This adds an isinstance guard so bools are safely returned as "Any".
+python3 - <<'PYPATCH'
+import sys, pathlib, site
+
+for sp in [*site.getsitepackages(), *sys.path]:
+    candidate = pathlib.Path(sp, "gradio_client", "utils.py")
+    if candidate.exists():
+        text = candidate.read_text()
+        if "if not isinstance(schema, dict):" in text:
+            print(f"  Already patched: {candidate}")
+            break
+        OLD = 'def _json_schema_to_python_type(schema: Any, defs) -> str:\n    """Convert the json schema into a python type hint"""\n    if schema == {}:'
+        NEW = 'def _json_schema_to_python_type(schema: Any, defs) -> str:\n    """Convert the json schema into a python type hint"""\n    if not isinstance(schema, dict):\n        return "Any"\n    if schema == {}:'
+        if OLD in text:
+            candidate.write_text(text.replace(OLD, NEW, 1))
+            print(f"  Patched: {candidate}")
+            break
+        # fallback: patch get_type directly
+        OLD2 = 'def get_type(schema: dict):\n    if "const" in schema:'
+        NEW2 = 'def get_type(schema: dict):\n    if not isinstance(schema, dict):\n        return "unknown"\n    if "const" in schema:'
+        if OLD2 in text:
+            candidate.write_text(text.replace(OLD2, NEW2, 1))
+            print(f"  Patched get_type fallback: {candidate}")
+            break
+        print(f"  ERROR: no matching pattern in {candidate}")
+        break
+PYPATCH
 
 echo "Installing SageAttention for accelerated inference..."
 pip3 install sageattention --break-system-packages --no-cache-dir 2>/dev/null || {
