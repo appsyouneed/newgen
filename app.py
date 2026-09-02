@@ -54,45 +54,6 @@ except ImportError:
     import subprocess as _sp
     _sp.run([sys.executable, "-m", "pip", "install", "--quiet", "cryptography==42.0.8"], check=True)
 
-# ── Dependency self-heal (runs before any gradio/pydantic import) ──────────────
-# gradio==4.43.0 requires pydantic<2.10 (2.10+ renamed is_stdlib_dataclass).
-# gradio==4.43.0 + gradio-client==1.3.0 must be co-installed; a stale gradio 3.x
-# (found via IMPORTANT: You are using gradio version 3.50.2) breaks js= kwargs.
-_needs_restart = False
-try:
-    import gradio as _gr_check
-    _gv = tuple(int(x) for x in _gr_check.__version__.split(".")[:2])
-    if _gv < (4, 43):
-        raise ImportError(f"gradio {_gr_check.__version__} too old")
-    del _gr_check, _gv
-except Exception as _e:
-    print(f"[startup] Reinstalling gradio==4.43.0 (found: {_e})...")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--quiet", "--force-reinstall",
-         "--no-cache-dir", "gradio==4.43.0", "gradio-client==1.3.0"],
-        check=True,
-    )
-    _needs_restart = True
-    print("[startup] gradio reinstalled.")
-
-try:
-    from pydantic._internal._dataclasses import is_stdlib_dataclass as _pyd_chk
-    del _pyd_chk
-except ImportError:
-    print("[startup] Pinning pydantic<2.10 for gradio 4.43.0 compatibility...")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--quiet", "--force-reinstall",
-         "--no-cache-dir", "pydantic>=2.0,<2.10"],
-        check=True,
-    )
-    _needs_restart = True
-    print("[startup] pydantic pinned OK.")
-
-if _needs_restart:
-    print("[startup] Restarting process so patched packages are active...")
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-# ──────────────────────────────────────────────────────────────────────────────
-
 os.environ.update({
     "TMPDIR": "/dev/shm/newgen",
     "TEMP": "/dev/shm/newgen",
@@ -855,9 +816,7 @@ def add_audio_to_video(
         return video_buf
 
 
-# Run engine setup in background so it doesn't block app startup
-_audio_engine_setup_thread = threading.Thread(target=_ensure_audio_engines, daemon=True)
-_audio_engine_setup_thread.start()
+_ensure_audio_engines()
 
 
 

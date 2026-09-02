@@ -9,22 +9,8 @@ if [ "$EUID" -ne 0 ]; then
     exec sudo bash "$0" "$@"
 fi
 
-# Detect the Python that will actually run the app — prefer the one that already
-# has torch/gradio (if any), otherwise fall back to python3.
-_detect_python() {
-    for py in python3.12 python3.11 python3.10 python3; do
-        if command -v "$py" &>/dev/null; then
-            # Prefer the one that can import torch
-            if "$py" -c "import torch" &>/dev/null 2>&1; then
-                echo "$py"; return
-            fi
-        fi
-    done
-    echo "python3"
-}
-PYTHON="$(_detect_python)"
-PIP="$PYTHON -m pip"
-echo "Using Python: $PYTHON ($($PYTHON --version 2>&1))"
+PYTHON="python3"
+PIP="pip3"
 
 echo "Installing system dependencies..."
 if lsof /var/lib/dpkg/lock-frontend > /dev/null 2>&1; then
@@ -52,12 +38,6 @@ $PIP install -r "$SCRIPT_DIR/requirements.txt" --break-system-packages --ignore-
 
 echo "Ensuring critical packages..."
 $PIP install Pillow "transformers>=4.50.0,<5.0" "huggingface-hub>=0.34.0,<1.0" "numpy<2.1" "diffusers>=0.33.0,<0.38.0" "safetensors>=0.4.0" torchao accelerate --break-system-packages --no-cache-dir --force-reinstall
-
-echo "Pinning gradio to 4.43.0 (supports js= on event handlers; avoids 4.44.1 jinja2 regression)..."
-$PIP install "gradio==4.43.0" "gradio-client==1.3.0" --break-system-packages --no-cache-dir --force-reinstall
-
-echo "Pinning pydantic<2.10 (>=2.10 renamed is_stdlib_dataclass breaking gradio 4.43.0)..."
-$PIP install "pydantic>=2.0,<2.10" --break-system-packages --no-cache-dir --force-reinstall
 
 echo "Patching gradio/oauth.py for huggingface_hub >= 0.26 compatibility..."
 # huggingface_hub removed HfFolder in 0.26.0. gradio 4.43.0 still imports it at module
