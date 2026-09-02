@@ -1,63 +1,72 @@
-# Core (torch stack installed separately in setup.sh)
-# torch
-# torchvision
-# torchaudio  ← installed alongside torch in setup.sh; required by HunyuanVideo-Foley
-# torchcodec  ← required by torchaudio>=2.6 for audio save; installed in setup.sh
+# =============================================================================
+# Newgen — Python application dependencies
+# =============================================================================
+# CRITICAL: torch / torchvision / torchaudio are NOT listed here.
+# They are provided by the system Python environment (torch 2.8.0.dev+cu128,
+# CUDA 12.8) and are made available to the app venv via PYTHONPATH at runtime
+# (see run_app.sh / setup.sh).  Installing them here would download and
+# overwrite the existing dev builds, breaking CUDA 12.8 compatibility.
+#
+# numpy: the system has 2.1.2.  We allow >=1.26,<2.2 so the venv pip
+# resolves whatever is compatible without downgrading the system copy.
+# (The app venv gets its own numpy inside .app-venv; the system numpy
+# is untouched either way.)
+# =============================================================================
 
-# Pinned compatible stack — huggingface-hub must stay <1.0 for transformers<5.
-# gradio==4.43.0 imports HfFolder which was removed in huggingface-hub>=0.26.
+# --- HuggingFace stack -------------------------------------------------------
+# huggingface-hub must stay <1.0 for transformers<5.
+# gradio 4.43.0 imports HfFolder which was removed in huggingface-hub>=0.26.
 # setup.sh patches gradio/oauth.py with a shim after install so this is safe.
 huggingface-hub>=0.34.0,<1.0
-# transformers must be >=4.52.0: Qwen-Image-Edit-2511's text_encoder config
-# uses the newer nested `text_config` composite format. Before 4.52.0,
+
+# transformers >=4.52.0: Qwen-Image-Edit-2511's text_encoder config uses the
+# newer nested `text_config` composite format. Before 4.52.0,
 # Qwen2_5_VLConfig.sub_configs lacked "text_config", so the nested dict was
 # never wrapped in Qwen2_5_VLTextConfig and stayed a raw dict — then
 # GenerationConfig.from_model_config() calls decoder_config.to_dict() on it
 # and crashes with "'dict' object has no attribute 'to_dict'".
 transformers>=4.52.0,<5.0
-diffusers>=0.33.0,<0.38.0
-safetensors>=0.4.0
-numpy<2.1
-# No explicit protobuf pin needed here: descript-audiotools (pulled in via
-# HunyuanVideo-Foley's requirements.txt) pins protobuf<5.0, and nothing else
-# in this shared environment needs newer than that. F5-TTS's dependency
-# chain (which does need protobuf>=6.33.5, via cached_path ->
-# google-cloud-storage -> google-api-core) runs in its own isolated venv
-# (/root/newgen/.f5tts-venv, created by _ensure_audio_engines() in app.py)
-# specifically so its protobuf requirement never has to coexist with
-# audiotools' in the same site-packages.
 
-# Model dependencies
+# WanImageToVideoPipeline (diffusers.pipelines.wan) was added in 0.34.0.
+# 0.33.x does not have it and will crash at import time.
+diffusers>=0.34.0,<0.38.0
+
+safetensors>=0.4.0
+
+# numpy: allow >=1.26 and <2.2. This is compatible with torch 2.8 dev and
+# avoids constraining the system install. The venv will install its own copy.
+numpy>=1.26,<2.2
+
+# --- Model dependencies ------------------------------------------------------
 accelerate
 sentencepiece
 peft
 torchao
 
-# Image/Video processing
+# --- Image/Video processing --------------------------------------------------
 opencv-python
 imageio
 imageio-ffmpeg
 Pillow
-rembg[gpu]
+# rembg installed separately in setup.sh (tries gpu variant first)
 
-# UI and utilities
-# gradio 4.43.0: supports js= on event handlers and gr.on(), avoids 4.44.1 jinja2 bug
-# gradio-client must be pinned to exactly what gradio 4.43.0 requires — a newer
-# gradio-client passes bool schemas (from pydantic v2 additionalProperties:false) into
-# get_type() which expects a dict, crashing with "argument of type 'bool' is not iterable"
+# --- UI and utilities --------------------------------------------------------
+# gradio 4.43.0: supports js= on event handlers and gr.on(), avoids 4.44.1
+# jinja2 bug.  gradio-client must be pinned to exactly what gradio 4.43.0
+# requires — a newer gradio-client passes bool schemas (from pydantic v2
+# additionalProperties:false) into get_type() which expects a dict, crashing
+# with "argument of type 'bool' is not iterable".
 gradio==4.43.0
 gradio-client==1.3.0
-# pydantic>=2.10 renamed is_stdlib_dataclass->is_builtin_dataclass, breaking gradio 4.43.0's
-# component schema generation with ImportError at startup. Must stay <2.10.
+
+# pydantic>=2.10 renamed is_stdlib_dataclass->is_builtin_dataclass, breaking
+# gradio 4.43.0's component schema generation with ImportError at startup.
 pydantic>=2.0,<2.10
+
 ftfy
 tqdm
 typing-extensions
+requests
 
-# Used directly by app.py for video frame extraction/encoding (dual audio
-# engine: F5-TTS + HunyuanVideo-Foley). MMAudio and its transitive deps
-# (open_clip_torch, einops, librosa, omegaconf, scipy, soundfile, PyYAML)
-# were removed — app.py no longer imports any of them, and both audio
-# engines install their own dependencies at first run via
-# _ensure_audio_engines().
+# av: used directly by app.py for video frame extraction/encoding.
 av

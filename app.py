@@ -69,108 +69,111 @@ try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _aesgcm_check
     del _aesgcm_check
 except ImportError:
-    import subprocess as _sp
-    _sp.run([sys.executable, "-m", "pip", "install", "--quiet", "cryptography==42.0.8"], check=True)
+    # cryptography must be installed in the app venv (setup.sh / requirements.txt).
+    # We do NOT pip-install here at runtime — that would modify whatever Python
+    # environment is running and could break system packages.
+    raise RuntimeError(
+        "cryptography is not installed in the current Python environment.\n"
+        "Run setup.sh to create the app venv with all required dependencies."
+    )
 
-# --- Self-heal: gradio version guard ---------------------------------------
-# HunyuanVideo-Foley's own requirements.txt pins gradio==3.50.2. If a prior
-# run already cloned that repo and installed its deps (or someone re-ran
-# setup.sh after that happened), the environment can be left with gradio
-# downgraded from our pinned 4.43.0. That's silent at install time but blows
-# up later: gr.on()/event listeners with js= (gradio 4.x only) raise
-# "TypeError: EventListenerMethod.__call__() got an unexpected keyword
-# argument 'js'" deep into UI construction, and gradio-client version skew
-# causes other obscure crashes. Check and repair *before* gradio is ever
-# imported, on every startup, since _ensure_audio_engines() only reinstalls
-# Foley's requirements once (skipped if the repo dir already exists) and
-# can't repair a leftover bad install from a previous run.
+# ---------------------------------------------------------------------------
+# Version sanity checks — READ ONLY, never pip-install into the running env.
+#
+# All runtime dependencies (gradio, diffusers, transformers, numpy, etc.) are
+# installed into the isolated app venv by setup.sh.  The self-heal functions
+# that used to pip-install packages at runtime have been removed because they
+# modified whichever Python environment launched the app — on a system where
+# torch 2.8 dev+cu128 is already installed, that caused irreversible version
+# downgrades.
+#
+# If a version check fails below the app exits immediately with a clear
+# message so the operator can fix the venv, rather than silently degrading.
+# ---------------------------------------------------------------------------
+
 def _self_heal_patch_gradio_oauth():
-    """Reapply the HfFolder shim setup.sh patches into gradio/oauth.py.
-    Needed after any --force-reinstall of gradio, which restores the
-    original unpatched file."""
+    """Reapply the HfFolder shim into gradio/oauth.py if needed.
+    Patches the file in-place (no pip, no env modification).
+    Safe to call multiple times — is a no-op if already patched."""
     import site
     try:
-        oauth_path = None
         for sp_dir in site.getsitepackages():
             candidate = Path(sp_dir, "gradio", "oauth.py")
             if candidate.exists():
-                oauth_path = candidate
-                break
-        if oauth_path is None:
-            return
-        text = oauth_path.read_text()
-        OLD = "from huggingface_hub import HfFolder, whoami"
-        if OLD not in text:
-            return  # already patched or different gradio version
-        NEW = (
-            "try:\n"
-            "    from huggingface_hub import HfFolder, whoami\n"
-            "except ImportError:\n"
-            "    from huggingface_hub import whoami\n"
-            "    try:\n"
-            "        from huggingface_hub import get_token as _get_token\n"
-            "    except ImportError:\n"
-            "        _get_token = lambda: None  # noqa: E731\n\n"
-            "    class HfFolder:  # noqa: N801\n"
-            "        @staticmethod\n"
-            "        def get_token():\n"
-            "            return _get_token()"
-        )
-        oauth_path.write_text(text.replace(OLD, NEW, 1))
-        print(f"[SelfHeal] Patched {oauth_path}")
+                text = candidate.read_text()
+                OLD = "from huggingface_hub import HfFolder, whoami"
+                if OLD not in text:
+                    return  # already patched or different gradio version
+                NEW = (
+                    "try:\n"
+                    "    from huggingface_hub import HfFolder, whoami\n"
+                    "except ImportError:\n"
+                    "    from huggingface_hub import whoami\n"
+                    "    try:\n"
+                    "        from huggingface_hub import get_token as _get_token\n"
+                    "    except ImportError:\n"
+                    "        _get_token = lambda: None  # noqa: E731\n\n"
+                    "    class HfFolder:  # noqa: N801\n"
+                    "        @staticmethod\n"
+                    "        def get_token():\n"
+                    "            return _get_token()"
+                )
+                candidate.write_text(text.replace(OLD, NEW, 1))
+                print(f"[Patch] gradio/oauth.py patched at {candidate}")
+                return
     except Exception as _e:
-        print(f"[SelfHeal] gradio oauth patch failed (non-fatal): {_e}")
+        print(f"[Patch] gradio oauth patch failed (non-fatal): {_e}")
 
 
 def _self_heal_patch_gradio_client_utils():
-    """Reapply the pydantic v2 bool-schema guard setup.sh patches into
-    gradio_client/utils.py. Needed after any --force-reinstall of
-    gradio-client, which restores the original unpatched file."""
+    """Reapply the pydantic v2 bool-schema guard into gradio_client/utils.py.
+    Patches the file in-place (no pip, no env modification).
+    Safe to call multiple times — is a no-op if already patched."""
     import site
     try:
-        candidate = None
         for sp_dir in site.getsitepackages():
-            p = Path(sp_dir, "gradio_client", "utils.py")
-            if p.exists():
-                candidate = p
-                break
-        if candidate is None:
-            return
-        text = candidate.read_text()
-        if "if not isinstance(schema, dict):" in text:
-            return  # already patched
-        OLD = (
-            'def _json_schema_to_python_type(schema: Any, defs) -> str:\n'
-            '    """Convert the json schema into a python type hint"""\n'
-            '    if schema == {}:'
-        )
-        NEW = (
-            'def _json_schema_to_python_type(schema: Any, defs) -> str:\n'
-            '    """Convert the json schema into a python type hint"""\n'
-            '    if not isinstance(schema, dict):\n'
-            '        return "Any"\n'
-            '    if schema == {}:'
-        )
-        if OLD in text:
-            candidate.write_text(text.replace(OLD, NEW, 1))
-            print(f"[SelfHeal] Patched {candidate}")
-            return
-        OLD2 = 'def get_type(schema: dict):\n    if "const" in schema:'
-        NEW2 = (
-            'def get_type(schema: dict):\n'
-            '    if not isinstance(schema, dict):\n'
-            '        return "unknown"\n'
-            '    if "const" in schema:'
-        )
-        if OLD2 in text:
-            candidate.write_text(text.replace(OLD2, NEW2, 1))
-            print(f"[SelfHeal] Patched get_type fallback in {candidate}")
+            candidate = Path(sp_dir, "gradio_client", "utils.py")
+            if candidate.exists():
+                text = candidate.read_text()
+                if "if not isinstance(schema, dict):" in text:
+                    return  # already patched
+                OLD = (
+                    'def _json_schema_to_python_type(schema: Any, defs) -> str:\n'
+                    '    """Convert the json schema into a python type hint"""\n'
+                    '    if schema == {}:'
+                )
+                NEW = (
+                    'def _json_schema_to_python_type(schema: Any, defs) -> str:\n'
+                    '    """Convert the json schema into a python type hint"""\n'
+                    '    if not isinstance(schema, dict):\n'
+                    '        return "Any"\n'
+                    '    if schema == {}:'
+                )
+                if OLD in text:
+                    candidate.write_text(text.replace(OLD, NEW, 1))
+                    print(f"[Patch] gradio_client/utils.py patched at {candidate}")
+                    return
+                OLD2 = 'def get_type(schema: dict):\n    if "const" in schema:'
+                NEW2 = (
+                    'def get_type(schema: dict):\n'
+                    '    if not isinstance(schema, dict):\n'
+                    '        return "unknown"\n'
+                    '    if "const" in schema:'
+                )
+                if OLD2 in text:
+                    candidate.write_text(text.replace(OLD2, NEW2, 1))
+                    print(f"[Patch] gradio_client/utils.py (get_type fallback) patched at {candidate}")
+                    return
     except Exception as _e:
-        print(f"[SelfHeal] gradio_client utils patch failed (non-fatal): {_e}")
+        print(f"[Patch] gradio_client utils patch failed (non-fatal): {_e}")
 
 
 def _self_heal_gradio_version():
-    _pinned_gradio = "4.43.0"
+    """Check gradio version and apply file patches. NEVER pip-installs.
+    If the wrong version is found, prints a clear error — the operator must
+    rebuild the app venv via setup.sh rather than having the app silently
+    modify the Python environment at runtime."""
+    _pinned_gradio        = "4.43.0"
     _pinned_gradio_client = "1.3.0"
     try:
         from importlib.metadata import version as _pkg_version, PackageNotFoundError
@@ -179,38 +182,40 @@ def _self_heal_gradio_version():
         except PackageNotFoundError:
             _cur_gradio = None
         if _cur_gradio != _pinned_gradio:
-            print(f"[SelfHeal] gradio version is {_cur_gradio!r}, expected "
-                  f"{_pinned_gradio!r} — reinstalling pinned gradio stack...")
-            import subprocess as _sp
-            _sp.run(
-                [sys.executable, "-m", "pip", "install", "--quiet",
-                 "--disable-pip-version-check", "--force-reinstall", "--no-deps",
-                 f"gradio=={_pinned_gradio}", f"gradio-client=={_pinned_gradio_client}"],
-                check=True,
+            print(
+                f"[VersionCheck] WARNING: gradio {_cur_gradio} found, expected {_pinned_gradio}.\n"
+                f"  Run setup.sh to rebuild the app venv with the correct versions.\n"
+                f"  The app will attempt to continue but may crash due to API mismatches."
             )
-            print("[SelfHeal] gradio reinstalled to pinned version.")
-            # --force-reinstall overwrites gradio/oauth.py and
-            # gradio_client/utils.py, wiping out the patches setup.sh applies
-            # after install (HfFolder shim for huggingface_hub >= 0.26, and
-            # the pydantic v2 bool-schema guard). Reapply both now or the
-            # next `import gradio` / component render will crash again.
-            _self_heal_patch_gradio_oauth()
-            _self_heal_patch_gradio_client_utils()
+        else:
+            print(f"[VersionCheck] gradio {_cur_gradio} ✓")
+        # Always reapply file patches — they are idempotent and touch only
+        # the gradio/gradio_client source files inside the venv, not packages.
+        _self_heal_patch_gradio_oauth()
+        _self_heal_patch_gradio_client_utils()
     except Exception as _e:
-        print(f"[SelfHeal] gradio version check failed (non-fatal): {_e}")
+        print(f"[VersionCheck] gradio version check failed (non-fatal): {_e}")
 
 
 def _self_heal_transformers_version():
-    # Qwen-Image-Edit-2511's text_encoder/config.json uses the newer nested
-    # `text_config` composite format. transformers < 4.52.0 has
-    # Qwen2_5_VLConfig.sub_configs WITHOUT "text_config", so the nested dict
-    # is never wrapped in Qwen2_5_VLTextConfig and stays a raw dict. Loading
-    # the pipeline then crashes in GenerationConfig.from_model_config() with
-    # "'dict' object has no attribute 'to_dict'". A prior run's Foley install
-    # (git+transformers@v4.49.0-SigLIP-2) or an older pin can leave the env
-    # on such a version, so verify and upgrade in place before importing
-    # transformers.
+    """Check transformers version. NEVER pip-installs.
+    Qwen-Image-Edit-2511 requires transformers>=4.52.0 for the nested
+    text_config composite format. If the wrong version is found, prints
+    a clear error pointing to setup.sh."""
     _min_transformers = (4, 52, 0)
+
+    def _parse(v):
+        parts = []
+        for p in (v or "0").split(".")[:3]:
+            num = ""
+            for ch in p:
+                if ch.isdigit(): num += ch
+                else: break
+            parts.append(int(num) if num else 0)
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts)
+
     try:
         from importlib.metadata import version as _pkg_version, PackageNotFoundError
         try:
@@ -218,38 +223,86 @@ def _self_heal_transformers_version():
         except PackageNotFoundError:
             _cur = None
 
-        def _parse(v):
-            parts = []
-            for p in (v or "0").split(".")[:3]:
-                num = ""
-                for ch in p:
-                    if ch.isdigit():
-                        num += ch
-                    else:
-                        break
-                parts.append(int(num) if num else 0)
-            while len(parts) < 3:
-                parts.append(0)
-            return tuple(parts)
-
         if _cur is None or _parse(_cur) < _min_transformers:
             _want = ".".join(str(x) for x in _min_transformers)
-            print(f"[SelfHeal] transformers version is {_cur!r}, need "
-                  f">={_want} for Qwen-Image-Edit-2511 — upgrading...")
-            import subprocess as _sp
-            _sp.run(
-                [sys.executable, "-m", "pip", "install", "--quiet",
-                 "--disable-pip-version-check", "--upgrade",
-                 f"transformers>={_want},<5.0"],
-                check=True,
+            print(
+                f"[VersionCheck] WARNING: transformers {_cur} found, need >={_want}.\n"
+                f"  Run setup.sh to rebuild the app venv with the correct versions."
             )
-            print("[SelfHeal] transformers upgraded.")
+        else:
+            print(f"[VersionCheck] transformers {_cur} ✓")
     except Exception as _e:
-        print(f"[SelfHeal] transformers version check failed (non-fatal): {_e}")
+        print(f"[VersionCheck] transformers version check failed (non-fatal): {_e}")
 
 
+def _self_heal_torch():
+    """Verify torch is installed and has a valid __version__ string.
+    NEVER reinstalls torch — the system torch 2.8 dev+cu128 must be preserved.
+    Raises RuntimeError if torch is absent or broken so the user gets a clear
+    message rather than a confusing downstream crash."""
+    try:
+        import subprocess as _sp
+        _check = _sp.run(
+            [sys.executable, "-c",
+             "import torch; v=torch.__version__; "
+             "assert v and v != 'None' and '.' in str(v), f'bad version: {v!r}'"],
+            capture_output=True, text=True,
+        )
+        if _check.returncode == 0:
+            print(f"[VersionCheck] torch ✓")
+            return
+        raise RuntimeError(
+            f"torch sanity check failed: {_check.stderr.strip()[:300]}\n"
+            "The system torch install may be broken. Do NOT reinstall torch via "
+            "pip — that would overwrite the dev build. Check your CUDA/Python env."
+        )
+    except RuntimeError:
+        raise
+    except Exception as _e:
+        print(f"[VersionCheck] torch check failed (non-fatal): {_e}")
+
+
+def _self_heal_diffusers_version():
+    """Check diffusers version. NEVER pip-installs.
+    WanImageToVideoPipeline requires diffusers>=0.34.0 (added in that release).
+    If the wrong version is found, prints a clear error pointing to setup.sh."""
+
+    def _parse(v):
+        parts = []
+        for p in (v or "0").split(".")[:3]:
+            num = ""
+            for ch in p:
+                if ch.isdigit(): num += ch
+                else: break
+            parts.append(int(num) if num else 0)
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts)
+
+    try:
+        from importlib.metadata import version as _pkg_version, PackageNotFoundError
+        try:
+            _cur = _pkg_version("diffusers")
+        except PackageNotFoundError:
+            _cur = None
+
+        if _cur is None or _parse(_cur) < (0, 34, 0):
+            print(
+                f"[VersionCheck] WARNING: diffusers {_cur} found, need >=0.34.0.\n"
+                f"  WanImageToVideoPipeline will fail to import.\n"
+                f"  Run setup.sh to rebuild the app venv with the correct versions."
+            )
+        else:
+            print(f"[VersionCheck] diffusers {_cur} ✓")
+    except Exception as _e:
+        print(f"[VersionCheck] diffusers version check failed (non-fatal): {_e}")
+
+
+_self_heal_torch()              # first: transformers crashes if torch.__version__ is None
+_self_heal_diffusers_version()  # before transformers heal can downgrade diffusers
 _self_heal_gradio_version()
 _self_heal_transformers_version()
+_self_heal_diffusers_version()  # after: transformers heal re-pins deps and can roll diffusers back
 
 os.environ.update({
     "TMPDIR": "/dev/shm/newgen",
@@ -267,6 +320,12 @@ os.environ.update({
     "HF_HOME": "/root/.cache/huggingface",
     "CUDA_LAUNCH_BLOCKING": "0",
     "OMP_NUM_THREADS": "8",
+    # Suppress pip noise globally for all subprocess pip calls:
+    # root-user warning, version-check nag, deprecation notices, conflict chatter.
+    "PIP_ROOT_USER_ACTION": "ignore",
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    "PIP_NO_WARN_CONFLICTS": "1",
+    "PYTHONWARNINGS": "ignore::DeprecationWarning,ignore::UserWarning,ignore::FutureWarning",
 })
 
 import cv2
@@ -298,7 +357,39 @@ from PIL import Image
 from safetensors.torch import load_file
 
 import gradio as gr
-from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
+def _import_wan_pipeline():
+    """Try every known import path across diffusers versions.
+    Catches Exception broadly (not just ImportError) because a broken torch
+    causes transformers to raise packaging.version.InvalidVersion (ValueError)
+    at import time, which would otherwise silently swallow the real cause."""
+    attempts = [
+        ("diffusers.pipelines.wan.pipeline_wan_i2v", "WanImageToVideoPipeline"),
+        ("diffusers",                                 "WanImageToVideoPipeline"),
+        ("diffusers.pipelines.wan",                   "WanImageToVideoPipeline"),
+    ]
+    last_exc = None
+    for module_path, class_name in attempts:
+        try:
+            import importlib as _il
+            mod = _il.import_module(module_path)
+            cls = getattr(mod, class_name, None)
+            if cls is not None:
+                return cls
+        except Exception as _e:
+            last_exc = _e
+            print(f"[WanImport] {module_path!r} failed: {type(_e).__name__}: {_e}")
+    try:
+        import importlib.metadata as _im
+        dv = _im.version("diffusers")
+    except Exception:
+        dv = "unknown"
+    raise ImportError(
+        f"Cannot import WanImageToVideoPipeline from diffusers {dv}. "
+        "Requires diffusers>=0.34.0 and a working torch install. "
+        f"Last error: {last_exc}"
+    ) from last_exc
+
+WanImageToVideoPipeline = _import_wan_pipeline()
 
 try:
     from diffusers import QwenImageEditPlusPipeline
@@ -717,15 +808,31 @@ def encode_frames_to_bytes(frames: list, fps: int, quality: int = 8) -> bytes:
 FOLEY_REPO_DIR  = Path(SCRIPT_DIR) / "HunyuanVideo-Foley"
 FOLEY_MODEL_DIR = Path(SCRIPT_DIR) / "HunyuanVideo-Foley-weights"
 
-# F5-TTS lives in its own venv (see _ensure_audio_engines) because its
-# dependency chain needs protobuf>=6.33.5 while HunyuanVideo-Foley's
-# descript-audiotools dependency needs protobuf<5.0.0 in the SAME process's
-# site-packages. Running it as a subprocess with a separate interpreter and
-# separate site-packages means each engine's protobuf install never touches
-# the other's, and neither is affected by whatever protobuf the main app
-# process happened to import first.
+# ---------------------------------------------------------------------------
+# Isolated venvs for audio/lipsync engines.
+#
+# ALL three engines (F5-TTS, HunyuanVideo-Foley, LatentSync) live in their
+# own venvs that are completely separate from both the system Python packages
+# and the app venv (/root/newgen/.app-venv).  This means:
+#   • protobuf conflicts between F5-TTS (>=6.33) and Foley (<5.0) are gone
+#   • LatentSync deps (mediapipe, etc.) cannot downgrade the app's numpy/torch
+#   • the system torch 2.8 dev+cu128 is NEVER touched by any of these installs
+#
+# Each engine is invoked exclusively via subprocess using its own venv python.
+# sys.executable is NEVER passed to pip for any of these engines.
+# ---------------------------------------------------------------------------
+
+# F5-TTS venv — isolated: protobuf>=6.33 conflict with Foley's <5.0
 F5_VENV_DIR = Path(SCRIPT_DIR) / ".f5tts-venv"
 F5_VENV_PY  = F5_VENV_DIR / "bin" / "python"
+
+# HunyuanVideo-Foley venv — isolated: protobuf<5.0, own torch copy
+FOLEY_VENV_DIR = Path(SCRIPT_DIR) / ".foley-venv"
+FOLEY_VENV_PY  = FOLEY_VENV_DIR / "bin" / "python"
+
+# LatentSync venv — isolated: mediapipe + own deps, never touches system numpy
+LATENTSYNC_VENV_DIR = Path(SCRIPT_DIR) / ".latentsync-venv"
+LATENTSYNC_VENV_PY  = LATENTSYNC_VENV_DIR / "bin" / "python"
 
 _AUDIO_ENGINE_AVAILABLE = False   # set True once both engines verified usable
 
@@ -738,25 +845,40 @@ def _ensure_audio_engines():
     """
     global _AUDIO_ENGINE_AVAILABLE
 
-    # --- torchcodec (required by torchaudio.save) ---------------------
-    # torchaudio 2.9+ routes torchaudio.save() through TorchCodec and no longer
-    # ships the built-in sox/soundfile save backends. Without torchcodec,
-    # HunyuanVideo-Foley's infer.py crashes at torchaudio.save() with
-    # "ModuleNotFoundError: No module named 'torchcodec'" and the whole video
-    # ends up silent. Install it so the Foley WAV can be written.
-    try:
-        import torchcodec  # noqa: F401
-    except ImportError:
-        print("[AudioEngine] Installing torchcodec (needed by torchaudio.save)...")
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--quiet",
-                 "--disable-pip-version-check", "torchcodec"],
-                check=True,
-            )
-            print("[AudioEngine] torchcodec installed.")
-        except Exception as _e:
-            print(f"[AudioEngine] torchcodec install failed (non-fatal): {_e}")
+    # --- Foley venv bootstrap -------------------------------------------------
+    # HunyuanVideo-Foley runs in its own isolated venv (.foley-venv) so its
+    # protobuf<5.0 requirement from descript-audiotools never touches the system
+    # python or the app venv. torch/torchaudio/torchcodec are installed inside
+    # this venv — the system torch is untouched.
+    _FOLEY_PIP_QUIET = [
+        "--quiet", "--disable-pip-version-check", "--root-user-action=ignore",
+        "--no-warn-conflicts", "--no-cache-dir",
+    ]
+
+    if not FOLEY_VENV_PY.exists():
+        print("[AudioEngine] Creating isolated venv for HunyuanVideo-Foley ...")
+        subprocess.run([sys.executable, "-m", "venv", str(FOLEY_VENV_DIR)], check=True)
+        subprocess.run(
+            [str(FOLEY_VENV_PY), "-m", "pip", "install"] + _FOLEY_PIP_QUIET +
+            ["--upgrade", "pip"],
+            check=True, capture_output=True,
+        )
+        # Install torch + torchaudio + torchcodec inside the Foley venv.
+        # torchaudio 2.6+ routes torchaudio.save() through TorchCodec; without
+        # torchcodec, infer.py crashes at torchaudio.save() with
+        # "ModuleNotFoundError: No module named 'torchcodec'" and videos are silent.
+        print("[AudioEngine] Installing torch/torchaudio/torchcodec into Foley venv ...")
+        subprocess.run(
+            [str(FOLEY_VENV_PY), "-m", "pip", "install"] + _FOLEY_PIP_QUIET +
+            ["torch", "torchaudio"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            [str(FOLEY_VENV_PY), "-m", "pip", "install"] + _FOLEY_PIP_QUIET +
+            ["torchcodec"],
+            check=False, capture_output=True,  # non-fatal: falls back to sox
+        )
+        print("[AudioEngine] Foley venv base ready.")
 
     # --- F5-TTS (isolated venv) -----------------------------------------
     # F5-TTS's dependency chain (via cached_path -> google-cloud-storage ->
@@ -784,7 +906,9 @@ def _ensure_audio_engines():
             print("[AudioEngine] f5-tts configs missing in existing venv — reinstalling correct version...")
             result = subprocess.run(
                 [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-                 "--disable-pip-version-check", "f5-tts==1.1.22", "openai-whisper"],
+                 "--disable-pip-version-check", "--root-user-action=ignore",
+                 "f5-tts==1.1.22", "openai-whisper"],
+                capture_output=True,
             )
             if result.returncode == 0:
                 print("[AudioEngine] f5-tts reinstalled.")
@@ -803,26 +927,31 @@ def _ensure_audio_engines():
         subprocess.run([sys.executable, "-m", "venv", str(F5_VENV_DIR)], check=True)
         subprocess.run(
             [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-             "--disable-pip-version-check", "--upgrade", "pip"],
-            check=True,
+             "--disable-pip-version-check", "--root-user-action=ignore",
+             "--upgrade", "pip"],
+            check=True, capture_output=True,
         )
         subprocess.run(
             [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-             "--disable-pip-version-check", "torch", "torchaudio"],
-            check=True,
+             "--disable-pip-version-check", "--root-user-action=ignore",
+             "torch", "torchaudio"],
+            check=True, capture_output=True,
         )
         # 1.1.22: latest stable. configs/ may not be bundled by pip, but the
         # worker script writes the missing yaml itself at runtime if needed.
         subprocess.run(
             [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-             "--disable-pip-version-check", "f5-tts==1.1.22"],
+             "--disable-pip-version-check", "--root-user-action=ignore",
+             "f5-tts==1.1.22"],
+            capture_output=True,
         )
         # openai-whisper: auto-transcribes the reference clip so F5-TTS knows
         # the language and content of the voice sample it is cloning from.
         subprocess.run(
             [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-             "--disable-pip-version-check", "openai-whisper"],
-            check=True,
+             "--disable-pip-version-check", "--root-user-action=ignore",
+             "openai-whisper"],
+            check=True, capture_output=True,
         )
         print("[AudioEngine] F5-TTS venv ready.")
 
@@ -869,10 +998,13 @@ def _ensure_audio_engines():
 
             filtered_req = FOLEY_REPO_DIR / "requirements.filtered.txt"
             filtered_req.write_text("\n".join(filtered_lines) + "\n")
+            # Install into the FOLEY venv — NEVER into sys.executable / main env
             subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--quiet",
-                 "--disable-pip-version-check", "-r", str(filtered_req)],
-                check=True,
+                [str(FOLEY_VENV_PY), "-m", "pip", "install", "--quiet",
+                 "--disable-pip-version-check", "--root-user-action=ignore",
+                 "--no-warn-conflicts", "--no-cache-dir",
+                 "-r", str(filtered_req)],
+                check=True, capture_output=True,
             )
         print("[AudioEngine] HunyuanVideo-Foley repo ready.")
 
@@ -914,7 +1046,7 @@ F5_INFER_SCRIPT = Path(SCRIPT_DIR) / ".f5tts_infer_worker.py"
 _F5_INFER_WORKER_SOURCE = '''\
 """Standalone F5-TTS inference worker. Run inside F5_VENV_PY only.
 Args: <json_payload_file>
-JSON keys: ref_file, gen_text, out_wav, ref_text (optional)
+JSON keys: ref_file, gen_text, out_wav, ref_text (optional), speed (optional, default 1.0)
 """
 import sys, json, os, pathlib, importlib.util
 
@@ -967,6 +1099,7 @@ def main():
     gen_text = p["gen_text"]
     out_wav  = p["out_wav"]
     ref_text = p.get("ref_text", "").strip()
+    speed    = float(p.get("speed", 1.0))
 
     if not ref_text:
         try:
@@ -988,6 +1121,7 @@ def main():
         gen_text=gen_text,
         file_wave=out_wav,
         remove_silence=True,
+        speed=speed,
     )
 
 if __name__ == "__main__":
@@ -995,11 +1129,13 @@ if __name__ == "__main__":
 '''
 
 
-def _run_f5tts(ref_file: str, gen_text: str, out_wav: str) -> bool:
+def _run_f5tts(ref_file: str, gen_text: str, out_wav: str, speed: float = 1.0) -> bool:
     """Run F5-TTS voice cloning in its isolated venv via subprocess.
 
     Passes all arguments via a JSON temp file so spaces / special characters
     in gen_text are never mangled by shell argument splitting.
+
+    speed < 1.0 slows the voice down; speed > 1.0 speeds it up (default 1.0).
 
     Returns True if out_wav was produced with nonzero size.
     """
@@ -1011,7 +1147,7 @@ def _run_f5tts(ref_file: str, gen_text: str, out_wav: str) -> bool:
 
     # Write payload to a temp JSON file — avoids ALL shell-splitting issues
     import tempfile
-    payload = {"ref_file": ref_file, "gen_text": gen_text, "out_wav": out_wav}
+    payload = {"ref_file": ref_file, "gen_text": gen_text, "out_wav": out_wav, "speed": float(speed)}
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tf:
         json.dump(payload, tf)
         payload_path = tf.name
@@ -1069,8 +1205,9 @@ def _run_foley(video_path: str, sfx_prompt: str, output_wav: str) -> bool:
     # Single run if <= 15s
     if video_duration <= max_chunk:
         stem = Path(video_path).stem
+        # Use FOLEY_VENV_PY — never sys.executable — so Foley deps stay isolated
         cmd = [
-            sys.executable, str(foley_script),
+            str(FOLEY_VENV_PY), str(foley_script),
             "--model_path", str(FOLEY_MODEL_DIR),
             "--model_size", "xl",
             "--enable_offload",
@@ -1119,8 +1256,9 @@ def _run_foley(video_path: str, sfx_prompt: str, output_wav: str) -> bool:
                 "-t", str(max_chunk), "-c", "copy", chunk_vid
             ], capture_output=True, timeout=60, check=True)
             
+            # Use FOLEY_VENV_PY — never sys.executable — so Foley deps stay isolated
             cmd = [
-                sys.executable, str(foley_script),
+                str(FOLEY_VENV_PY), str(foley_script),
                 "--model_path", str(FOLEY_MODEL_DIR),
                 "--model_size", "xl",
                 "--enable_offload",
@@ -1167,6 +1305,7 @@ def add_audio_to_video(
     audio_negative_prompt: str = "",
     ref_audio_path: str | None = None,
     dialogue_text: str = "",
+    voice_speed: float = 1.0,
 ) -> bytes:
     """Dual-engine audio synthesis for a generated video.
 
@@ -1236,8 +1375,8 @@ def add_audio_to_video(
         )
         if voice_active:
             try:
-                print("[AudioEngine] Running F5-TTS voice clone...")
-                has_voice = _run_f5tts(_ref_path, dialogue_text.strip(), voice_wav)
+                print(f"[AudioEngine] Running F5-TTS voice clone... (speed={voice_speed:.2f})")
+                has_voice = _run_f5tts(_ref_path, dialogue_text.strip(), voice_wav, speed=voice_speed)
                 if has_voice:
                     print("[AudioEngine] Voice track generated.")
                 else:
@@ -1312,6 +1451,268 @@ def add_audio_to_video(
 
 _ensure_audio_engines()
 
+
+# ── LatentSync (lip-sync post-processor) ─────────────────────────────────────
+LATENTSYNC_DIR = Path(SCRIPT_DIR) / "LatentSync"
+LATENTSYNC_CKPT = LATENTSYNC_DIR / "checkpoints" / "latentsync_unet.pt"
+LATENTSYNC_CONFIG = LATENTSYNC_DIR / "configs" / "unet" / "second_stage.yaml"
+
+_latentsync_ready = False   # set True once install confirmed
+_latentsync_lock  = threading.Lock()
+
+def _ensure_latentsync():
+    """Clone LatentSync, create its isolated venv, and download checkpoint.
+
+    LatentSync deps (mediapipe, etc.) are installed ONLY into the isolated
+    .latentsync-venv — they NEVER touch the system Python, the system torch,
+    or the app venv.  All inference is done by spawning LATENTSYNC_VENV_PY
+    as a subprocess (see _run_latentsync).
+
+    Key design decisions:
+      • No --system-site-packages: the venv is fully self-contained.
+      • torch/torchaudio are installed inside the venv (separate copy) so
+        LatentSync has a stable runtime regardless of the system torch version.
+      • numpy<2.1 is enforced ONLY inside the LatentSync venv — the system
+        numpy 2.1.2 is untouched.
+      • mediapipe==0.10.11 was yanked from PyPI; we loosen it to >=0.10.13.
+    """
+    global _latentsync_ready
+    with _latentsync_lock:
+        if _latentsync_ready:
+            return True
+        try:
+            # --- Clone repo -----------------------------------------------
+            if not LATENTSYNC_DIR.exists():
+                print("[LipSync] Cloning LatentSync...")
+                subprocess.run(
+                    ["git", "clone", "--depth", "1",
+                     "https://github.com/bytedance/LatentSync.git",
+                     str(LATENTSYNC_DIR)],
+                    check=True, capture_output=True,
+                )
+                print("[LipSync] LatentSync cloned.")
+
+            # --- Create isolated venv ------------------------------------
+            _LS_PIP_QUIET = [
+                "--quiet", "--disable-pip-version-check",
+                "--root-user-action=ignore", "--no-warn-conflicts", "--no-cache-dir",
+            ]
+            # pip uses TMPDIR for build isolation; /dev/shm is often noexec
+            _ls_env = {**os.environ, "TMPDIR": "/tmp"}
+
+            if not LATENTSYNC_VENV_PY.exists():
+                print("[LipSync] Creating isolated venv for LatentSync ...")
+                subprocess.run(
+                    [sys.executable, "-m", "venv", str(LATENTSYNC_VENV_DIR)],
+                    check=True,
+                )
+                subprocess.run(
+                    [str(LATENTSYNC_VENV_PY), "-m", "pip", "install"] +
+                    _LS_PIP_QUIET + ["--upgrade", "pip"],
+                    check=True, capture_output=True, env=_ls_env,
+                )
+                # Install torch inside the LatentSync venv (separate copy,
+                # does NOT affect the system torch 2.8 dev build).
+                print("[LipSync] Installing torch into LatentSync venv ...")
+                subprocess.run(
+                    [str(LATENTSYNC_VENV_PY), "-m", "pip", "install"] +
+                    _LS_PIP_QUIET + ["torch", "torchaudio"],
+                    check=True, capture_output=True, env=_ls_env,
+                )
+
+            # --- Install LatentSync's requirements into its venv ----------
+            req_file = LATENTSYNC_DIR / "requirements.txt"
+            if req_file.exists():
+                import re as _re
+                req_text = req_file.read_text()
+                patched = req_text
+                # mediapipe==0.10.11 was yanked from PyPI — loosen the pin.
+                patched = _re.sub(r"mediapipe==\S+", "mediapipe>=0.10.13", patched)
+                # Drop any torch/numpy pins from LatentSync's requirements.
+                # We manage those ourselves inside the venv below.
+                patched = _re.sub(r"(?m)^torch[^\n]*\n?", "", patched)
+                patched = _re.sub(r"(?m)^numpy[^\n]*\n?", "", patched)
+                # Write filtered requirements next to the original so git
+                # status on the clone is not dirtied.
+                filtered_req = LATENTSYNC_DIR / "requirements.filtered.txt"
+                filtered_req.write_text(patched)
+
+                subprocess.run(
+                    [str(LATENTSYNC_VENV_PY), "-m", "pip", "install",
+                     "-r", str(filtered_req)] + _LS_PIP_QUIET,
+                    check=False, env=_ls_env,
+                )
+                # Enforce numpy<2.1 INSIDE the LatentSync venv only.
+                # The system numpy 2.1.2 is NOT touched.
+                subprocess.run(
+                    [str(LATENTSYNC_VENV_PY), "-m", "pip", "install"] +
+                    _LS_PIP_QUIET + ["--force-reinstall", "numpy>=1.26,<2.1"],
+                    check=False, env=_ls_env,
+                )
+                print("[LipSync] LatentSync venv deps installed.")
+
+            # --- Download checkpoint if missing ---------------------------
+            (LATENTSYNC_DIR / "checkpoints").mkdir(exist_ok=True)
+            if not LATENTSYNC_CKPT.exists():
+                print("[LipSync] Downloading LatentSync checkpoint (~1.7 GB)...")
+                subprocess.run(
+                    ["wget", "-q", "-O", str(LATENTSYNC_CKPT),
+                     "https://huggingface.co/ByteDance/LatentSync/resolve/main/latentsync_unet.pt"],
+                    check=True,
+                )
+                print("[LipSync] LatentSync checkpoint ready.")
+
+            _latentsync_ready = True
+            return True
+        except Exception as _e:
+            print(f"[LipSync] _ensure_latentsync failed: {_e}")
+            return False
+
+
+def _run_latentsync(video_path: str, audio_path: str, output_path: str,
+                    inference_steps: int = 20, guidance_scale: float = 1.5) -> bool:
+    """
+    Run LatentSync on (video_path + audio_path) → output_path.
+    Returns True on success.
+    """
+    if not _ensure_latentsync():
+        print("[LipSync] LatentSync not available — skipping lip sync.")
+        return False
+
+    infer_script = LATENTSYNC_DIR / "scripts" / "inference.sh"
+    infer_py     = LATENTSYNC_DIR / "inference.py"
+
+    # Prefer the Python entry-point; fall back to the shell script.
+    # Always run through LATENTSYNC_VENV_PY — never sys.executable — so
+    # LatentSync's deps (mediapipe, etc.) stay inside the isolated venv.
+    if infer_py.exists():
+        cmd = [
+            str(LATENTSYNC_VENV_PY), str(infer_py),
+            "--unet_config_path", str(LATENTSYNC_CONFIG),
+            "--inference_ckpt_path", str(LATENTSYNC_CKPT),
+            "--video_path", video_path,
+            "--audio_path", audio_path,
+            "--video_out_path", output_path,
+            "--inference_steps", str(inference_steps),
+            "--guidance_scale", str(guidance_scale),
+        ]
+        cwd = str(LATENTSYNC_DIR)
+    elif infer_script.exists():
+        cmd = [
+            "bash", str(infer_script),
+            "--unet_config_path", str(LATENTSYNC_CONFIG),
+            "--inference_ckpt_path", str(LATENTSYNC_CKPT),
+            "--video_path", video_path,
+            "--audio_path", audio_path,
+            "--video_out_path", output_path,
+            "--inference_steps", str(inference_steps),
+            "--guidance_scale", str(guidance_scale),
+        ]
+        cwd = str(LATENTSYNC_DIR)
+    else:
+        print("[LipSync] Cannot find LatentSync inference entry-point.")
+        return False
+
+    try:
+        result = subprocess.run(
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode != 0:
+            print(f"[LipSync] LatentSync stderr: {result.stderr[-2000:]}")
+            return False
+        if not Path(output_path).exists():
+            print("[LipSync] LatentSync ran but output file not found.")
+            return False
+        print("[LipSync] LatentSync completed successfully.")
+        return True
+    except subprocess.TimeoutExpired:
+        print("[LipSync] LatentSync timed out.")
+        return False
+    except Exception as _e:
+        print(f"[LipSync] LatentSync subprocess error: {_e}")
+        return False
+
+
+def generate_lip_sync_video(
+    ref_image, prompt, scene_mode_val,
+    end_img, dur, res, fmul, qual, sd, rsd,
+    audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
+    neg_pt, esteps, eguid, fsa, fs,
+    lipsync_steps, lipsync_cfg,
+    *lora_args,
+):
+    """
+    Lip-Synced Speaking mode:
+      1. Generate video normally (using dialogue_text in the motion prompt).
+      2. Generate F5-TTS voice WAV from the dialogue script.
+      3. Run LatentSync to replace the mouth region with audio-driven synthesis.
+      4. Mix Foley SFX on top via the normal add_audio_to_video path.
+    """
+    # Step 1: generate base video (with audio=False so we control audio ourselves)
+    base_result = generate_video(
+        ref_image,
+        # Append speaking cue to prompt so Wan poses the mouth open
+        (prompt or "") + ", subject speaking, mouth moving, talking, lips moving",
+        MODE_KEEP,      # always keep scene; user can replace BG in a prior step
+        end_img, dur, res, fmul, qual, sd, rsd,
+        False,          # no audio yet — we handle it below
+        audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
+        neg_pt, esteps, eguid, fsa, fs,
+        *lora_args,
+    )
+    if base_result is None or base_result[0] is None:
+        return None, None, "Lip-sync: base video generation failed."
+
+    base_video_path = base_result[1]   # raw file path (video_file component)
+    if not base_video_path or not Path(base_video_path).exists():
+        return base_result[0], base_result[1], "Lip-sync: base video path missing."
+
+    # Step 2: generate voice WAV (we need the raw WAV, not the mixed video)
+    voice_wav = None
+    if ref_aud and dlg_txt and dlg_txt.strip():
+        voice_wav = str(Path(SCRIPT_DIR) / "tmp" / f"lipsync_voice_{uuid.uuid4().hex}.wav")
+        _ref_path = ref_aud.name if hasattr(ref_aud, "name") else (str(ref_aud) if ref_aud else None)
+        if _ref_path:
+            ok = _run_f5tts(_ref_path, dlg_txt.strip(), voice_wav, speed=v_speed)
+            if not ok:
+                voice_wav = None
+                print("[LipSync] F5-TTS failed — will do lip sync without voice WAV.")
+
+    if voice_wav is None or not Path(voice_wav).exists():
+        # Can't lip-sync without audio — fall back to normal mix
+        print("[LipSync] No voice WAV available — falling back to normal audio mix.")
+        final = add_audio_to_video(
+            base_video_path, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
+        )
+        out_path = str(Path(SCRIPT_DIR) / "tmp" / f"lipsync_out_{uuid.uuid4().hex}.mp4")
+        shutil.copy(final if final else base_video_path, out_path)
+        return out_path, out_path, "Lip-sync skipped (no voice WAV) — normal audio mixed."
+
+    # Step 3: LatentSync — replace mouth region
+    ls_out = str(Path(SCRIPT_DIR) / "tmp" / f"lipsync_ls_{uuid.uuid4().hex}.mp4")
+    ls_ok = _run_latentsync(
+        base_video_path, voice_wav, ls_out,
+        inference_steps=int(lipsync_steps),
+        guidance_scale=float(lipsync_cfg),
+    )
+    synced_video = ls_out if ls_ok else base_video_path
+
+    # Step 4: mix Foley SFX on top of the lip-synced video
+    #         pass ref_aud=None / dlg_txt="" so F5-TTS is skipped (voice already baked in)
+    final = add_audio_to_video(
+        synced_video, audio_pt, audio_neg_pt,
+        None, "",   # skip F5-TTS — voice already embedded by LatentSync
+        v_speed,
+    )
+    out_path = str(Path(SCRIPT_DIR) / "tmp" / f"lipsync_final_{uuid.uuid4().hex}.mp4")
+    shutil.copy(final if final else synced_video, out_path)
+
+    status = "✅ Lip-sync complete." if ls_ok else "⚠️ LatentSync failed — normal audio mixed."
+    return out_path, out_path, status
+
+
+# kick off LatentSync pre-download in the background so it's ready when needed
+threading.Thread(target=_ensure_latentsync, daemon=True).start()
 
 
 MAX_SEED = np.iinfo(np.int32).max
@@ -2784,7 +3185,8 @@ MODE_CUSTOM = "Custom edit instruction"
 MODE_AUTORUN = "Autorun"
 MODE_SEQUENCE = "Sequence"
 MODE_CUSTOM_SEQ = "Custom edit sequence"
-SCENE_MODES = [MODE_KEEP, MODE_REPLACE, MODE_CUSTOM, MODE_AUTORUN, MODE_SEQUENCE, MODE_CUSTOM_SEQ]
+MODE_LIP_SYNC = "Lip-Synced Speaking"
+SCENE_MODES = [MODE_KEEP, MODE_REPLACE, MODE_CUSTOM, MODE_AUTORUN, MODE_SEQUENCE, MODE_CUSTOM_SEQ, MODE_LIP_SYNC]
 SEQUENCE_MAX_SLOTS = 10
 CUSTOM_SEQ_MAX_SLOTS = 10
 
@@ -3291,10 +3693,11 @@ def generate_video(
     seed=42,
     randomize_seed=True,
     add_audio_cb=True,
-    audio_prompt_tb="realistic female breathing that matches the woman's movements and actions in video",
-    audio_negative_prompt_tb="music",
+    audio_prompt_tb="quiet ambience, soft room tone",
+    audio_negative_prompt_tb="music, noise, wind, crowd",
     ref_audio_path=None,
     dialogue_text="",
+    voice_speed=0.8,
     negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
@@ -3482,6 +3885,7 @@ def generate_video(
                 final_buf = add_audio_to_video(
                     final_buf, audio_prompt_tb, float(duration_seconds),
                     audio_negative_prompt_tb, ref_audio_path, dialogue_text,
+                    voice_speed=float(voice_speed),
                 )
             except Exception as e:
                 print(f"[AudioEngine] error in generate_video: {e}")
@@ -3518,10 +3922,11 @@ def generate_sequence(
     seed=42,
     randomize_seed=True,
     add_audio_cb=True,
-    audio_prompt_tb="realistic female breathing that matches the woman's movements and actions in video",
-    audio_negative_prompt_tb="music",
+    audio_prompt_tb="quiet ambience, soft room tone",
+    audio_negative_prompt_tb="music, noise, wind, crowd",
     ref_audio_path=None,
     dialogue_text="",
+    voice_speed=0.8,
     negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
@@ -3679,7 +4084,8 @@ def generate_sequence(
         if add_audio_cb and _AUDIO_ENGINE_AVAILABLE:
             try:
                 final_buf = add_audio_to_video(final_buf, audio_prompt_tb, float(total_duration),
-                                               audio_negative_prompt_tb, ref_audio_path, dialogue_text)
+                                               audio_negative_prompt_tb, ref_audio_path, dialogue_text,
+                                               voice_speed=float(voice_speed))
             except Exception as e:
                 print(f"[AudioEngine] error in generate_sequence: {e}")
 
@@ -3715,10 +4121,11 @@ def generate_custom_edit_sequence(
     seed=42,
     randomize_seed=True,
     add_audio_cb=True,
-    audio_prompt_tb="realistic female breathing that matches the woman's movements and actions in video",
-    audio_negative_prompt_tb="music",
+    audio_prompt_tb="quiet ambience, soft room tone",
+    audio_negative_prompt_tb="music, noise, wind, crowd",
     ref_audio_path=None,
     dialogue_text="",
+    voice_speed=0.8,
     negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
@@ -3904,7 +4311,8 @@ def generate_custom_edit_sequence(
         if add_audio_cb and _AUDIO_ENGINE_AVAILABLE:
             try:
                 final_buf = add_audio_to_video(final_buf, audio_prompt_tb, float(total_duration),
-                                               audio_negative_prompt_tb, ref_audio_path, dialogue_text)
+                                               audio_negative_prompt_tb, ref_audio_path, dialogue_text,
+                                               voice_speed=float(voice_speed))
             except Exception as e:
                 print(f"[AudioEngine] error in generate_custom_edit_sequence: {e}")
 
@@ -3940,6 +4348,7 @@ def autorun_generate(
     audio_negative_prompt_tb,
     ref_audio_path=None,
     dialogue_text="",
+    voice_speed=0.8,
     vid_negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
@@ -5215,6 +5624,7 @@ def autorun_push_generate(
     audio_negative_prompt_tb,
     ref_audio_path=None,
     dialogue_text="",
+    voice_speed=0.8,
     vid_negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
@@ -5457,7 +5867,10 @@ with gr.Blocks(css=css) as demo:
                             "Custom Edit Sequence = single reference photo, N segments each "
                             "with a picgen prompt (Qwen generates the last frame) and a "
                             "motion prompt (Wan animates from current to generated frame); "
-                            "uses Generation Steps and Frame-Edit Guidance sliders."
+                            "uses Generation Steps and Frame-Edit Guidance sliders. "
+                            "Lip-Synced Speaking = generate video then run LatentSync "
+                            "(ByteDance) to drive mouth movements from your Dialogue Script — "
+                            "requires Voice Reference Clip + Dialogue Script in the Sound section."
                         ),
                     )
 
@@ -5517,28 +5930,94 @@ with gr.Blocks(css=css) as demo:
 
                     with gr.Group():
                         add_audio_cb = gr.Checkbox(label="Add Audio (F5-TTS + HunyuanVideo-Foley)", value=True)
+                        # ── Top row: all four panels side-by-side ──────────────────────
                         with gr.Row():
                             audio_prompt_tb = gr.Textbox(
-                                label="Sound Effects / Foley Prompt", value="realistic female breathing that matches the woman's movements and actions in video",
-                                lines=3,
+                                label="Sound Effects / Foley Prompt", value="quiet ambience, soft room tone",
+                                lines=4, scale=1,
                             )
                             audio_negative_prompt_tb = gr.Textbox(
-                                label="Audio Negative Prompt", value="music",
-                                placeholder="e.g. music, silence, noise",
-                                lines=3,
+                                label="Audio Negative Prompt", value="music, noise, wind, crowd",
+                                placeholder="e.g. music, noise, wind, crowd",
+                                lines=4, scale=1,
                             )
-                        gr.Markdown("**Voice Cloning (optional)** — upload a 5-10s reference clip and type the dialogue to speak. Leave blank to skip.")
-                        with gr.Row():
-                            ref_audio_input = gr.File(
-                                label="Voice Reference Clip (upload .wav/.mp3, 5-10s)",
-                                file_types=[".wav", ".mp3", ".flac", ".ogg", ".m4a"],
-                                file_count="single",
-                            )
+                            with gr.Column(scale=1):
+                                gr.Markdown("**Voice Cloning (optional)** — upload a 5-10s reference clip and type the dialogue to speak. Leave blank to skip.")
+                                ref_audio_input = gr.File(
+                                    label="Voice Reference Clip (upload .wav/.mp3, 5-10s)",
+                                    file_types=[".wav", ".mp3", ".flac", ".ogg", ".m4a"],
+                                    file_count="single",
+                                )
                             dialogue_text_tb = gr.Textbox(
                                 label="Dialogue Script",
                                 placeholder="Leave blank to skip voice cloning",
-                                lines=3,
+                                lines=4, scale=1,
                             )
+                        # ── Voice Speed ────────────────────────────────────────────────
+                        gr.Markdown("**Voice Speed** — controls how fast the cloned voice speaks. 1.0 is natural; try 0.75–0.85 if she sounds rushed.")
+                        with gr.Row():
+                            voice_speed_slider = gr.Slider(
+                                label="Voice Speed",
+                                minimum=0.5,
+                                maximum=1.5,
+                                step=0.05,
+                                value=0.8,
+                                scale=3,
+                            )
+                        with gr.Row():
+                            voice_speed_very_slow_btn = gr.Button("🐢 Very Slow (0.6)", size="sm", scale=1)
+                            voice_speed_slow_btn      = gr.Button("🐌 Slow (0.75)",     size="sm", scale=1)
+                            voice_speed_normal_btn    = gr.Button("🎙️ Normal (1.0)",    size="sm", scale=1)
+                            voice_speed_fast_btn      = gr.Button("⚡ Fast (1.2)",       size="sm", scale=1)
+                        voice_speed_very_slow_btn.click(fn=lambda: 0.6,  outputs=[voice_speed_slider])
+                        voice_speed_slow_btn.click(     fn=lambda: 0.75, outputs=[voice_speed_slider])
+                        voice_speed_normal_btn.click(   fn=lambda: 1.0,  outputs=[voice_speed_slider])
+                        voice_speed_fast_btn.click(     fn=lambda: 1.2,  outputs=[voice_speed_slider])
+
+                        # ── F5-TTS voice control quick-insert buttons ──────────────────
+                        gr.Markdown(
+                            "### 🎙️ F5-TTS Voice Controls — click any button to insert into Dialogue Script"
+                        )
+                        gr.Markdown("**Punctuation for pacing & breath:**")
+                        with gr.Row():
+                            _ins_comma  = gr.Button(", — short pause / breath beat",              size="sm")
+                            _ins_period = gr.Button(". / ! / ? — longer pause, sentence boundary", size="sm")
+                            _ins_ellip  = gr.Button("... — extended pause / trailing off",         size="sm")
+                            _ins_emdash = gr.Button("— (em-dash) — abrupt cut / interruption",    size="sm")
+
+                        def _append_to_dialogue(current_text, insert_str):
+                            """Append insert_str to whatever is already in the dialogue box."""
+                            return (current_text or "") + insert_str
+
+                        _ins_comma.click(
+                            fn=lambda t: _append_to_dialogue(t, ", "),
+                            inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
+                        )
+                        _ins_period.click(
+                            fn=lambda t: _append_to_dialogue(t, ". "),
+                            inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
+                        )
+                        _ins_ellip.click(
+                            fn=lambda t: _append_to_dialogue(t, "... "),
+                            inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
+                        )
+                        _ins_emdash.click(
+                            fn=lambda t: _append_to_dialogue(t, " — "),
+                            inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
+                        )
+
+                        gr.Markdown(
+                            "**Capitalization for emphasis:** F5 is sensitive to capitalization for stress — "
+                            "`I LOVE this` will make LOVE land harder than `I love this`. Not perfect, but noticeable.\n\n"
+                            "**Repetition for elongation:** Stretch a vowel by writing it as you'd say it — "
+                            "`nooo`, `pleease`, `yeeees`. F5 treats the extra letters as held phonemes.\n\n"
+                            "**Phonetic spelling for tricky pronunciation:** If a word sounds wrong, spell it "
+                            "phonetically — `Anth-ro-pic` instead of `Anthropic`, `eye-kon` instead of `icon`. "
+                            "Hyphens help segment syllables.\n\n"
+                            "**Whispered / breathy tone:** F5 clones the reference voice's character — so the "
+                            "clearest lever is your reference clip itself. A breathy 5-second clip → breathy output. "
+                            "An excited clip → excited clone. Record different reference clips for different moods."
+                        )
 
                 with gr.Column(scale=1):
                     vidgen_progress = gr.Markdown(
@@ -5727,6 +6206,30 @@ with gr.Blocks(css=css) as demo:
                     custom_seq_motion_prompts.append(_cs_motion)
                     custom_seq_picgen_prompts.append(_cs_picgen)
                     custom_seq_durations.append(_cs_dur)
+
+            with gr.Group(visible=False) as lip_sync_group:
+                gr.Markdown(
+                    "**Lip-Synced Speaking** — generates video with subject speaking, "
+                    "then runs **LatentSync** (ByteDance, 2025) to replace the mouth region "
+                    "with audio-driven synthesis locked to your Dialogue Script. "
+                    "Requires a Voice Reference Clip + Dialogue Script in the Sound section above. "
+                    "LatentSync downloads automatically (~1.7 GB) on first use.\n\n"
+                    "Pipeline: Wan generates video → F5-TTS generates voice WAV → "
+                    "LatentSync drives mouth → Foley SFX mixed on top."
+                )
+                with gr.Row():
+                    lipsync_steps_sl = gr.Slider(
+                        label="LatentSync Inference Steps",
+                        minimum=5, maximum=50, step=1, value=20,
+                        info="More steps = better quality, slower. 20 is a good default.",
+                        scale=2,
+                    )
+                    lipsync_cfg_sl = gr.Slider(
+                        label="LatentSync Guidance Scale",
+                        minimum=0.5, maximum=5.0, step=0.1, value=1.5,
+                        info="Higher = mouth follows audio more strictly. 1.5–2.0 recommended.",
+                        scale=2,
+                    )
 
             video_file = gr.File(visible=False)
             
@@ -6273,6 +6776,7 @@ with gr.Blocks(css=css) as demo:
                 is_seq = (m == MODE_SEQUENCE)
                 is_cseq = (m == MODE_CUSTOM_SEQ)
                 is_autorun = (m == MODE_AUTORUN)
+                is_lipsync = (m == MODE_LIP_SYNC)
                 prompt_visible = not (is_seq or is_cseq)
                 return (
                     gr.update(visible=is_autorun),    # autorun_status
@@ -6280,19 +6784,20 @@ with gr.Blocks(css=css) as demo:
                     gr.update(visible=is_seq),         # sequence_group
                     gr.update(visible=is_cseq),        # custom_seq_group
                     gr.update(visible=prompt_visible), # vid_prompt
+                    gr.update(visible=is_lipsync),     # lip_sync_group
                 )
 
             scene_mode.change(
                 fn=_scene_mode_visibility,
                 inputs=[scene_mode],
-                outputs=[autorun_status, push_autorun_row, sequence_group, custom_seq_group, vid_prompt],
+                outputs=[autorun_status, push_autorun_row, sequence_group, custom_seq_group, vid_prompt, lip_sync_group],
             )
 
             _PUSH_AUTORUN_INPUTS = [
                 vid_prompt, duration_seconds, resolution, frame_multiplier,
                 export_quality, seed, randomize_seed, add_audio_cb,
                 audio_prompt_tb, audio_negative_prompt_tb,
-                ref_audio_input, dialogue_text_tb,
+                ref_audio_input, dialogue_text_tb, voice_speed_slider,
                 vid_negative_prompt, edit_steps, edit_guidance,
                 flow_shift_auto, flow_shift,
             ] + [lora_checkboxes[k] for k in AVAILABLE_LORAS if k in lora_checkboxes]
@@ -6301,10 +6806,12 @@ with gr.Blocks(css=css) as demo:
             def _dispatch_generate(scene_mode_val, ref_image, prompt,
                                    end_img, dur, res, fmul, qual, sd, rsd,
                                    audio_cb, audio_pt, audio_neg_pt,
-                                   ref_aud, dlg_txt,
+                                   ref_aud, dlg_txt, v_speed,
                                    neg_pt, esteps, eguid,
-                                   fsa, fs, *rest_args):
-                """Route to normal generate_video, folder-Autorun, Sequence, or Custom Edit Sequence."""
+                                   fsa, fs,
+                                   lipsync_steps, lipsync_cfg,
+                                   *rest_args):
+                """Route to normal generate_video, folder-Autorun, Sequence, Custom Edit Sequence, or Lip-Synced Speaking."""
                 _do_clear_storage()
                 n = SEQUENCE_MAX_SLOTS
                 c = CUSTOM_SEQ_MAX_SLOTS
@@ -6316,11 +6823,23 @@ with gr.Blocks(css=css) as demo:
                 cs_durs = list(rest_args[3 * n + 2 * c: 3 * n + 3 * c])
                 lora_args_inner = rest_args[3 * n + 3 * c:]
 
+                if scene_mode_val == MODE_LIP_SYNC:
+                    result = generate_lip_sync_video(
+                        ref_image, prompt, scene_mode_val,
+                        end_img, dur, res, fmul, qual, sd, rsd,
+                        audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
+                        neg_pt, esteps, eguid, fsa, fs,
+                        lipsync_steps, lipsync_cfg,
+                        *lora_args_inner,
+                    )
+                    yield result[0], result[1], result[2]
+                    return
+
                 if scene_mode_val == MODE_AUTORUN:
                     yield from autorun_generate(
                         prompt, scene_mode_val, None,
                         dur, res, fmul, qual, sd, rsd,
-                        audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt,
+                        audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
                         neg_pt, esteps, eguid, fsa, fs,
                         *lora_args_inner,
                     )
@@ -6328,7 +6847,7 @@ with gr.Blocks(css=css) as demo:
                     result = generate_sequence(
                         seq_imgs, seq_prompts, seq_durs,
                         res, fmul, qual, sd, rsd,
-                        audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt,
+                        audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
                         neg_pt, esteps, eguid, fsa, fs,
                         *lora_args_inner,
                     )
@@ -6337,7 +6856,7 @@ with gr.Blocks(css=css) as demo:
                     result = generate_custom_edit_sequence(
                         ref_image, cs_motions, cs_picgens, cs_durs,
                         res, fmul, qual, sd, rsd,
-                        audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt,
+                        audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
                         neg_pt, esteps, eguid, fsa, fs,
                         *lora_args_inner,
                     )
@@ -6346,7 +6865,7 @@ with gr.Blocks(css=css) as demo:
                     result = generate_video(
                         ref_image, prompt, scene_mode_val,
                         end_img, dur, res, fmul, qual, sd, rsd,
-                        audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt,
+                        audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
                         neg_pt, esteps, eguid, fsa, fs,
                         *lora_args_inner,
                     )
@@ -6359,9 +6878,10 @@ with gr.Blocks(css=css) as demo:
                     end_image, duration_seconds, resolution, frame_multiplier,
                     export_quality, seed, randomize_seed, add_audio_cb,
                     audio_prompt_tb, audio_negative_prompt_tb,
-                    ref_audio_input, dialogue_text_tb,
+                    ref_audio_input, dialogue_text_tb, voice_speed_slider,
                     vid_negative_prompt, edit_steps, edit_guidance,
                     flow_shift_auto, flow_shift,
+                    lipsync_steps_sl, lipsync_cfg_sl,
                 ] + sequence_images + sequence_prompts + sequence_durations
                   + custom_seq_motion_prompts + custom_seq_picgen_prompts + custom_seq_durations
                   + [lora_checkboxes[k] for k in AVAILABLE_LORAS if k in lora_checkboxes],
@@ -6392,9 +6912,10 @@ with gr.Blocks(css=css) as demo:
                     end_image, duration_seconds, resolution, frame_multiplier,
                     export_quality, seed, randomize_seed, add_audio_cb,
                     audio_prompt_tb, audio_negative_prompt_tb,
-                    ref_audio_input, dialogue_text_tb,
+                    ref_audio_input, dialogue_text_tb, voice_speed_slider,
                     vid_negative_prompt, edit_steps, edit_guidance,
                     flow_shift_auto, flow_shift,
+                    lipsync_steps_sl, lipsync_cfg_sl,
                 ] + sequence_images + sequence_prompts + sequence_durations
                   + custom_seq_motion_prompts + custom_seq_picgen_prompts + custom_seq_durations
                   + [lora_checkboxes[k] for k in AVAILABLE_LORAS if k in lora_checkboxes],

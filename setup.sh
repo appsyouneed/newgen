@@ -9,10 +9,23 @@ if [ "$EUID" -ne 0 ]; then
     exec sudo bash "$0" "$@"
 fi
 
-PYTHON="python3"
-PIP="pip3"
+# ---------------------------------------------------------------------------
+# CRITICAL: This setup script NEVER touches the system torch / torchvision /
+# torchaudio / numpy stack that ships with your Ubuntu 22.04 VPS.
+# Those versions (torch 2.8 dev+cu128, etc.) are already correct and must
+# not be changed.  All Python-level dependencies that the app needs are
+# installed into /root/newgen/.app-venv so they are completely isolated from
+# both the OS-managed python3 packages and the system torch stack.
+#
+# The ONLY system packages installed here are apt-managed OS tools:
+#   ffmpeg, wget, unzip, git, git-lfs, python3-pip, python3-venv
+# Those are safe because they live in /usr/bin / /usr/lib, not in
+# site-packages, and cannot conflict with Python packages.
+# ---------------------------------------------------------------------------
 
-echo "Installing system dependencies..."
+PYTHON="python3"
+
+echo "Installing system apt dependencies (safe — OS tools only, not Python packages)..."
 if lsof /var/lib/dpkg/lock-frontend > /dev/null 2>&1; then
     lsof -t /var/lib/dpkg/lock-frontend | xargs kill -9 2>/dev/null || true
 fi
@@ -20,7 +33,7 @@ rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/loc
 rm -f /var/lib/dpkg/updates/*
 dpkg --configure -a || true
 apt-get update
-apt-get install -y --fix-missing ffmpeg wget unzip git python3-pip git-lfs
+apt-get install -y --fix-missing ffmpeg wget unzip git python3-pip python3-venv git-lfs
 
 echo "Creating directories..."
 mkdir -p /root/newgen/tmp
@@ -29,55 +42,93 @@ mkdir -p /root/newgen/wan22_distill
 mkdir -p /root/.cache/huggingface
 chmod 1777 /root/newgen/tmp
 
-echo "Installing PyTorch..."
-$PIP uninstall -y torch torchvision torchaudio --break-system-packages 2>/dev/null || true
-$PIP install torch torchvision torchaudio --break-system-packages --no-cache-dir
+# ---------------------------------------------------------------------------
+# App venv — isolated from system Python site-packages.
+# We do NOT use --system-site-packages so nothing leaks in from the OS level.
+# The venv gets its own pip, its own diffusers, gradio, etc.
+# torch / torchvision / torchaudio are NOT reinstalled here; the venv
+# inherits the system torch via PYTHONPATH override at app launch time
+# (see autorun.sh / systemd service), keeping the multi-GB dev build intact.
+# ---------------------------------------------------------------------------
+APP_VENV="/root/newgen/.app-venv"
 
-echo "Installing Python dependencies..."
-$PIP install -r "$SCRIPT_DIR/requirements.txt" --break-system-packages --ignore-installed typing-extensions --no-cache-dir
+if [ ! -f "$APP_VENV/bin/python" ]; then
+    echo "Creating isolated app venv at $APP_VENV ..."
+    $PYTHON -m venv "$APP_VENV"
+fi
 
-echo "Ensuring critical packages..."
-$PIP install Pillow "transformers>=4.52.0,<5.0" "huggingface-hub>=0.34.0,<1.0" "numpy<2.1" "diffusers>=0.33.0,<0.38.0" "safetensors>=0.4.0" torchao accelerate --break-system-packages --no-cache-dir --force-reinstall
+APP_PY="$APP_VENV/bin/python"
+APP_PIP="$APP_VENV/bin/pip"
 
-echo "Installing torchcodec (required by torchaudio.save for Foley audio)..."
-# torchaudio 2.9+ routes torchaudio.save() through TorchCodec; without it the
+echo "Upgrading pip inside venv..."
+"$APP_PIP" install --quiet --upgrade pip
+
+# ---------------------------------------------------------------------------
+# Detect the system torch location so the venv can import it without
+# reinstalling it.  We find the real site-packages dir by asking the system
+# python where torch lives, then prepend it to PYTHONPATH for all subsequent
+# pip calls and for the running app.  This means pip inside the venv will
+# treat torch/torchvision/torchaudio as "already satisfied" (via PYTHONPATH)
+# and skip downloading them.
+# ---------------------------------------------------------------------------
+SYS_SITE=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || echo "")
+if [ -n "$SYS_SITE" ] && [ -d "$SYS_SITE/torch" ]; then
+    echo "System torch found at $SYS_SITE — venv will use it via PYTHONPATH."
+    export PYTHONPATH="$SYS_SITE:${PYTHONPATH:-}"
+else
+    echo "WARNING: Could not locate system torch in $SYS_SITE."
+    echo "  The app venv will attempt to use whatever torch is on PYTHONPATH at runtime."
+    echo "  Do NOT let setup.sh install torch — that would overwrite your dev build."
+fi
+
+echo "Installing Python application dependencies into isolated venv..."
+# Requirements file has torch/torchvision/torchaudio commented out intentionally.
+# With PYTHONPATH pointing at the system site-packages, pip will resolve them
+# as already satisfied and skip download.
+"$APP_PIP" install --quiet --no-cache-dir \
+    -r "$SCRIPT_DIR/requirements.txt"
+
+echo "Ensuring critical pinned packages inside venv..."
+# These are pinned to exact versions the app requires. They live only in the
+# venv — the system site-packages are never touched.
+"$APP_PIP" install --quiet --no-cache-dir \
+    Pillow \
+    "transformers>=4.52.0,<5.0" \
+    "huggingface-hub>=0.34.0,<1.0" \
+    "numpy>=1.26,<2.1" \
+    "diffusers>=0.34.0,<0.38.0" \
+    "safetensors>=0.4.0" \
+    torchao \
+    accelerate
+
+echo "Installing torchcodec into venv (required by torchaudio.save for Foley audio)..."
+# torchaudio 2.6+ routes torchaudio.save() through TorchCodec; without it the
 # HunyuanVideo-Foley step crashes and videos come out silent.
-$PIP install torchcodec --break-system-packages --no-cache-dir || true
+"$APP_PIP" install --quiet --no-cache-dir torchcodec 2>/dev/null || true
 
-echo "Patching gradio/oauth.py for huggingface_hub >= 0.26 compatibility..."
-# huggingface_hub removed HfFolder in 0.26.0. gradio 4.43.0 still imports it at module
-# level, crashing the entire process on startup even when OAuth is never used.
-# This patch replaces the broken import with a shim class that replicates the only
-# method gradio calls (HfFolder.get_token), backed by the replacement API (get_token).
-# The shim is only activated when HfFolder is actually absent, so this is a no-op on
-# older huggingface_hub installations.
-python3 - <<'PYPATCH'
-import sys, pathlib
+# ---------------------------------------------------------------------------
+# Patch gradio/oauth.py inside the VENV for huggingface_hub >= 0.26
+# huggingface_hub removed HfFolder in 0.26.0; gradio 4.43.0 still imports it
+# at module level, crashing the entire process on startup.
+# This patch lives only inside the venv's copy of gradio — the system is untouched.
+# ---------------------------------------------------------------------------
+echo "Patching venv gradio/oauth.py for huggingface_hub >= 0.26 compatibility..."
+VENV_SITE="$APP_VENV/lib/$(ls $APP_VENV/lib/)/site-packages"
+"$APP_PY" - <<'PYPATCH'
+import sys, pathlib, site
 
-oauth_path = pathlib.Path(
-    next(p for p in sys.path if "dist-packages" in p or "site-packages" in p),
-    "gradio", "oauth.py"
-)
-if not oauth_path.exists():
-    # try the other path variant
-    import site
-    for sp in site.getsitepackages():
-        candidate = pathlib.Path(sp, "gradio", "oauth.py")
-        if candidate.exists():
-            oauth_path = candidate
+for sp in site.getsitepackages():
+    candidate = pathlib.Path(sp, "gradio", "oauth.py")
+    if candidate.exists():
+        text = candidate.read_text()
+        OLD = "from huggingface_hub import HfFolder, whoami"
+        if OLD not in text:
+            print(f"  Already patched or pattern not found: {candidate}")
             break
-
-text = oauth_path.read_text()
-
-OLD = "from huggingface_hub import HfFolder, whoami"
-NEW = """\
+        NEW = """\
 try:
     from huggingface_hub import HfFolder, whoami
 except ImportError:
-    # huggingface_hub >= 0.26 removed HfFolder. Provide a shim so gradio can
-    # still import cleanly. The real HfFolder.get_token() path is only reached
-    # when running locally with a mocked OAuth login button, which this app
-    # does not use.
     from huggingface_hub import whoami
     try:
         from huggingface_hub import get_token as _get_token
@@ -88,23 +139,16 @@ except ImportError:
         @staticmethod
         def get_token():
             return _get_token()"""
-
-if OLD in text:
-    oauth_path.write_text(text.replace(OLD, NEW, 1))
-    print(f"  Patched: {oauth_path}")
-else:
-    print(f"  Already patched or pattern not found: {oauth_path}")
+        candidate.write_text(text.replace(OLD, NEW, 1))
+        print(f"  Patched: {candidate}")
+        break
 PYPATCH
 
-echo "Patching gradio_client/utils.py for pydantic v2 bool-schema compatibility..."
-# pydantic v2 emits additionalProperties: false (a bool) in JSON schemas.
-# gradio_client's _json_schema_to_python_type and get_type both assume schema is
-# always a dict, crashing with "argument of type 'bool' is not iterable".
-# This adds an isinstance guard so bools are safely returned as "Any".
-python3 - <<'PYPATCH'
+echo "Patching venv gradio_client/utils.py for pydantic v2 bool-schema compatibility..."
+"$APP_PY" - <<'PYPATCH'
 import sys, pathlib, site
 
-for sp in [*site.getsitepackages(), *sys.path]:
+for sp in site.getsitepackages():
     candidate = pathlib.Path(sp, "gradio_client", "utils.py")
     if candidate.exists():
         text = candidate.read_text()
@@ -117,7 +161,6 @@ for sp in [*site.getsitepackages(), *sys.path]:
             candidate.write_text(text.replace(OLD, NEW, 1))
             print(f"  Patched: {candidate}")
             break
-        # fallback: patch get_type directly
         OLD2 = 'def get_type(schema: dict):\n    if "const" in schema:'
         NEW2 = 'def get_type(schema: dict):\n    if not isinstance(schema, dict):\n        return "unknown"\n    if "const" in schema:'
         if OLD2 in text:
@@ -128,24 +171,25 @@ for sp in [*site.getsitepackages(), *sys.path]:
         break
 PYPATCH
 
-echo "Installing SageAttention for accelerated inference..."
-$PIP install sageattention --break-system-packages --no-cache-dir 2>/dev/null || {
+echo "Installing SageAttention into venv for accelerated inference..."
+"$APP_PIP" install --quiet --no-cache-dir sageattention 2>/dev/null || {
     echo "Pre-built SageAttention not available for this GPU arch — building from source..."
-    $PIP install "git+https://github.com/thu-ml/SageAttention.git" --break-system-packages --no-cache-dir 2>/dev/null || {
+    "$APP_PIP" install "git+https://github.com/thu-ml/SageAttention.git" --no-cache-dir 2>/dev/null || {
         echo "⚠️  SageAttention install failed — will fall back to standard SDPA at runtime."
     }
 }
 
-echo "Installing rembg (BiRefNet background removal for Merge Photos)..."
-$PIP install "rembg[gpu]" --break-system-packages --no-cache-dir 2>/dev/null || {
+echo "Installing rembg into venv (BiRefNet background removal for Merge Photos)..."
+"$APP_PIP" install --quiet --no-cache-dir "rembg[gpu]" 2>/dev/null || {
     echo "rembg[gpu] failed — trying CPU-only rembg..."
-    $PIP install rembg --break-system-packages --no-cache-dir 2>/dev/null || {
+    "$APP_PIP" install --quiet --no-cache-dir rembg 2>/dev/null || {
         echo "⚠️  rembg install failed — Merge Photos will use original images without background removal."
     }
 }
 
-echo "Fixing pyOpenSSL..."
-$PYTHON -c "from OpenSSL import SSL" 2>/dev/null || $PIP install pyopenssl --break-system-packages
+echo "Ensuring pyOpenSSL inside venv..."
+"$APP_PY" -c "from OpenSSL import SSL" 2>/dev/null || \
+    "$APP_PIP" install --quiet pyopenssl
 
 echo "Setting up RIFE interpolation model..."
 if [ ! -d "/root/newgen/train_log/model" ] || [ ! -f "/root/newgen/train_log/RIFE_HDv3.py" ]; then
@@ -164,8 +208,7 @@ fi
 echo "Preparing Wan 2.2 distilled weights directory..."
 mkdir -p /root/newgen/wan22_distill
 echo "Note: the two merged 4-step BF16 experts (~28.6 GB each, ~57 GB total)"
-echo "download automatically on first video generation. The base repo's own"
-echo "transformer weights are never downloaded."
+echo "download automatically on first video generation."
 echo "Plan for roughly 150-200 GB total across Wan, Qwen and MMAudio."
 
 echo "Copying app files to /root/newgen/..."
@@ -187,18 +230,34 @@ if [ -d "$SCRIPT_DIR/starters" ] && [ "$SCRIPT_DIR/starters" != "/root/newgen/st
     cp -r "$SCRIPT_DIR/starters" /root/newgen/starters
 fi
 
+# ---------------------------------------------------------------------------
+# Write the launch wrapper that ensures the app venv's python is used but
+# the system torch is visible via PYTHONPATH.  This is what systemd / autorun
+# should call instead of plain "python3 app.py".
+# ---------------------------------------------------------------------------
+cat > /root/newgen/run_app.sh << 'LAUNCHER'
+#!/bin/bash
+# Launch app.py using the isolated app venv, with system torch on PYTHONPATH.
+# This preserves the system torch 2.8 dev+cu128 while using venv's gradio/
+# diffusers/transformers/etc.
+APP_VENV="/root/newgen/.app-venv"
+SYS_SITE=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || echo "")
+if [ -n "$SYS_SITE" ] && [ -d "$SYS_SITE/torch" ]; then
+    export PYTHONPATH="$SYS_SITE:${PYTHONPATH:-}"
+fi
+cd /root/newgen
+exec "$APP_VENV/bin/python" app.py "$@"
+LAUNCHER
+chmod +x /root/newgen/run_app.sh
+
 # Check if running in Docker (no systemd)
 if [ ! -d /run/systemd/system ]; then
     echo "Docker environment — skipping systemd setup"
     echo ""
     echo "=== Docker Startup Instructions ==="
-    echo "Run manually: cd /root/newgen && python3 app.py"
+    echo "Run: /root/newgen/run_app.sh"
+    echo "  (uses isolated venv; system torch preserved)"
     echo ""
-    echo "🎬 Video Generator:"
-    echo "   • Background replacement via Qwen, animation via Wan 2.2"
-    echo "   • Merged 4-step BF16 checkpoints, no LoRA"
-    echo "   • Zero configuration required"
-    echo "   • Unrestricted content generation"
     bash "$SCRIPT_DIR/autorun.sh"
     exit 0
 fi
@@ -211,6 +270,10 @@ systemctl start newgen
 
 echo ""
 echo "=== Setup Complete ==="
+echo ""
+echo "IMPORTANT: App now runs via /root/newgen/run_app.sh"
+echo "  System torch 2.8 dev+cu128 is PRESERVED."
+echo "  All app dependencies live in /root/newgen/.app-venv"
 echo ""
 echo "🎬 New Features Available:"
 echo "   • Wan 2.2 I2V A14B merged 4-step distill (BF16, no LoRA)"
