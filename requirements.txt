@@ -8,7 +8,13 @@
 # gradio==4.43.0 imports HfFolder which was removed in huggingface-hub>=0.26.
 # setup.sh patches gradio/oauth.py with a shim after install so this is safe.
 huggingface-hub>=0.34.0,<1.0
-transformers>=4.50.0,<5.0
+# transformers must be >=4.52.0: Qwen-Image-Edit-2511's text_encoder config
+# uses the newer nested `text_config` composite format. Before 4.52.0,
+# Qwen2_5_VLConfig.sub_configs lacked "text_config", so the nested dict was
+# never wrapped in Qwen2_5_VLTextConfig and stayed a raw dict — then
+# GenerationConfig.from_model_config() calls decoder_config.to_dict() on it
+# and crashes with "'dict' object has no attribute 'to_dict'".
+transformers>=4.52.0,<5.0
 diffusers>=0.33.0,<0.38.0
 safetensors>=0.4.0
 numpy<2.1
@@ -40,13 +46,10 @@ ftfy
 tqdm
 typing-extensions
 
-# MMAudio
-git+https://github.com/hkchengrex/MMAudio@d1d78adc63f59329127e73fa003c29cab6714107#egg=mmaudio
-open_clip_torch
-einops
+# Used directly by app.py for video frame extraction/encoding (dual audio
+# engine: F5-TTS + HunyuanVideo-Foley). MMAudio and its transitive deps
+# (open_clip_torch, einops, librosa, omegaconf, scipy, soundfile, PyYAML)
+# were removed — app.py no longer imports any of them, and both audio
+# engines install their own dependencies at first run via
+# _ensure_audio_engines().
 av
-librosa
-omegaconf
-scipy
-soundfile
-PyYAML

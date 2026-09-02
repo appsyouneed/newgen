@@ -54,6 +54,185 @@ except ImportError:
     import subprocess as _sp
     _sp.run([sys.executable, "-m", "pip", "install", "--quiet", "cryptography==42.0.8"], check=True)
 
+# --- Self-heal: gradio version guard ---------------------------------------
+# HunyuanVideo-Foley's own requirements.txt pins gradio==3.50.2. If a prior
+# run already cloned that repo and installed its deps (or someone re-ran
+# setup.sh after that happened), the environment can be left with gradio
+# downgraded from our pinned 4.43.0. That's silent at install time but blows
+# up later: gr.on()/event listeners with js= (gradio 4.x only) raise
+# "TypeError: EventListenerMethod.__call__() got an unexpected keyword
+# argument 'js'" deep into UI construction, and gradio-client version skew
+# causes other obscure crashes. Check and repair *before* gradio is ever
+# imported, on every startup, since _ensure_audio_engines() only reinstalls
+# Foley's requirements once (skipped if the repo dir already exists) and
+# can't repair a leftover bad install from a previous run.
+def _self_heal_patch_gradio_oauth():
+    """Reapply the HfFolder shim setup.sh patches into gradio/oauth.py.
+    Needed after any --force-reinstall of gradio, which restores the
+    original unpatched file."""
+    import site
+    try:
+        oauth_path = None
+        for sp_dir in site.getsitepackages():
+            candidate = Path(sp_dir, "gradio", "oauth.py")
+            if candidate.exists():
+                oauth_path = candidate
+                break
+        if oauth_path is None:
+            return
+        text = oauth_path.read_text()
+        OLD = "from huggingface_hub import HfFolder, whoami"
+        if OLD not in text:
+            return  # already patched or different gradio version
+        NEW = (
+            "try:\n"
+            "    from huggingface_hub import HfFolder, whoami\n"
+            "except ImportError:\n"
+            "    from huggingface_hub import whoami\n"
+            "    try:\n"
+            "        from huggingface_hub import get_token as _get_token\n"
+            "    except ImportError:\n"
+            "        _get_token = lambda: None  # noqa: E731\n\n"
+            "    class HfFolder:  # noqa: N801\n"
+            "        @staticmethod\n"
+            "        def get_token():\n"
+            "            return _get_token()"
+        )
+        oauth_path.write_text(text.replace(OLD, NEW, 1))
+        print(f"[SelfHeal] Patched {oauth_path}")
+    except Exception as _e:
+        print(f"[SelfHeal] gradio oauth patch failed (non-fatal): {_e}")
+
+
+def _self_heal_patch_gradio_client_utils():
+    """Reapply the pydantic v2 bool-schema guard setup.sh patches into
+    gradio_client/utils.py. Needed after any --force-reinstall of
+    gradio-client, which restores the original unpatched file."""
+    import site
+    try:
+        candidate = None
+        for sp_dir in site.getsitepackages():
+            p = Path(sp_dir, "gradio_client", "utils.py")
+            if p.exists():
+                candidate = p
+                break
+        if candidate is None:
+            return
+        text = candidate.read_text()
+        if "if not isinstance(schema, dict):" in text:
+            return  # already patched
+        OLD = (
+            'def _json_schema_to_python_type(schema: Any, defs) -> str:\n'
+            '    """Convert the json schema into a python type hint"""\n'
+            '    if schema == {}:'
+        )
+        NEW = (
+            'def _json_schema_to_python_type(schema: Any, defs) -> str:\n'
+            '    """Convert the json schema into a python type hint"""\n'
+            '    if not isinstance(schema, dict):\n'
+            '        return "Any"\n'
+            '    if schema == {}:'
+        )
+        if OLD in text:
+            candidate.write_text(text.replace(OLD, NEW, 1))
+            print(f"[SelfHeal] Patched {candidate}")
+            return
+        OLD2 = 'def get_type(schema: dict):\n    if "const" in schema:'
+        NEW2 = (
+            'def get_type(schema: dict):\n'
+            '    if not isinstance(schema, dict):\n'
+            '        return "unknown"\n'
+            '    if "const" in schema:'
+        )
+        if OLD2 in text:
+            candidate.write_text(text.replace(OLD2, NEW2, 1))
+            print(f"[SelfHeal] Patched get_type fallback in {candidate}")
+    except Exception as _e:
+        print(f"[SelfHeal] gradio_client utils patch failed (non-fatal): {_e}")
+
+
+def _self_heal_gradio_version():
+    _pinned_gradio = "4.43.0"
+    _pinned_gradio_client = "1.3.0"
+    try:
+        from importlib.metadata import version as _pkg_version, PackageNotFoundError
+        try:
+            _cur_gradio = _pkg_version("gradio")
+        except PackageNotFoundError:
+            _cur_gradio = None
+        if _cur_gradio != _pinned_gradio:
+            print(f"[SelfHeal] gradio version is {_cur_gradio!r}, expected "
+                  f"{_pinned_gradio!r} — reinstalling pinned gradio stack...")
+            import subprocess as _sp
+            _sp.run(
+                [sys.executable, "-m", "pip", "install", "--quiet",
+                 "--disable-pip-version-check", "--force-reinstall", "--no-deps",
+                 f"gradio=={_pinned_gradio}", f"gradio-client=={_pinned_gradio_client}"],
+                check=True,
+            )
+            print("[SelfHeal] gradio reinstalled to pinned version.")
+            # --force-reinstall overwrites gradio/oauth.py and
+            # gradio_client/utils.py, wiping out the patches setup.sh applies
+            # after install (HfFolder shim for huggingface_hub >= 0.26, and
+            # the pydantic v2 bool-schema guard). Reapply both now or the
+            # next `import gradio` / component render will crash again.
+            _self_heal_patch_gradio_oauth()
+            _self_heal_patch_gradio_client_utils()
+    except Exception as _e:
+        print(f"[SelfHeal] gradio version check failed (non-fatal): {_e}")
+
+
+def _self_heal_transformers_version():
+    # Qwen-Image-Edit-2511's text_encoder/config.json uses the newer nested
+    # `text_config` composite format. transformers < 4.52.0 has
+    # Qwen2_5_VLConfig.sub_configs WITHOUT "text_config", so the nested dict
+    # is never wrapped in Qwen2_5_VLTextConfig and stays a raw dict. Loading
+    # the pipeline then crashes in GenerationConfig.from_model_config() with
+    # "'dict' object has no attribute 'to_dict'". A prior run's Foley install
+    # (git+transformers@v4.49.0-SigLIP-2) or an older pin can leave the env
+    # on such a version, so verify and upgrade in place before importing
+    # transformers.
+    _min_transformers = (4, 52, 0)
+    try:
+        from importlib.metadata import version as _pkg_version, PackageNotFoundError
+        try:
+            _cur = _pkg_version("transformers")
+        except PackageNotFoundError:
+            _cur = None
+
+        def _parse(v):
+            parts = []
+            for p in (v or "0").split(".")[:3]:
+                num = ""
+                for ch in p:
+                    if ch.isdigit():
+                        num += ch
+                    else:
+                        break
+                parts.append(int(num) if num else 0)
+            while len(parts) < 3:
+                parts.append(0)
+            return tuple(parts)
+
+        if _cur is None or _parse(_cur) < _min_transformers:
+            _want = ".".join(str(x) for x in _min_transformers)
+            print(f"[SelfHeal] transformers version is {_cur!r}, need "
+                  f">={_want} for Qwen-Image-Edit-2511 — upgrading...")
+            import subprocess as _sp
+            _sp.run(
+                [sys.executable, "-m", "pip", "install", "--quiet",
+                 "--disable-pip-version-check", "--upgrade",
+                 f"transformers>={_want},<5.0"],
+                check=True,
+            )
+            print("[SelfHeal] transformers upgraded.")
+    except Exception as _e:
+        print(f"[SelfHeal] transformers version check failed (non-fatal): {_e}")
+
+
+_self_heal_gradio_version()
+_self_heal_transformers_version()
+
 os.environ.update({
     "TMPDIR": "/dev/shm/newgen",
     "TEMP": "/dev/shm/newgen",
@@ -85,6 +264,15 @@ logging.getLogger("torch.utils._pytree").setLevel(logging.ERROR)
 logging.getLogger("absl").setLevel(logging.ERROR)
 logging.getLogger("diffusers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
+
+import warnings as _warnings
+# torch/transformers/diffusers install their own warnings filters during
+# import, which can override the blanket warnings.filterwarnings("ignore")
+# set at the top of this file. This specific message ("Unable to import
+# `torchao` Tensor objects...") is emitted via warnings.warn (not logging),
+# so the _TorchaoFilter logging.Filter above never catches it. Re-assert
+# suppression here, after the heavy imports, targeting it by message text.
+_warnings.filterwarnings("ignore", message=r".*torchao.*Tensor objects.*")
 
 from huggingface_hub import hf_hub_download
 from torch.nn import functional as F
@@ -528,8 +716,28 @@ def _ensure_audio_engines():
         import f5_tts  # noqa: F401 — just checking installability
     except ImportError:
         print("[AudioEngine] Installing f5-tts...")
+        # f5-tts's own metadata requires numpy<=1.26.4 while our pinned stack
+        # already satisfies everything else it needs (torch, torchaudio,
+        # transformers, accelerate, gradio, tqdm, safetensors...). Installing
+        # its declared deps verbatim just downgrades numpy and produces the
+        # noisy "pip's dependency resolver" conflict warnings against
+        # opencv-python/tifffile without fixing anything real, so we skip
+        # dependency resolution and rely on requirements.txt for the rest.
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet", "f5-tts==1.1.4"],
+            [sys.executable, "-m", "pip", "install", "--quiet",
+             "--disable-pip-version-check", "--no-deps", "f5-tts==1.1.4"],
+            check=True,
+        )
+        # Ensure the handful of f5-tts runtime deps not already covered by
+        # requirements.txt are present (small, non-conflicting packages).
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet",
+             "--disable-pip-version-check",
+             "cached_path", "click", "datasets", "ema_pytorch>=0.5.2",
+             "hydra-core>=1.3.0", "jieba", "librosa", "matplotlib",
+             "pydub", "pypinyin", "tomli", "torchdiffeq",
+             "transformers_stream_generator", "vocos", "wandb",
+             "x_transformers>=1.31.14", "bitsandbytes>0.37.0"],
             check=True,
         )
         print("[AudioEngine] f5-tts installed.")
@@ -543,11 +751,41 @@ def _ensure_audio_engines():
              str(FOLEY_REPO_DIR)],
             check=True,
         )
-        # install repo dependencies into current env
+        # Install repo dependencies into current env, but strip out lines that
+        # would clobber our pinned stack. HunyuanVideo-Foley's own
+        # requirements.txt pins gradio==3.50.2 and a git transformers branch,
+        # and repeats torch/torchvision/torchaudio/numpy. Installing those
+        # verbatim downgrades our pinned gradio==4.43.0 mid-run, which is what
+        # caused "ImportError: cannot import name 'http_server' from 'gradio'"
+        # at demo.launch() — gradio's package files ended up a mix of two
+        # incompatible versions. Everything else in that file (av, einops,
+        # omegaconf, pyyaml, scipy, timm, sentencepiece, accelerate, pandas,
+        # pyarrow, loguru, easydict, descript-audiotools, etc.) is safe to
+        # install as-is.
+        _CONFLICTING_PREFIXES = (
+            "torch", "gradio", "transformers", "numpy", "urllib3",
+        )
         req_file = FOLEY_REPO_DIR / "requirements.txt"
         if req_file.exists():
+            filtered_lines = []
+            for line in req_file.read_text().splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                pkg_spec = stripped.lower()
+                if pkg_spec.startswith("git+"):
+                    # e.g. git+https://github.com/huggingface/transformers@...
+                    if "transformers" in pkg_spec:
+                        continue
+                elif pkg_spec.startswith(_CONFLICTING_PREFIXES):
+                    continue
+                filtered_lines.append(line)
+
+            filtered_req = FOLEY_REPO_DIR / "requirements.filtered.txt"
+            filtered_req.write_text("\n".join(filtered_lines) + "\n")
             subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--quiet", "-r", str(req_file)],
+                [sys.executable, "-m", "pip", "install", "--quiet",
+                 "--disable-pip-version-check", "-r", str(filtered_req)],
                 check=True,
             )
         print("[AudioEngine] HunyuanVideo-Foley repo ready.")
@@ -1714,66 +1952,87 @@ MERGE_BG_PROMPTS = {
 
 MERGE_BG_INSTRUCTION = (
     "Keep both people exactly as they are — identical faces, facial features, hair, "
-    "body shape, proportions and skin tone. Do not alter their identities or bodies. "
+    "body shape, proportions and skin tone. Do not alter their identities or bodies, "
+    "and do not add, remove or duplicate any person. "
     "Replace the entire background and environment with: {prompt}. "
     "Relight both subjects naturally to match the new environment."
 )
 
+# Auto-appended to EVERY scene generation (presets and custom) so the caller
+# never has to describe framing/fit/placement. It guarantees both full bodies
+# are visible and correctly sized, and that they are posed naturally for the
+# scene (e.g. actually sitting ON a bed rather than floating in front of it).
+MERGE_FIT_INSTRUCTION = (
+    " Position both people naturally within the scene, correctly sized relative "
+    "to each other and to the environment, and interacting with it realistically "
+    "(for example, actually sitting or lying on the bed/furniture if the scene "
+    "has one, with proper contact and perspective). Show BOTH people's FULL "
+    "bodies head-to-toe, entirely inside the frame, with nothing cut off at any "
+    "edge. Keep both faces and bodies unchanged."
+)
 
-def _complete_body_with_qwen(rgba: Image.Image) -> Image.Image:
+
+def _complete_body_safe(rgba: Image.Image) -> Image.Image:
     """
-    Use Qwen to complete any missing body parts (cropped feet, head, etc.)
-    on a person extracted from rembg.
+    Generatively fill ONLY the missing parts of a person whose body is clipped
+    at the top (head) or bottom (feet) of their photo, WITHOUT altering a
+    single original pixel.
 
-    Strategy:
-    - Composite the subject onto a white RGB canvas at its natural size.
-    - Detect how much of the bottom and top are clipped by checking alpha rows.
-    - If the bottom N rows are fully opaque (feet hit the frame edge) or the
-      subject fills >90% of the canvas height, add padding below/above and ask
-      Qwen to fill the legs/feet / head naturally.
-    - The visible pixels are NEVER altered: we blend the Qwen output back
-      such that wherever the original alpha was >128 we keep the original pixel.
-    - Returns an RGBA image the same pixel size as the input.
+    How the original is protected:
+    - We pad transparent space only on the clipped side(s).
+    - Qwen fills the whole padded canvas, but we then hard-paste the EXACT
+      original RGBA back on top at full opacity, so every original pixel is
+      byte-for-byte unchanged. Qwen output is used ONLY inside the padded
+      (previously-empty) region.
+    - The alpha for the newly generated region is derived by re-running rembg
+      on the Qwen output and masking it to the padded region only; the
+      original alpha is preserved verbatim everywhere it existed. This avoids
+      the earlier bug where re-running rembg over the whole composite let the
+      generated alpha bleed into and mangle the visible body.
+
+    Returns an RGBA image (trimmed to its bbox). If nothing is clipped, the
+    input is returned untouched (no diffusion call → fast).
     """
     if rgba is None:
         return rgba
 
     W, H = rgba.size
     alpha_arr = np.array(rgba.split()[3], dtype=np.uint8)
-
-    bottom_rows = alpha_arr[-8:, :]
-    top_rows = alpha_arr[:8, :]
-    bottom_clipped = np.any(bottom_rows > 128)
-    top_clipped = np.any(top_rows > 128)
-
-    if not bottom_clipped and not top_clipped:
+    if alpha_arr.size == 0:
         return rgba
 
-    PAD = int(H * 0.35)
+    # A body is "clipped" on a side if opaque subject pixels touch that edge.
+    EDGE = 6
+    bottom_clipped = bool(np.any(alpha_arr[-EDGE:, :] > 128))
+    top_clipped = bool(np.any(alpha_arr[:EDGE, :] > 128))
 
-    new_h = H + (PAD if bottom_clipped else 0) + (PAD if top_clipped else 0)
+    if not bottom_clipped and not top_clipped:
+        return rgba  # full body already visible — nothing to fill
+
+    pad_bottom = int(H * 0.40) if bottom_clipped else 0
+    pad_top = int(H * 0.40) if top_clipped else 0
     new_w = W
-    top_offset = PAD if top_clipped else 0
+    new_h = H + pad_top + pad_bottom
 
-    padded = Image.new("RGBA", (new_w, new_h), (255, 255, 255, 0))
-    padded.paste(rgba, (0, top_offset), rgba)
-
+    # Compose the subject onto a white canvas with transparent padding regions.
+    padded_rgba = Image.new("RGBA", (new_w, new_h), (255, 255, 255, 0))
+    padded_rgba.paste(rgba, (0, pad_top), rgba)
     rgb_canvas = Image.new("RGB", (new_w, new_h), (255, 255, 255))
-    rgb_canvas.paste(padded.convert("RGB"), mask=padded.split()[3])
+    rgb_canvas.paste(padded_rgba.convert("RGB"), mask=padded_rgba.split()[3])
 
-    direction_parts = []
+    parts = []
     if bottom_clipped:
-        direction_parts.append("legs and feet below")
+        parts.append("legs and feet at the bottom")
     if top_clipped:
-        direction_parts.append("head and shoulders above")
-    direction = " and ".join(direction_parts)
+        parts.append("head and hair at the top")
+    what = " and ".join(parts)
 
     instruction = (
-        f"This image shows a person whose {direction} is cut off. "
-        "Complete the full body by naturally extending the missing parts. "
-        "Keep the person's face, hair, clothing, skin tone, and body proportions "
-        "exactly identical to what is already shown. Only add the missing body parts "
-        "in the white empty space. Do not change anything already visible."
+        f"The person's {what} is cropped off. Extend and complete ONLY the "
+        "missing body parts into the empty area, matching their exact skin "
+        "tone, body shape, and proportions. Do NOT change, redraw, or move any "
+        "part of the body that is already visible — keep it pixel-for-pixel "
+        "identical. Only paint into the empty space."
     )
 
     try:
@@ -1784,47 +2043,55 @@ def _complete_body_with_qwen(rgba: Image.Image) -> Image.Image:
                 result = pic_pipe(
                     image=[rgb_canvas],
                     prompt=instruction,
-                    negative_prompt="distorted, deformed, extra limbs, blurry",
+                    negative_prompt="distorted, deformed, extra limbs, mutated, blurry",
                     num_inference_steps=4,
                     true_cfg_scale=1.0,
                     generator=torch.Generator(device=PIC_DEVICE).manual_seed(
                         random.randint(0, np.iinfo(np.int32).max)
                     ),
                 )
-        completed_rgb = result.images[0]
-        if completed_rgb.size != (new_w, new_h):
-            completed_rgb = completed_rgb.resize((new_w, new_h), Image.LANCZOS)
+        gen_rgb = result.images[0]
+        if gen_rgb.size != (new_w, new_h):
+            gen_rgb = gen_rgb.resize((new_w, new_h), Image.LANCZOS)
 
-        completed_rgba = completed_rgb.convert("RGBA")
-
-        orig_alpha_padded = np.zeros((new_h, new_w), dtype=np.uint8)
-        orig_alpha_padded[top_offset:top_offset + H, :] = alpha_arr
-
-        orig_arr = np.array(padded, dtype=np.uint8)
-        comp_arr = np.array(completed_rgba, dtype=np.uint8)
-
-        mask = (orig_alpha_padded > 128).astype(np.uint8)
-        out_arr = comp_arr.copy()
-        out_arr[mask == 1] = orig_arr[mask == 1]
-
-        out_arr[:, :, 3] = 255
-
-        new_bg_alpha = np.array(
-            _remove_background_rembg(Image.fromarray(out_arr[:, :, :3])).split()[3],
-            dtype=np.uint8
+        # Alpha for the generated result (whole canvas), from rembg.
+        gen_alpha = np.array(
+            _remove_background_rembg(gen_rgb).split()[3], dtype=np.uint8
         )
-        out_arr[:, :, 3] = new_bg_alpha
+
+        # Build the output: start from the generated RGB, and give it an alpha
+        # that is (a) the ORIGINAL alpha wherever the original subject existed,
+        # and (b) the generated alpha ONLY in the padded regions.
+        out_rgb = np.array(gen_rgb.convert("RGB"), dtype=np.uint8)
+        out_alpha = np.zeros((new_h, new_w), dtype=np.uint8)
+
+        # Restrict generated alpha to the padded rows only.
+        if pad_top:
+            out_alpha[:pad_top, :] = gen_alpha[:pad_top, :]
+        if pad_bottom:
+            out_alpha[new_h - pad_bottom:, :] = gen_alpha[new_h - pad_bottom:, :]
+
+        # Original region alpha preserved verbatim.
+        out_alpha[pad_top:pad_top + H, :] = alpha_arr
+
+        out_arr = np.dstack([out_rgb, out_alpha]).astype(np.uint8)
+
+        # Hard-paste the EXACT original RGB back over its region so not one
+        # visible pixel is altered by the diffusion pass.
+        orig_rgb = np.array(rgba.convert("RGB"), dtype=np.uint8)
+        region = out_arr[pad_top:pad_top + H, :, :3]
+        orig_mask = (alpha_arr > 0)
+        region[orig_mask] = orig_rgb[orig_mask]
+        out_arr[pad_top:pad_top + H, :, :3] = region
 
         result_rgba = Image.fromarray(out_arr, mode="RGBA")
-
         bbox = result_rgba.getbbox()
         if bbox:
             result_rgba = result_rgba.crop(bbox)
-
         return result_rgba
 
     except Exception as e:
-        print(f"[merge] body completion failed ({e}), using original subject")
+        print(f"[merge] safe body completion failed ({e}); using original subject")
         return rgba
 
 
@@ -1875,20 +2142,20 @@ def _apply_merge_background(
         final.paste(merged_rgba.convert("RGB"), mask=merged_rgba.split()[3])
         return final
 
-    if bg_choice == "Person A":
-        bg = _extract_background_rgb(pil_a)
-    elif bg_choice == "Person B":
-        bg = _extract_background_rgb(pil_b)
-    else:
+    # Note: "Person A" / "Person B" are handled entirely inside merge_photos_fn
+    # (via _merge_into_person_photo) and never reach this function, so they are
+    # not handled here.
+    if True:
         prompt_text = MERGE_BG_PROMPTS.get(bg_choice)
         if not prompt_text:
             bg = Image.new("RGB", (OUT_W, OUT_H), (255, 255, 255))
         else:
             try:
-                instruction = MERGE_BG_INSTRUCTION.format(prompt=prompt_text)
+                instruction = MERGE_BG_INSTRUCTION.format(prompt=prompt_text) + MERGE_FIT_INSTRUCTION
                 white_canvas = Image.new("RGB", (OUT_W, OUT_H), (255, 255, 255))
                 base = white_canvas.copy()
-                base.paste(merged_rgba.convert("RGB"), mask=merged_rgba.split()[3])
+                _m = merged_rgba if merged_rgba.mode == "RGBA" else merged_rgba.convert("RGBA")
+                base.paste(_m.convert("RGB"), mask=_m.split()[3])
 
                 activate_pic()
                 torch.cuda.set_device(PIC_DEVICE)
@@ -1917,6 +2184,195 @@ def _apply_merge_background(
     return final
 
 
+def _complete_body_on_photo(photo: Image.Image) -> Image.Image:
+    """
+    Generatively fill ONLY the missing body parts of the person in `photo`,
+    directly on their own full photo (background kept), WITHOUT altering any
+    existing pixel. Returns an RGB photo, possibly taller than the input if
+    body parts were added at the top/bottom.
+
+    Protection of the original: Qwen fills a padded canvas, but afterwards we
+    hard-paste the EXACT original photo back over its region, so every original
+    pixel (person AND their background) is byte-for-byte unchanged. Qwen output
+    is used ONLY in the added padding rows.
+
+    If the person is not clipped at top/bottom, the photo is returned untouched
+    (no diffusion call → fast).
+    """
+    if photo is None:
+        return photo
+    rgb = photo.convert("RGB")
+
+    # Detect whether the SUBJECT touches the top/bottom edge (i.e. is clipped).
+    # Use rembg alpha so we test the person, not the background.
+    try:
+        subj_alpha = np.array(_remove_background_rembg(rgb).split()[3], dtype=np.uint8)
+    except Exception:
+        return rgb
+    if subj_alpha.size == 0:
+        return rgb
+
+    W, H = rgb.size
+    EDGE = 6
+    bottom_clipped = bool(np.any(subj_alpha[-EDGE:, :] > 128))
+    top_clipped = bool(np.any(subj_alpha[:EDGE, :] > 128))
+    if not bottom_clipped and not top_clipped:
+        return rgb  # full body already in frame — nothing to add
+
+    pad_top = int(H * 0.40) if top_clipped else 0
+    pad_bottom = int(H * 0.40) if bottom_clipped else 0
+    new_w = W
+    new_h = H + pad_top + pad_bottom
+
+    # Pad with a neutral fill; place the original photo in the middle band.
+    canvas = Image.new("RGB", (new_w, new_h), (255, 255, 255))
+    canvas.paste(rgb, (0, pad_top))
+
+    parts = []
+    if bottom_clipped:
+        parts.append("legs and feet at the bottom")
+    if top_clipped:
+        parts.append("head and hair at the top")
+    what = " and ".join(parts)
+    instruction = (
+        f"The person's {what} is cropped off. Extend and complete ONLY the "
+        "missing body parts and the surrounding background into the empty area, "
+        "matching their exact skin tone, body shape and the existing scene. Do "
+        "NOT change, move or redraw anything already visible — keep it identical. "
+        "Only paint into the empty space."
+    )
+
+    try:
+        activate_pic()
+        torch.cuda.set_device(PIC_DEVICE)
+        with torch.cuda.device(PIC_DEVICE):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                result = pic_pipe(
+                    image=[canvas],
+                    prompt=instruction,
+                    negative_prompt="distorted, deformed, extra limbs, mutated, duplicate person",
+                    num_inference_steps=4,
+                    true_cfg_scale=1.0,
+                    generator=torch.Generator(device=PIC_DEVICE).manual_seed(
+                        random.randint(0, np.iinfo(np.int32).max)
+                    ),
+                )
+        gen = result.images[0]
+        if gen.size != (new_w, new_h):
+            gen = gen.resize((new_w, new_h), Image.LANCZOS)
+        # Hard-restore the exact original photo band; keep Qwen only in padding.
+        out = gen.convert("RGB")
+        out.paste(rgb, (0, pad_top))
+        return out
+    except Exception as e:
+        print(f"[merge] on-photo body completion failed ({e}); using original photo")
+        return rgb
+
+
+def _merge_into_person_photo(
+    base_photo: Image.Image,
+    other_rgba: Image.Image,
+    add_side: str,
+) -> Image.Image:
+    """
+    Build the "Person A" / "Person B" result, in this exact order:
+
+    1. Body-complete the chosen person ON THEIR OWN PHOTO — add only any
+       missing (cropped) body parts via generative fill, without altering them
+       or their background at all. (Done by the caller via
+       _complete_body_on_photo before this function is called.)
+    2. Generative-fill (outpaint) to EXTEND their environment to one side,
+       enlarging the scene. The person and their original photo are never
+       changed — after the Qwen pass we hard-restore the full original photo
+       region, so the chosen person can NEVER be duplicated or edited; only the
+       newly added strip comes from Qwen.
+    3. The OTHER person (already body-completed) is background-removed (cropped)
+       and placed into that added space, without altering them further.
+
+    add_side = "right"  -> base photo on the LEFT,  other person on the RIGHT
+                           (used by the "Person A" option)
+    add_side = "left"   -> base photo on the RIGHT, other person on the LEFT
+                           (used by the "Person B" option)
+    """
+    OUT_W, OUT_H = 1280, 720
+
+    # --- Fit the (already body-completed) base photo to full canvas height,
+    #     anchored to one side; the opposite side stays empty for outpainting.
+    base_region_w = int(OUT_W * 0.55)
+    base_rgb = base_photo.convert("RGB")
+    scale = min(base_region_w / base_rgb.width, OUT_H / base_rgb.height)
+    bw = max(1, int(base_rgb.width * scale))
+    bh = max(1, int(base_rgb.height * scale))
+    base_fit = base_rgb.resize((bw, bh), Image.LANCZOS)
+
+    y_off = (OUT_H - bh) // 2
+    base_x = 0 if add_side == "right" else (OUT_W - bw)
+
+    canvas_rgb = Image.new("RGB", (OUT_W, OUT_H), (255, 255, 255))
+    canvas_rgb.paste(base_fit, (base_x, y_off))
+
+    # --- Outpaint the empty side so the environment extends naturally.
+    extend_dir = "to the right" if add_side == "right" else "to the left"
+    outpaint_instruction = (
+        f"Extend and continue this photo's background and environment {extend_dir} "
+        "into the empty area, seamlessly matching the existing scene, lighting, "
+        "colors and perspective. Keep everything already visible unchanged. "
+        "Do not add any people — only extend the empty background scenery."
+    )
+
+    extended_bg = canvas_rgb
+    try:
+        activate_pic()
+        torch.cuda.set_device(PIC_DEVICE)
+        with torch.cuda.device(PIC_DEVICE):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                result = pic_pipe(
+                    image=[canvas_rgb],
+                    prompt=outpaint_instruction,
+                    negative_prompt="people, person, extra person, duplicate, seam, border, frame",
+                    num_inference_steps=4,
+                    true_cfg_scale=1.0,
+                    generator=torch.Generator(device=PIC_DEVICE).manual_seed(
+                        random.randint(0, np.iinfo(np.int32).max)
+                    ),
+                )
+        gen = result.images[0]
+        if gen.size != (OUT_W, OUT_H):
+            gen = gen.resize((OUT_W, OUT_H), Image.LANCZOS)
+        extended_bg = gen
+    except Exception as e:
+        print(f"[merge] background outpaint failed ({e}); using un-extended scene")
+        extended_bg = canvas_rgb
+
+    # --- Hard-restore the ORIGINAL base photo region. This is the guarantee
+    #     against duplicating/editing the chosen person: whatever Qwen produced
+    #     inside the base region (including any hallucinated duplicate) is
+    #     overwritten by the real, unaltered base photo. Only the added strip
+    #     (outside the base region) keeps Qwen's extended scenery.
+    final = extended_bg.copy()
+    final.paste(base_fit, (base_x, y_off))
+
+    # --- Place the OTHER (cropped, body-completed) person into the added space,
+    #     scaled to match the base person's height, bottom-aligned to the base
+    #     photo's floor. They are only cropped + placed, never edited further.
+    added_w = OUT_W - bw
+    if added_w < 8:
+        added_w = OUT_W // 2  # safety fallback
+
+    target_h = min(bh, int(OUT_H * 0.95))
+    other = _scale_subject_to_fit(other_rgba, max(1, added_w - 8), target_h)
+
+    base_baseline = y_off + bh  # base photo's floor line
+    other_y = max(0, base_baseline - other.height)
+    strip_left = bw if add_side == "right" else 0
+    other_x = strip_left + max(0, (added_w - other.width) // 2)
+    other_x = max(0, min(other_x, OUT_W - other.width))
+
+    final_rgba = final.convert("RGBA")
+    final_rgba.paste(other, (other_x, other_y), other)
+    return final_rgba.convert("RGB")
+
+
 def merge_photos_fn(img_a, img_b, bg_choice: str | None = None) -> Image.Image | None:
     """
     Merge two photos side by side on a chosen background.
@@ -1924,12 +2380,14 @@ def merge_photos_fn(img_a, img_b, bg_choice: str | None = None) -> Image.Image |
     Pipeline:
     1. Remove backgrounds with BiRefNet.
     2. Trim each subject to their alpha bounding box.
-    3. If the subject is clipped at top or bottom, run Qwen to complete the
-       missing body parts — keeping the visible pixels exactly unchanged.
-    4. Scale both subjects so they fit within their respective half-canvas slot
+    3. Scale both subjects so they fit within their respective half-canvas slot
        at up to 95% canvas height, never upscaling.
-    5. Bottom-align both subjects so feet sit at the same baseline.
-    6. Composite onto the chosen background (white, Person A/B photo, or Qwen scene).
+    4. Bottom-align both subjects so feet sit at the same baseline.
+    5. Composite onto the chosen background (white, Person A/B photo, or Qwen scene).
+
+    Subjects are never regenerated — each person is composited using the exact
+    pixels rembg extracts from their original photo, so their bodies are kept
+    at 100% original quality with nothing altered or hallucinated.
     """
     if img_a is None or img_b is None:
         return None
@@ -1947,30 +2405,56 @@ def merge_photos_fn(img_a, img_b, bg_choice: str | None = None) -> Image.Image |
     rgba_a = trim_to_subject(rgba_a)
     rgba_b = trim_to_subject(rgba_b)
 
-    print("[merge] completing bodies if clipped...")
-    rgba_a = _complete_body_with_qwen(rgba_a)
-    rgba_b = _complete_body_with_qwen(rgba_b)
+    # Person A / Person B backgrounds follow this exact order:
+    #   1. body-complete the CHOSEN person on their own photo (missing parts
+    #      only, nothing else about them or their background altered),
+    #   2. outpaint to extend their environment to one side,
+    #   3. body-complete the OTHER person, crop them, and place them into the
+    #      added space without altering them further.
+    # The chosen person is never duplicated — see _merge_into_person_photo.
+    # Only the cutout that is actually used gets the (Qwen) body-completion, so
+    # no diffusion work is wasted.
+    if bg_choice == "Person A":
+        print("[merge] Person A: completing A on-photo, extending right, placing B...")
+        base_a = _complete_body_on_photo(pil_a)          # step 1
+        rgba_b = _complete_body_safe(rgba_b)             # step 3 (other person)
+        return _merge_into_person_photo(base_a, rgba_b, add_side="right")
+    if bg_choice == "Person B":
+        print("[merge] Person B: completing B on-photo, extending left, placing A...")
+        base_b = _complete_body_on_photo(pil_b)          # step 1
+        rgba_a = _complete_body_safe(rgba_a)             # step 3 (other person)
+        return _merge_into_person_photo(base_b, rgba_a, add_side="left")
+
+    # All other backgrounds (white / Qwen scene): body-complete both cutouts,
+    # then lay them out side by side. No original pixels are altered.
+    print("[merge] completing clipped bodies (missing parts only)...")
+    rgba_a = _complete_body_safe(rgba_a)
+    rgba_b = _complete_body_safe(rgba_b)
 
     OUT_W, OUT_H = 1280, 720
     SLOT_W = OUT_W // 2
     MAX_H = int(OUT_H * 0.95)
 
+    # BOTH subjects are always scaled to fit fully inside their half-canvas
+    # slot. This is what guarantees both full bodies are visible and neither
+    # person is oversized or cropped by the canvas edges — regardless of which
+    # background is chosen. (Previously the "Person A/B" options pasted that
+    # person's full-resolution photo as the background, so they appeared huge
+    # and cropped. Now they are a fitted cutout like everyone else, and their
+    # photo is only used as a soft backdrop scene behind both people.)
     rgba_a = _scale_subject_to_fit(rgba_a, SLOT_W - 8, MAX_H)
     rgba_b = _scale_subject_to_fit(rgba_b, SLOT_W - 8, MAX_H)
-
-    canvas = Image.new("RGBA", (OUT_W, OUT_H), (0, 0, 0, 0))
 
     baseline = OUT_H - int(OUT_H * 0.02)
 
     y_a = baseline - rgba_a.height
-    x_a = SLOT_W - rgba_a.width + 4
-    x_a = max(0, x_a)
-    canvas.paste(rgba_a, (x_a, y_a), rgba_a)
-
+    x_a = max(0, SLOT_W - rgba_a.width + 4)
     y_b = baseline - rgba_b.height
     x_b = SLOT_W - 4
-    canvas.paste(rgba_b, (x_b, y_b), rgba_b)
 
+    canvas = Image.new("RGBA", (OUT_W, OUT_H), (0, 0, 0, 0))
+    canvas.paste(rgba_a, (x_a, y_a), rgba_a)
+    canvas.paste(rgba_b, (x_b, y_b), rgba_b)
     return _apply_merge_background(canvas, bg_choice, pil_a, pil_b)
 
 
@@ -2562,12 +3046,12 @@ def generate_video(
     segment_bufs = []  # list[bytes] — in-memory MP4 segments
 
     try:
-        if progress:
+        if progress is not None:
             progress(0.02, desc="Preparing reference frame")
         sized = resize_image_for_wan(reference_image, resolution)
 
 
-        if progress:
+        if progress is not None:
             progress(0.10, desc="Preparing reference frame")
         start_frame = edit_reference_frame(
             sized, scene_mode, prompt,
@@ -2590,7 +3074,7 @@ def generate_video(
             is_last_segment = (remaining - seg_duration) <= 0.01
 
             seg_end = processed_end if is_last_segment else None
-            if progress:
+            if progress is not None:
                 progress(min(0.15 + 0.75 * (seg_index - 1) / max(1, int(duration_seconds / SEGMENT_DURATION + 1)), 0.90), desc=f"Generating segment {seg_index}")
             raw_frames = animate_frame(
                 current_frame, seg_end, prompt, negative_prompt,
@@ -2641,7 +3125,7 @@ def generate_video(
         filepath = _write_video_tmp(final_buf, filename)
         print(f"Done in {time.time() - started:.1f}s  {seg_index} segment(s), "
               f"seed {current_seed} -> {filename}")
-        if progress:
+        if progress is not None:
             progress(1.0, desc="Generation complete")
         _generation_release(_current_input_image_path)
         _generation_release(_end_image_protect_path)
@@ -2747,7 +3231,7 @@ def generate_sequence(
         seg_counter = 0
 
         for slot_idx, slot in enumerate(slots):
-            if progress:
+            if progress is not None:
                 progress(min(0.05 + 0.9 * seg_counter / max(1, total_segments), 0.95),
                           desc=f"Sequence part {slot_idx + 1}/{n_slots}: preparing frame")
 
@@ -2787,7 +3271,7 @@ def generate_sequence(
                 is_last_segment_of_part = (remaining - seg_duration) <= 0.01
                 seg_end = target_end if is_last_segment_of_part else None
 
-                if progress:
+                if progress is not None:
                     progress(min(0.05 + 0.9 * seg_counter / max(1, total_segments), 0.97),
                               desc=f"Sequence part {slot_idx + 1}/{n_slots}, segment {part_seg_index}")
 
@@ -2836,7 +3320,7 @@ def generate_sequence(
         filename = _media_name("vidgen_sequence", ".mp4")
         filepath = _write_video_tmp(final_buf, filename)
         print(f"Sequence done in {time.time() - started:.1f}s  {n_slots} part(s) -> {filename}")
-        if progress:
+        if progress is not None:
             progress(1.0, desc="Sequence generation complete")
         for p in protected_slot_paths:
             _generation_release(p)
@@ -2947,7 +3431,7 @@ def generate_custom_edit_sequence(
 
     try:
         for slot_idx, slot in enumerate(slots):
-            if progress:
+            if progress is not None:
                 progress(
                     min(0.05 + 0.9 * seg_counter / max(1, total_segments), 0.92),
                     desc=f"Custom seq segment {slot_idx + 1}/{n_slots}: generating last frame with picgen"
@@ -2974,7 +3458,7 @@ def generate_custom_edit_sequence(
 
             processed_end = resize_and_crop_to_match(generated_last, sized_first)
 
-            if progress:
+            if progress is not None:
                 progress(
                     min(0.05 + 0.9 * (seg_counter + 0.5) / max(1, total_segments), 0.95),
                     desc=f"Custom seq segment {slot_idx + 1}/{n_slots}: animating"
@@ -3006,7 +3490,7 @@ def generate_custom_edit_sequence(
                 is_last_segment_of_part = (remaining - seg_duration) <= 0.01
                 seg_end = processed_end if is_last_segment_of_part else None
 
-                if progress:
+                if progress is not None:
                     progress(
                         min(0.05 + 0.9 * seg_counter / max(1, total_segments), 0.97),
                         desc=f"Custom seq {slot_idx + 1}/{n_slots}, vidgen seg {part_seg_index}"
@@ -3062,7 +3546,7 @@ def generate_custom_edit_sequence(
         _cache_last_frame_from_video(filepath)
         print(f"Custom edit sequence done in {time.time() - started:.1f}s — "
               f"{n_slots} segment(s) -> {filename}")
-        if progress:
+        if progress is not None:
             progress(1.0, desc="Custom edit sequence complete")
         return filepath, filepath, gr.update(visible=False, value="")
 
@@ -4530,6 +5014,10 @@ with gr.Blocks(css=css) as demo:
                         label="Reference Photo",
                         type="filepath",
                         elem_id="vidgen-reference",
+                        # PNG (not Gradio's default webp) so right-clicking the
+                        # imported preview > "open image in new tab" displays it
+                        # inline full size instead of downloading a .webp.
+                        format="png",
                     )
                     last_frame_from_video_btn = gr.Button(
                         "Last Frame from Video", size="sm",
@@ -4736,6 +5224,7 @@ with gr.Blocks(css=css) as demo:
                               "even when the duration requires chaining multiple segments)",
                         type="filepath",
                         elem_id="end-frame-image",
+                        format="png",
                     )
                     use_last_as_first_btn = gr.Button(
                         "Use as first frame",
@@ -4774,6 +5263,7 @@ with gr.Blocks(css=css) as demo:
                             type="filepath",
                             scale=1,
                             elem_id=f"sequence-image-{_seq_i}",
+                            format="png",
                         )
                         _seq_prompt = gr.Textbox(
                             label=f"Part {_seq_i + 1} prompt",
@@ -5053,6 +5543,7 @@ with gr.Blocks(css=css) as demo:
                             sources=["upload", "clipboard"],
                             elem_id="merge-img-a",
                             height=200,
+                            format="png",
                         )
                     with gr.Column(scale=1, min_width=140):
                         merge_img_b = gr.Image(
@@ -5061,6 +5552,7 @@ with gr.Blocks(css=css) as demo:
                             sources=["upload", "clipboard"],
                             elem_id="merge-img-b",
                             height=200,
+                            format="png",
                         )
                     with gr.Column(scale=2):
                         merge_output = gr.Image(
@@ -5069,6 +5561,10 @@ with gr.Blocks(css=css) as demo:
                             interactive=False,
                             elem_id="merge-output-img",
                             height=200,
+                            # Serve full-quality PNG instead of Gradio's default
+                            # webp so "open image in new tab" displays it inline
+                            # full size rather than downloading a .webp.
+                            format="png",
                         )
                 with gr.Row():
                     merge_bg_radio = gr.Radio(
@@ -5095,6 +5591,9 @@ with gr.Blocks(css=css) as demo:
                     elem_id="merge-custom-gallery",
                     interactive=False,
                     allow_preview=False,
+                    # Serve full-quality PNG instead of Gradio's default webp so
+                    # "open image in new tab" shows the image inline full size.
+                    format="png",
                 )
                 # Tracks which gallery image the user has selected (0-indexed)
                 merge_gallery_selection = gr.State(value=None)
@@ -5139,17 +5638,27 @@ with gr.Blocks(css=css) as demo:
                         if not prompt_text:
                             raise gr.Error("Please enter a custom background prompt.")
 
-                        # Build the merged subjects on white first (no background)
-                        merged_rgba = merge_photos_fn(a, b, None)
-                        if merged_rgba is None:
-                            raise gr.Error("Merge failed — could not process images.")
-
-                        # Convert merged result to PIL RGB for pic_pipe input
+                        # Build the merged subjects on a white canvas. With
+                        # bg_choice=None, merge_photos_fn already returns a
+                        # flattened RGB 1280x720 image of both fitted subjects
+                        # on white — exactly the base pic_pipe needs. (It is
+                        # NOT an RGBA image, so we must not call .split()[3] on
+                        # it — that was the "tuple index out of range" crash.)
                         OUT_W, OUT_H = 1280, 720
-                        base = Image.new("RGB", (OUT_W, OUT_H), (255, 255, 255))
-                        base.paste(merged_rgba.convert("RGB"), mask=merged_rgba.split()[3])
+                        base = merge_photos_fn(a, b, None)
+                        if base is None:
+                            raise gr.Error("Merge failed — could not process images.")
+                        base = base.convert("RGB")
+                        if base.size != (OUT_W, OUT_H):
+                            base = base.resize((OUT_W, OUT_H), Image.LANCZOS)
 
-                        instruction = MERGE_BG_INSTRUCTION.format(prompt=prompt_text)
+                        # The user's custom prompt only needs to describe the
+                        # scene — the identity-preserving wrapper AND the
+                        # fit/placement instructions (both full bodies visible,
+                        # correctly sized, posed naturally in the scene) are
+                        # appended automatically so they don't have to include
+                        # any of that themselves.
+                        instruction = MERGE_BG_INSTRUCTION.format(prompt=prompt_text) + MERGE_FIT_INSTRUCTION
 
                         activate_pic()
                         torch.cuda.set_device(PIC_DEVICE)
@@ -5713,6 +6222,11 @@ with gr.Blocks(css=css) as demo:
                             interactive=False,
                             columns=2,
                             elem_id="picgen-result-gallery",
+                            # Serve full-quality PNG instead of Gradio's default
+                            # webp. Without this, right-click > "open image in
+                            # new tab" hands the browser a .webp it downloads
+                            # rather than displaying inline full size.
+                            format="png",
                         )
                         use_output_btn = gr.Button("Use as input", variant="secondary", size="sm")
                         pic_download_btn = gr.Button("Download Images", variant="secondary", size="sm")

@@ -37,7 +37,7 @@ echo "Installing Python dependencies..."
 $PIP install -r "$SCRIPT_DIR/requirements.txt" --break-system-packages --ignore-installed typing-extensions --no-cache-dir
 
 echo "Ensuring critical packages..."
-$PIP install Pillow "transformers>=4.50.0,<5.0" "huggingface-hub>=0.34.0,<1.0" "numpy<2.1" "diffusers>=0.33.0,<0.38.0" "safetensors>=0.4.0" torchao accelerate --break-system-packages --no-cache-dir --force-reinstall
+$PIP install Pillow "transformers>=4.52.0,<5.0" "huggingface-hub>=0.34.0,<1.0" "numpy<2.1" "diffusers>=0.33.0,<0.38.0" "safetensors>=0.4.0" torchao accelerate --break-system-packages --no-cache-dir --force-reinstall
 
 echo "Patching gradio/oauth.py for huggingface_hub >= 0.26 compatibility..."
 # huggingface_hub removed HfFolder in 0.26.0. gradio 4.43.0 still imports it at module
