@@ -61,8 +61,10 @@ for _arg in sys.argv[1:]:
     elif _flag == "picgen":
         STARTUP_MODE = "picgen"
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 os.makedirs("/dev/shm/newgen", exist_ok=True)
-os.makedirs("/root/newgen/tmp/gradio", exist_ok=True)
+os.makedirs(os.path.join(SCRIPT_DIR, "tmp", "gradio"), exist_ok=True)
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _aesgcm_check
     del _aesgcm_check
@@ -303,7 +305,6 @@ try:
 except ImportError:
     from qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 
@@ -413,7 +414,7 @@ def _media_store_release_prefix(prefix: str):
             del _media_store[k]
 
 
-VIDGEN_TMP_DIR = Path("/root/newgen/tmp/gradio")
+VIDGEN_TMP_DIR = Path(os.path.join(SCRIPT_DIR, "tmp", "gradio"))
 
 
 def _write_video_tmp(data: bytes, filename: str) -> str:
@@ -530,7 +531,7 @@ def extract_frame(video_url_or_buf, timestamp) -> str | None:
 
         pil_img = target_frame.to_image()
         filename = _media_name("extracted_frame", ".jpg")
-        fpath = os.path.join("/root/newgen/tmp/gradio", filename)
+        fpath = os.path.join(SCRIPT_DIR, "tmp", "gradio", filename)
         pil_img.save(fpath, format="JPEG", quality=95)
         print(f" [extract_frame] saved as {filename}")
         return fpath
@@ -541,17 +542,17 @@ def extract_frame(video_url_or_buf, timestamp) -> str | None:
 
 
 
-if not os.path.exists("train_log/RIFE_HDv3.py"):
+if not os.path.exists(os.path.join(SCRIPT_DIR, "train_log", "RIFE_HDv3.py")):
     print("Downloading RIFE Model...")
-    if not os.path.exists("RIFEv4.26_0921.zip"):
+    if not os.path.exists(os.path.join(SCRIPT_DIR, "RIFEv4.26_0921.zip")):
         subprocess.run([
             "wget", "-q",
             "https://huggingface.co/r3gm/RIFE/resolve/main/RIFEv4.26_0921.zip",
-            "-O", "RIFEv4.26_0921.zip"
+            "-O", os.path.join(SCRIPT_DIR, "RIFEv4.26_0921.zip")
         ], check=True)
-    subprocess.run(["unzip", "-n", "RIFEv4.26_0921.zip"], check=True)
+    subprocess.run(["unzip", "-n", os.path.join(SCRIPT_DIR, "RIFEv4.26_0921.zip")], check=True)
 
-sys.path.append(os.path.join(os.getcwd(), "train_log"))
+sys.path.append(os.path.join(SCRIPT_DIR, "train_log"))
 from train_log.RIFE_HDv3 import Model
 
 
@@ -713,8 +714,8 @@ def encode_frames_to_bytes(frames: list, fps: int, quality: int = 8) -> bytes:
 #              called via subprocess (it has no installable Python package).
 # ---------------------------------------------------------------------------
 
-FOLEY_REPO_DIR  = Path("/root/newgen/HunyuanVideo-Foley")
-FOLEY_MODEL_DIR = Path("/root/newgen/HunyuanVideo-Foley-weights")
+FOLEY_REPO_DIR  = Path(SCRIPT_DIR) / "HunyuanVideo-Foley"
+FOLEY_MODEL_DIR = Path(SCRIPT_DIR) / "HunyuanVideo-Foley-weights"
 
 # F5-TTS lives in its own venv (see _ensure_audio_engines) because its
 # dependency chain needs protobuf>=6.33.5 while HunyuanVideo-Foley's
@@ -723,7 +724,7 @@ FOLEY_MODEL_DIR = Path("/root/newgen/HunyuanVideo-Foley-weights")
 # separate site-packages means each engine's protobuf install never touches
 # the other's, and neither is affected by whatever protobuf the main app
 # process happened to import first.
-F5_VENV_DIR = Path("/root/newgen/.f5tts-venv")
+F5_VENV_DIR = Path(SCRIPT_DIR) / ".f5tts-venv"
 F5_VENV_PY  = F5_VENV_DIR / "bin" / "python"
 
 _AUDIO_ENGINE_AVAILABLE = False   # set True once both engines verified usable
@@ -769,6 +770,27 @@ def _ensure_audio_engines():
     # after import never takes effect in the same process. So F5-TTS gets
     # its own venv (like HunyuanVideo-Foley gets its own subprocess/cwd) and
     # is invoked as a subprocess via _run_f5tts(), never imported in-process.
+    # If the venv exists but has a broken f5-tts install (e.g. 1.1.4 with
+    # missing configs/), reinstall the correct version automatically.
+    if F5_VENV_PY.exists():
+        _f5_check = subprocess.run(
+            [str(F5_VENV_PY), "-c",
+             "from f5_tts.api import F5TTS; import pathlib, f5_tts; "
+             "p=pathlib.Path(f5_tts.__file__).parent/'configs'/'F5-TTS.yaml'; "
+             "exit(0 if p.exists() else 1)"],
+            capture_output=True,
+        )
+        if _f5_check.returncode != 0:
+            print("[AudioEngine] f5-tts configs missing in existing venv — reinstalling correct version...")
+            result = subprocess.run(
+                [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
+                 "--disable-pip-version-check", "f5-tts==1.1.22", "openai-whisper"],
+            )
+            if result.returncode == 0:
+                print("[AudioEngine] f5-tts reinstalled.")
+            else:
+                print("[AudioEngine] f5-tts reinstall failed — worker will write missing yaml at runtime.")
+
     if not F5_VENV_PY.exists():
         # Deliberately NOT --system-site-packages: if the venv could see the
         # main env's protobuf, pip would treat it as "already satisfied" and
@@ -789,9 +811,17 @@ def _ensure_audio_engines():
              "--disable-pip-version-check", "torch", "torchaudio"],
             check=True,
         )
+        # 1.1.22: latest stable. configs/ may not be bundled by pip, but the
+        # worker script writes the missing yaml itself at runtime if needed.
         subprocess.run(
             [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-             "--disable-pip-version-check", "f5-tts==1.1.4"],
+             "--disable-pip-version-check", "f5-tts==1.1.22"],
+        )
+        # openai-whisper: auto-transcribes the reference clip so F5-TTS knows
+        # the language and content of the voice sample it is cloning from.
+        subprocess.run(
+            [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
+             "--disable-pip-version-check", "openai-whisper"],
             check=True,
         )
         print("[AudioEngine] F5-TTS venv ready.")
@@ -879,25 +909,85 @@ def _ensure_audio_engines():
     print("[AudioEngine] Dual audio engine ready (F5-TTS + HunyuanVideo-Foley).")
 
 
-F5_INFER_SCRIPT = Path("/root/newgen/.f5tts_infer_worker.py")
+F5_INFER_SCRIPT = Path(SCRIPT_DIR) / ".f5tts_infer_worker.py"
 
 _F5_INFER_WORKER_SOURCE = '''\
 """Standalone F5-TTS inference worker. Run inside F5_VENV_PY only.
-Isolated from the main app process/site-packages -- see _ensure_audio_engines
-in app.py for why. Args: ref_file gen_text out_wav
+Args: <json_payload_file>
+JSON keys: ref_file, gen_text, out_wav, ref_text (optional)
 """
-import sys
+import sys, json, os, pathlib, importlib.util
+
+def find_f5_pkg_dir():
+    spec = importlib.util.find_spec("f5_tts")
+    if spec and spec.submodule_search_locations:
+        return pathlib.Path(list(spec.submodule_search_locations)[0])
+    import f5_tts
+    if getattr(f5_tts, "__file__", None):
+        return pathlib.Path(f5_tts.__file__).parent
+    return pathlib.Path(list(f5_tts.__path__)[0])
+
+def ensure_config():
+    pkg_dir  = find_f5_pkg_dir()
+    cfg_dir  = pkg_dir / "configs"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg_file = cfg_dir / "F5TTS_v1_Base.yaml"
+    if not cfg_file.exists():
+        # Exact structure required by api.py:
+        #   model_cfg.model.backbone  -> class name under f5_tts.model.*
+        #   model_cfg.model.arch      -> kwargs passed to model constructor
+        #   model_cfg.model.mel_spec  -> mel spectrogram settings
+        cfg_lines = [
+            "model:",
+            "  backbone: DiT",
+            "  arch:",
+            "    dim: 1024",
+            "    depth: 22",
+            "    heads: 16",
+            "    ff_mult: 2",
+            "    text_dim: 512",
+            "    conv_layers: 4",
+            "  mel_spec:",
+            "    target_sample_rate: 24000",
+            "    n_mel_channels: 100",
+            "    hop_length: 256",
+            "    win_length: 1024",
+            "    n_fft: 1024",
+            "    mel_spec_type: vocos",
+        ]
+        cfg_file.write_text(chr(10).join(cfg_lines) + chr(10))
+        print(f"[F5Worker] Wrote {cfg_file}")
+    return cfg_file
 
 def main():
-    ref_file, gen_text, out_wav = sys.argv[1], sys.argv[2], sys.argv[3]
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        p = json.load(fh)
+
+    ref_file = p["ref_file"]
+    gen_text = p["gen_text"]
+    out_wav  = p["out_wav"]
+    ref_text = p.get("ref_text", "").strip()
+
+    if not ref_text:
+        try:
+            import whisper
+            result = whisper.load_model("base").transcribe(ref_file, language="en")
+            ref_text = result.get("text", "").strip()
+            print(f"[F5Worker] ref_text: {ref_text!r}")
+        except Exception as e:
+            print(f"[F5Worker] Whisper failed ({e}), using empty ref_text.")
+            ref_text = ""
+
+    ensure_config()
+
     from f5_tts.api import F5TTS
-    model = F5TTS(model="F5-TTS")
+    model = F5TTS(model="F5TTS_v1_Base")
     model.infer(
         ref_file=ref_file,
-        ref_text="",
+        ref_text=ref_text,
         gen_text=gen_text,
         file_wave=out_wav,
-        remove_silence=False,
+        remove_silence=True,
     )
 
 if __name__ == "__main__":
@@ -908,17 +998,27 @@ if __name__ == "__main__":
 def _run_f5tts(ref_file: str, gen_text: str, out_wav: str) -> bool:
     """Run F5-TTS voice cloning in its isolated venv via subprocess.
 
+    Passes all arguments via a JSON temp file so spaces / special characters
+    in gen_text are never mangled by shell argument splitting.
+
     Returns True if out_wav was produced with nonzero size.
     """
     if not F5_VENV_PY.exists():
         print("[AudioEngine] F5-TTS venv missing, skipping voice track.")
         return False
-    if not F5_INFER_SCRIPT.exists():
-        F5_INFER_SCRIPT.write_text(_F5_INFER_WORKER_SOURCE)
+    # Always rewrite the worker script so fixes take effect without a server restart
+    F5_INFER_SCRIPT.write_text(_F5_INFER_WORKER_SOURCE)
 
-    cmd = [str(F5_VENV_PY), str(F5_INFER_SCRIPT), ref_file, gen_text, out_wav]
+    # Write payload to a temp JSON file — avoids ALL shell-splitting issues
+    import tempfile
+    payload = {"ref_file": ref_file, "gen_text": gen_text, "out_wav": out_wav}
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tf:
+        json.dump(payload, tf)
+        payload_path = tf.name
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        cmd = [str(F5_VENV_PY), str(F5_INFER_SCRIPT), payload_path]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             print(f"[AudioEngine] F5-TTS worker stderr: {result.stderr[-2000:]}")
             return False
@@ -929,6 +1029,11 @@ def _run_f5tts(ref_file: str, gen_text: str, out_wav: str) -> bool:
     except Exception as e:
         print(f"[AudioEngine] F5-TTS worker error: {e}")
         return False
+    finally:
+        try:
+            os.unlink(payload_path)
+        except Exception:
+            pass
 
 
 def _run_foley(video_path: str, sfx_prompt: str, output_wav: str) -> bool:
@@ -4478,7 +4583,7 @@ def _do_clear_storage():
     count = 0
 
     import glob as _glob
-    _tmp = "/root/newgen/tmp/gradio"
+    _tmp = os.path.join(SCRIPT_DIR, "tmp", "gradio")
     import time as _time
     _now = _time.time()
     for _pat in (
@@ -4505,7 +4610,6 @@ def _do_clear_storage():
     _media_store_release_prefix("extracted_frame_")
 
     for gradio_dir in [
-        Path("/root/newgen/tmp/gradio"),
         Path(SCRIPT_DIR) / "tmp" / "gradio",
     ]:
         if gradio_dir.exists():
@@ -4654,7 +4758,7 @@ def infer(
     print(f"  pipeline call took {time.time() - _t_pipe:.2f}s")
 
     import os as _os
-    _shm_dir = "/root/newgen/tmp/gradio"
+    _shm_dir = os.path.join(SCRIPT_DIR, "tmp", "gradio")
     _os.makedirs(_shm_dir, exist_ok=True)
     if not _os.path.isdir(_shm_dir):
         _shm_dir = _os.path.join(_os.environ.get("TMPDIR", "/tmp"), "picgen_out")
@@ -5270,7 +5374,6 @@ with gr.Blocks(css=css) as demo:
 
         cleaned = 0
         for gradio_dir in [
-            Path("/root/newgen/tmp/gradio"),
             Path(SCRIPT_DIR) / "tmp" / "gradio",
         ]:
             if gradio_dir.exists():
@@ -7456,7 +7559,7 @@ if __name__ == "__main__":
             server_name="0.0.0.0",
             server_port=7860,
             share=False,
-            allowed_paths=[SCRIPT_DIR, "/root/newgen/tmp/gradio"],
+            allowed_paths=[SCRIPT_DIR, os.path.join(SCRIPT_DIR, "tmp", "gradio")],
         )
     else:
         if STARTUP_MODE == "vidgen":
@@ -7468,7 +7571,7 @@ if __name__ == "__main__":
             server_name="0.0.0.0",
             server_port=7860,
             share=False,
-            allowed_paths=[SCRIPT_DIR, "/root/newgen/tmp/gradio"],
+            allowed_paths=[SCRIPT_DIR, os.path.join(SCRIPT_DIR, "tmp", "gradio")],
         )
 
         def _bg_load():
