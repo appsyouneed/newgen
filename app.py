@@ -9504,99 +9504,100 @@ window.__openOutpaintPopup = function() {
         // Export the padded canvas as JPEG base64
         const exportB64 = cvs.toDataURL('image/jpeg', 0.95);
 
-        // 1. Replace gallery with ONLY this one padded image — clear everything
-        // else first, then push exactly one entry. Suppress the syncToGradio
-        // feedback so the hidden_images_b64.change handler doesn't fire and
-        // re-add a second image on top of the one we're setting here.
+        // 1. Replace gallery input with ONLY the padded canvas image.
+        // Suppress syncToGradio feedback so the hidden_images_b64.change
+        // handler cannot fire and add a second copy on top.
         window.__picgenSuppressSync = true;
         try {
-            if (window.__picgenImages) {
-                window.__picgenImages.length = 0;
-            }
+            if (window.__picgenImages) window.__picgenImages.length = 0;
             if (window.__replaceImages) {
                 window.__replaceImages(exportB64, 'outpaint_input.jpg');
             } else if (window.__addImage) {
                 window.__addImage(exportB64, 'outpaint_input.jpg');
             }
         } finally {
-            // Re-enable sync, then do ONE explicit sync so Gradio sees the
-            // final single-image state without triggering the change handler
-            // feedback loop (the change handler itself checks __picgenSuppressSync).
             window.__picgenSuppressSync = false;
-            // Manually write the correct value to the hidden textbox without
-            // going through syncToGradio (which would fire change events again).
-            // We update it directly so Gradio has the right state for Generate.
+            // One explicit write to the hidden textbox using only 'input' (not
+            // 'change') so Gradio reads the correct value at generate-time but
+            // the .change JS handler (which listens for 'change') never fires.
             const _imgs = window.__picgenImages || [];
-            const _b64arr = _imgs.map(img => img.b64);
             const _container = document.getElementById('hidden-images-b64');
             if (_container) {
                 _container.querySelectorAll('input,textarea').forEach(el => {
                     const _proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
                     const _ns = Object.getOwnPropertyDescriptor(_proto, 'value');
                     if (_ns && _ns.set) {
-                        _ns.set.call(el, JSON.stringify(_b64arr));
-                        // Only fire 'input' — NOT 'change', to avoid triggering
-                        // the hidden_images_b64.change Gradio handler again.
+                        _ns.set.call(el, JSON.stringify(_imgs.map(i => i.b64)));
                         el.dispatchEvent(new Event('input', {bubbles:true, composed:true}));
                     }
                 });
             }
         }
 
-        // 2. Set the prompt textbox
-        const promptEl = document.querySelector('#col-container textarea');
-        // Find all textareas in the picgen column and set the first visible one
-        // (the prompt textarea). Use native setter so React/Vue state fires.
-        const allTA = Array.from(document.querySelectorAll('textarea'));
-        const promptTA = allTA.find(el => {
-            const lbl = el.closest('.block, label')?.querySelector('label span, span.svelte-1gfkn6j');
-            return !lbl || lbl.textContent.trim() !== 'Motion & Scene Prompt';
-        });
-        // More reliable: look for the textarea whose parent label contains "Prompt"
-        // and is inside the picgen tab
-        const picgenTab = document.getElementById('col-container');
-        if (picgenTab) {
-            const tas = picgenTab.querySelectorAll('textarea');
-            // The first textarea in the picgen column is the prompt
-            if (tas.length > 0) {
-                const ta = tas[0];
-                const ns = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
-                if (ns && ns.set) {
-                    ns.set.call(ta, PROMPT);
-                    ta.dispatchEvent(new Event('input',  {bubbles:true, composed:true}));
-                    ta.dispatchEvent(new Event('change', {bubbles:true, composed:true}));
-                }
+        // 2. Write the exact prompt text into the visible Prompt textarea so
+        // the normal Generate flow reads it from there — no custom pipeline.
+        // Find the Prompt textarea inside col-container: it is the one whose
+        // nearest label text is "Prompt" (not "Negative Prompt").
+        const picgenCol = document.getElementById('col-container');
+        let promptTA = null;
+        if (picgenCol) {
+            const allTA = Array.from(picgenCol.querySelectorAll('textarea'));
+            // Walk each textarea and check its label
+            for (const ta of allTA) {
+                const block = ta.closest('.block') || ta.closest('label') || ta.parentElement;
+                const labelEl = block ? block.querySelector('label span, .label-wrap span') : null;
+                const labelText = labelEl ? labelEl.textContent.trim().toLowerCase() : '';
+                // "Prompt" but not "Negative Prompt"
+                if (labelText === 'prompt') { promptTA = ta; break; }
+            }
+            // Fallback: first textarea in col-container that isn't the negative prompt
+            if (!promptTA && allTA.length > 0) {
+                promptTA = allTA.find(ta => {
+                    const block = ta.closest('.block') || ta.parentElement;
+                    const lbl = block ? (block.querySelector('label span, .label-wrap span') || {}).textContent || '' : '';
+                    return !lbl.toLowerCase().includes('negative');
+                }) || allTA[0];
+            }
+        }
+        if (promptTA) {
+            const ns = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+            if (ns && ns.set) {
+                ns.set.call(promptTA, PROMPT);
+                promptTA.dispatchEvent(new Event('input',  {bubbles:true, composed:true}));
+                promptTA.dispatchEvent(new Event('change', {bubbles:true, composed:true}));
             }
         }
 
-        // 3. Set num_images_per_prompt to 4
-        // Find the "Number of images" slider and set to 4
-        const sliders = document.querySelectorAll('input[type="range"]');
-        sliders.forEach(sl => {
-            const label = sl.closest('.block')?.querySelector('label span');
-            if (label && label.textContent.includes('Number of images')) {
-                const ns = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-                if (ns && ns.set) {
-                    ns.set.call(sl, '4');
-                    sl.dispatchEvent(new Event('input',  {bubbles:true, composed:true}));
-                    sl.dispatchEvent(new Event('change', {bubbles:true, composed:true}));
+        // 3. Set the Number of images slider to 4.
+        if (picgenCol) {
+            const sliders = picgenCol.querySelectorAll('input[type="range"]');
+            sliders.forEach(sl => {
+                const block = sl.closest('.block');
+                const lbl = block ? block.querySelector('label span') : null;
+                if (lbl && lbl.textContent.includes('Number of images')) {
+                    const ns = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+                    if (ns && ns.set) {
+                        ns.set.call(sl, '4');
+                        sl.dispatchEvent(new Event('input',  {bubbles:true, composed:true}));
+                        sl.dispatchEvent(new Event('change', {bubbles:true, composed:true}));
+                    }
                 }
-            }
-        });
+            });
+        }
 
-        // 4. Close popup
+        // 4. Close the popup.
         _close();
 
-        // 5. Click the Generate button (small delay so syncToGradio propagates)
+        // 5. Click the Generate button. A small delay lets the Gradio component
+        // state settle from the events fired above before generation starts.
         setTimeout(() => {
-            // Find the top Generate button in the picgen column
             const genBtn = Array.from(document.querySelectorAll('button')).find(b =>
                 b.textContent.trim() === 'Generate' &&
                 b.id !== 'ng-op-generate' &&
                 b.closest('#col-container')
             );
             if (genBtn) genBtn.click();
-        }, 120);
+        }, 150);
     });
 
     // ── populate from gallery if image already there ──────────────────────────
