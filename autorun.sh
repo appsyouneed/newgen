@@ -14,7 +14,23 @@ APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP="$APP_DIR/app.py"
 LOG="$APP_DIR/newgen.log"
 PID_FILE="$APP_DIR/app.pid"
-PYTHON="${PYTHON:-python3}"
+APP_VENV="$APP_DIR/.app-venv"
+
+# Prefer the isolated venv python (has all deps installed by setup.sh).
+# Fall back to the PYTHON env var or bare python3 only if the venv doesn't exist.
+# IMPORTANT: do NOT export PYTHONPATH pointing at the system site-packages here.
+# setup.sh places directory symlinks for torch/torchvision/torchaudio inside the
+# venv's own site-packages AND writes a zzz_system_torch_path.pth file so
+# sys.path already includes the system torch location at runtime — no PYTHONPATH
+# needed.  A PYTHONPATH export pointing at the whole system dist-packages dir
+# would shadow every same-named package in the venv with the system copy (e.g.
+# it would make the app import system diffusers 0.33.1 instead of the venv's
+# correctly-installed 0.37.1).
+if [ -f "$APP_VENV/bin/python" ]; then
+    PYTHON="$APP_VENV/bin/python"
+else
+    PYTHON="${PYTHON:-python3}"
+fi
 
 is_running() {
     [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
@@ -30,8 +46,8 @@ do_stop() {
         fi
         rm -f "$PID_FILE"
     fi
-    # Also catch anything missed (nohup, direct python3, etc.)
-    pkill -f "python.*app\.py" 2>/dev/null || true
+    # Also catch anything missed (nohup, direct python3, venv python, etc.)
+    pkill -f "app\.py" 2>/dev/null || true
     echo "[autorun] Stopped."
 }
 

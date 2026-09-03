@@ -4,6 +4,20 @@
 After each generation the VPS queues the finished .mp4 on GET /autorun/download.
 This feeder fetches it, writes it to --download-dir (default: D:\\Apps\\newgen\\downloads),
 and only then POSTs /autorun/ready so the VPS knows it can accept the next image.
+
+State machine on the VPS (app.py):
+  idle  ->  (user clicks Start Push Autorun)  ->  ready
+  ready ->  (feeder POSTs /autorun/push)       ->  busy
+  busy  ->  (generation finishes)              ->  done   (video available on /autorun/download)
+  done  ->  (feeder POSTs /autorun/ready)      ->  ready  (clears done, accepts next push)
+
+The feeder must:
+  1. Wait for state == "ready"  (app is accepting images)
+  2. POST /autorun/push         (sends image, state -> busy)
+  3. Wait for state == "done"   (generation finished, video queued)
+  4. GET  /autorun/download     (pull the .mp4 while state is still "done")
+  5. POST /autorun/ready        (signal app to go back to "ready" for next image)
+  6. Repeat for next image
 """
 import argparse
 import json
@@ -29,7 +43,7 @@ def request_json(port, path, method="GET", body=None, headers=None):
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read())
     except urllib.error.HTTPError as error:
-        return {"error": error.read().decode(errors="replace")}
+        return {"error": error.read().decode(errors="replace"), "http_status": error.code}
     except Exception as error:
         return {"error": str(error)}
 
@@ -52,18 +66,26 @@ def send_image(port, path):
     )
 
 
-def download_video(port, download_dir, timeout=120):
+def download_video(port, download_dir, timeout=300):
     """
     Pull the finished .mp4 from GET /autorun/download and save it locally.
-    Polls until the endpoint has a video ready (VPS queues it after generation).
+
+    The VPS queues the video in memory as soon as generation completes (state
+    transitions to "done").  This function polls until the video is available
+    (HTTP 200) or until `timeout` seconds elapse.
+
+    IMPORTANT: this must be called BEFORE POST /autorun/ready.  The /ready
+    signal clears the "done" state and moves the app back to "ready" so it
+    can accept the next image.  Downloading after signalling ready creates a
+    race where the video bytes may already be cleared.
+
     Returns the local Path on success, None on failure.
     """
     deadline = time.monotonic() + timeout
+    last_print = 0.0
     while time.monotonic() < deadline:
         try:
-            req = urllib.request.Request(
-                endpoint(port, "download"), method="GET"
-            )
+            req = urllib.request.Request(endpoint(port, "download"), method="GET")
             with urllib.request.urlopen(req, timeout=60) as resp:
                 if resp.status != 200:
                     time.sleep(2)
@@ -89,56 +111,110 @@ def download_video(port, download_dir, timeout=120):
                         f.write(chunk)
                 print(f"  [feeder] Downloaded -> {dest} ({dest.stat().st_size // 1024} KB)")
                 return dest
+
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                # Not ready yet — generation still in progress
-                print("  [feeder] Waiting for video to be ready for download…")
-                time.sleep(3)
+                # Video not queued yet — generation may still be finalising
+                now = time.monotonic()
+                if now - last_print >= 10:
+                    print("  [feeder] Waiting for video to be queued for download…")
+                    last_print = now
+                time.sleep(2)
                 continue
             print(f"  [feeder] Download HTTP error {e.code}: {e.read().decode(errors='replace')}")
             return None
         except Exception as e:
             print(f"  [feeder] Download error: {e}")
             time.sleep(3)
+
     print("  [feeder] Timed out waiting for video download.")
     return None
 
 
 def signal_ready(port):
-    """POST /autorun/ready to tell the VPS it may accept the next image."""
+    """POST /autorun/ready — tells the VPS to transition done -> ready."""
     return request_json(port, "ready", method="POST")
 
 
-def state(port):
+def get_state(port):
     result = request_json(port, "status")
+    if "error" in result:
+        return None  # tunnel/app unreachable
     return result.get("state")
 
 
-def wait_for(port, expected, timeout=900):
+def wait_for(port, expected, timeout=1800, label=None):
+    """
+    Poll /autorun/status until state == expected or timeout expires.
+
+    Prints a progress line at most once every 15 seconds so the terminal
+    isn't spammed during long generations, but still shows life signs.
+
+    Returns True if reached, False on timeout.
+    """
     deadline = time.monotonic() + timeout
+    last_print = 0.0
     while time.monotonic() < deadline:
-        current = state(port)
+        current = get_state(port)
         if current == expected:
             return True
-        if current is None:
-            print("  [feeder] App/tunnel unavailable; retrying…")
-        else:
-            print(f"  [feeder] state={current!r}; waiting for {expected!r}")
+        now = time.monotonic()
+        if now - last_print >= 15:
+            if current is None:
+                print("  [feeder] App/tunnel unreachable — retrying…")
+            else:
+                msg = label or f"waiting for state={expected!r}"
+                print(f"  [feeder] state={current!r}  ({msg})")
+            last_print = now
         time.sleep(2)
     return False
 
 
 def main():
     parser = argparse.ArgumentParser(description="NewGen Push Autorun feeder")
-    parser.add_argument("--folder", default="./autorun")
-    parser.add_argument("--port", type=int, default=7861)
-    parser.add_argument("--pause", type=float, default=0)
-    parser.add_argument("--once", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--folder",
+        default="./autorun",
+        help="Folder containing input images (default: ./autorun)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=7861,
+        help="Local port the SSH tunnel forwards to (default: 7861)",
+    )
+    parser.add_argument(
+        "--pause",
+        type=float,
+        default=0,
+        help="Extra seconds to wait between images (default: 0)",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Process only the first image then exit",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List images that would be sent but do not send them",
+    )
     parser.add_argument(
         "--download-dir",
         default=r"D:\Apps\newgen\downloads",
-        help="Local folder where finished .mp4 files are saved (default: D:\\Apps\\newgen\\downloads)",
+        help="Local folder where finished .mp4 files are saved",
+    )
+    parser.add_argument(
+        "--gen-timeout",
+        type=int,
+        default=1800,
+        help="Seconds to wait for a single generation to complete (default: 1800)",
+    )
+    parser.add_argument(
+        "--dl-timeout",
+        type=int,
+        default=300,
+        help="Seconds to wait for the video download after generation (default: 300)",
     )
     args = parser.parse_args()
 
@@ -146,59 +222,98 @@ def main():
     if not folder.is_dir():
         print(f"[feeder] Folder not found: {folder}")
         return 1
+
     images = sorted(
         [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED],
         key=lambda p: p.name.casefold(),
     )
     if not images:
-        print(f"[feeder] No supported images in {folder}")
+        print(f"[feeder] No supported images ({', '.join(SUPPORTED)}) found in {folder}")
         return 1
+
+    if args.once:
+        images = images[:1]
 
     print(f"[feeder] Found {len(images)} image(s) in {folder}:")
     for i, image in enumerate(images, 1):
         print(f"  {i:3}. {image.name}")
+
     if args.dry_run:
         print("[feeder] Dry run — nothing sent.")
         return 0
 
-    print("[feeder] Waiting for app/tunnel…")
-    while state(args.port) is None:
-        time.sleep(5)
-    print("[feeder] App reachable. Click Start Push Autorun in the app.")
-    if not wait_for(args.port, "ready"):
-        print("[feeder] Timed out waiting for initial ready state.")
+    # ------------------------------------------------------------------ #
+    #  Wait for the app/tunnel to be reachable                            #
+    # ------------------------------------------------------------------ #
+    print("[feeder] Waiting for app/tunnel to be reachable…")
+    try:
+        while get_state(args.port) is None:
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print("\n[feeder] Interrupted — exiting.")
         return 1
 
-    for i, image in enumerate(images, 1):
-        print(f"\n[feeder] Pushing {i}/{len(images)}: {image.name}")
-        result = send_image(args.port, image)
-        if "error" in result:
-            print(f"[feeder] Push failed: {result['error']}")
-            return 1
-        print("[feeder] Accepted; waiting for generation to finish…")
+    print("[feeder] App reachable.")
+    print("[feeder] Waiting for state=ready — click [Start Push Autorun] in the app if you haven't yet.")
 
-        # Wait until the VPS transitions to "done" (video queued, storage cleared).
-        if not wait_for(args.port, "done"):
-            print("[feeder] Timed out waiting for generation to complete.")
+    try:
+        if not wait_for(args.port, "ready", timeout=900,
+                        label="waiting for user to click Start Push Autorun"):
+            print("[feeder] Timed out waiting for initial ready state.")
             return 1
 
-        # Pull the finished video from the VPS to the local download folder.
-        print(f"[feeder] Generation done — downloading video to {args.download_dir}")
-        dest = download_video(args.port, args.download_dir)
-        if dest is None:
-            print("[feeder] Warning: could not download video — signalling ready anyway.")
+        for i, image in enumerate(images, 1):
+            print(f"\n[feeder] ── Image {i}/{len(images)}: {image.name} ──")
 
-        # Tell the VPS it can accept the next image.
-        sig = signal_ready(args.port)
-        if "error" in sig:
-            print(f"[feeder] /autorun/ready signal failed: {sig['error']}")
-            return 1
-        print("[feeder] VPS signalled ready for next image.")
+            # ---- Push the image ----------------------------------------
+            result = send_image(args.port, image)
+            if "error" in result:
+                print(f"[feeder] Push failed: {result['error']}")
+                return 1
+            print(f"[feeder] Accepted by VPS. Waiting for generation to finish…")
 
-        if args.pause and i < len(images):
-            time.sleep(args.pause)
+            # ---- Wait for generation to complete (state: busy -> done) ---
+            if not wait_for(args.port, "done", timeout=args.gen_timeout,
+                            label="generating video"):
+                print("[feeder] Timed out waiting for generation to complete.")
+                return 1
+            print("[feeder] Generation done.")
+
+            # ---- Download the finished video BEFORE signalling ready -----
+            # (signalling ready clears the done state and the app may accept
+            # the next push immediately, racing with our download attempt)
+            print(f"[feeder] Downloading video to {args.download_dir}…")
+            dest = download_video(args.port, args.download_dir, timeout=args.dl_timeout)
+            if dest is None:
+                print("[feeder] Warning: video download failed — still signalling ready to unblock the VPS.")
+
+            # ---- Signal the VPS: ready for next image --------------------
+            sig = signal_ready(args.port)
+            if "error" in sig:
+                print(f"[feeder] /autorun/ready signal failed: {sig['error']}")
+                return 1
+            print("[feeder] VPS signalled ready for next image.")
+
+            if args.pause and i < len(images):
+                print(f"[feeder] Pausing {args.pause}s before next image…")
+                time.sleep(args.pause)
+
+            # ---- Wait for VPS to confirm it's ready for the next push ----
+            # (state transitions done -> ready after /autorun/ready is POSTed;
+            # this wait ensures we don't push the next image before the VPS
+            # has processed the ready signal and looped back)
+            if i < len(images):
+                if not wait_for(args.port, "ready", timeout=60,
+                                label="waiting for VPS to confirm ready"):
+                    print("[feeder] VPS didn't return to ready in time — proceeding anyway.")
+
+    except KeyboardInterrupt:
+        print("\n[feeder] Interrupted — cancelling push autorun on VPS…")
+        request_json(args.port, "cancel", method="POST")
+        return 1
 
     print(f"\n[feeder] ✓ All {len(images)} image(s) processed successfully.")
+    print(f"[feeder] Videos saved to: {args.download_dir}")
     return 0
 
 

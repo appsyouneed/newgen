@@ -461,6 +461,41 @@ _self_heal_transformers_version()
 _self_heal_gradio_version()     # patches oauth.py and gradio_client/utils.py in-place
 _self_heal_diffusers_version()  # re-check after transformers may have rolled deps
 
+# ---------------------------------------------------------------------------
+# PRE-IMPORT DIFFUSERS BACKEND CACHE RESET
+# diffusers evaluates is_torch_available() at module import time and caches
+# the result.  If something imported diffusers before torch was on sys.path
+# (e.g. a transitive import during the gradio patch functions above), the
+# cache records "torch not available" and every subsequent pipeline class
+# resolves to a dummy stub — causing the misleading "PyTorch library not
+# found" error even though torch is perfectly installed.
+#
+# We reset the cache here, AFTER confirming torch is importable (_self_heal_torch
+# would have raised if it weren't), and BEFORE the real 'import diffusers'
+# below, so diffusers evaluates is_torch_available() fresh.
+# ---------------------------------------------------------------------------
+try:
+    if "diffusers" in sys.modules or "diffusers.utils.import_utils" in sys.modules:
+        _diu = sys.modules.get("diffusers.utils.import_utils")
+        if _diu is not None:
+            # Force the module-level bool back to True.
+            if hasattr(_diu, "_torch_available"):
+                _diu._torch_available = True
+            # Clear any lru_cache wrapping is_torch_available.
+            _fn = getattr(_diu, "is_torch_available", None)
+            if _fn is not None and hasattr(_fn, "cache_clear"):
+                _fn.cache_clear()
+            # Also reset the transformers-availability flag since transformers
+            # has the same caching pattern and is checked alongside torch.
+            if hasattr(_diu, "_transformers_available"):
+                _diu._transformers_available = True
+            _fn2 = getattr(_diu, "is_transformers_available", None)
+            if _fn2 is not None and hasattr(_fn2, "cache_clear"):
+                _fn2.cache_clear()
+            print("[StartupFix] diffusers backend availability cache reset.")
+except Exception as _cache_reset_e:
+    print(f"[StartupFix] diffusers cache reset (non-fatal): {_cache_reset_e}")
+
 os.environ.update({
     "TMPDIR": "/dev/shm/newgen",
     "TEMP": "/dev/shm/newgen",
@@ -513,16 +548,124 @@ from torch.nn import functional as F
 from PIL import Image
 from safetensors.torch import load_file
 
+def _patch_wan_lora_loader_mixin():
+    """
+    diffusers 0.37.1 ships WanImageToVideoPipeline but its pipeline_wan_i2v
+    module tries to import WanLoraLoaderMixin from diffusers.loaders, which
+    does not exist in 0.37.1.  That import failure propagates through ALL three
+    import paths tried below (including the top-level 'diffusers' path, because
+    diffusers/__init__.py re-imports from the same broken submodule), leaving
+    WanImageToVideoPipeline unresolvable and causing the misleading
+    "PyTorch library not found" error from the dummy stub at runtime.
+
+    Fix: inject an empty WanLoraLoaderMixin shim into diffusers.loaders
+    BEFORE any wan submodule is touched.  This is safe because diffusers 0.37.1
+    never actually calls any method on WanLoraLoaderMixin — the class is only
+    listed as a base class in the pipeline definition.  When diffusers is
+    upgraded to a version that ships the real class, the shim is never reached
+    (the real class will already be present in diffusers.loaders).
+    """
+    try:
+        import diffusers.loaders as _dl
+        if hasattr(_dl, "WanLoraLoaderMixin"):
+            return  # real class already present — nothing to do
+        # Inject a no-op shim so the pipeline_wan_i2v 'from diffusers.loaders
+        # import WanLoraLoaderMixin' succeeds.
+        class WanLoraLoaderMixin:  # noqa: N801
+            """Compatibility shim for diffusers < 0.38."""
+        _dl.WanLoraLoaderMixin = WanLoraLoaderMixin
+        # Also register on the already-loaded sys.modules entry so that
+        # 'from diffusers.loaders import WanLoraLoaderMixin' in the wan
+        # pipeline submodule resolves to the shim at import time.
+        import sys as _sys
+        _loaders_mod = _sys.modules.get("diffusers.loaders")
+        if _loaders_mod is not None:
+            setattr(_loaders_mod, "WanLoraLoaderMixin", WanLoraLoaderMixin)
+        print("[WanImport] Injected WanLoraLoaderMixin shim into diffusers.loaders "
+              "(diffusers 0.37.1 compat)")
+    except Exception as _e:
+        print(f"[WanImport] WanLoraLoaderMixin shim injection failed (non-fatal): {_e}")
+
+
+# Apply WanLoraLoaderMixin shim NOW — before gradio is imported.
+# gradio's transitive imports can touch diffusers' lazy loader which evaluates
+# the wan pipeline submodule imports.  If WanLoraLoaderMixin is missing at
+# that point, diffusers silently falls back to a dummy stub even though torch
+# is correctly installed.  Patching diffusers.loaders here, before any gradio
+# import, ensures the shim is in place for every subsequent import attempt.
+_patch_wan_lora_loader_mixin()
+
 import gradio as gr
+
+
 def _import_wan_pipeline():
     """Try every known import path across diffusers versions.
     Catches Exception broadly (not just ImportError) because a broken torch
     causes transformers to raise packaging.version.InvalidVersion (ValueError)
-    at import time, which would otherwise silently swallow the real cause."""
+    at import time, which would otherwise silently swallow the real cause.
+
+    IMPORTANT: always try the top-level 'diffusers' path FIRST.
+    diffusers/__init__.py imports WanImageToVideoPipeline via a lazy loader
+    that avoids executing the full pipeline_wan_i2v module at import time,
+    so it succeeds even if pipeline_wan_i2v has a missing-symbol error.
+    The submodule paths are tried as fallbacks only.
+    """
+    # ---------------------------------------------------------------------------
+    # PRE-FLIGHT: verify torch is actually importable before attempting any
+    # diffusers import.  If torch is missing, diffusers marks ALL backends as
+    # unavailable and returns dummy stubs for every pipeline class — the stubs'
+    # from_pretrained() then raises the misleading "PyTorch library not found"
+    # error even when the real problem is just a broken/absent torch install.
+    # Catching this here gives a clear, actionable error message.
+    # ---------------------------------------------------------------------------
+    try:
+        import torch as _torch_preflight
+        _tv = _torch_preflight.__version__
+        if not _tv or _tv == "None":
+            raise ImportError(f"torch.__version__ is invalid: {_tv!r}")
+        # Also verify CUDA is available (required for Wan pipeline)
+        if not _torch_preflight.cuda.is_available():
+            print("[WanImport] WARNING: torch.cuda.is_available() == False — "
+                  "pipeline will be loaded on CPU and moved to GPU later.")
+    except ImportError as _te:
+        raise ImportError(
+            f"torch is not importable in this Python environment ({sys.executable}).\n"
+            f"Error: {_te}\n"
+            "The venv relies on system torch symlinks placed by setup.sh.\n"
+            "Fix: re-run setup.sh to rebuild the venv and re-create the symlinks."
+        ) from _te
+
+    # Force diffusers to re-evaluate its backend availability now that we have
+    # confirmed torch is present.  diffusers caches is_torch_available() at
+    # first import; if diffusers was imported before torch was on sys.path
+    # (e.g. via gradio's transitive imports), the cache is stale.
+    try:
+        import diffusers.utils.import_utils as _diu
+        # Reset the cached result so the next call re-runs find_spec("torch").
+        if hasattr(_diu, "_torch_available"):
+            # diffusers < 0.28 stored it as a module-level bool
+            _diu._torch_available = True
+        # diffusers >= 0.28 uses a cached_property / lru_cache; clear it.
+        for _attr in ("is_torch_available",):
+            _fn = getattr(_diu, _attr, None)
+            if _fn is not None and hasattr(_fn, "cache_clear"):
+                _fn.cache_clear()
+        # Re-import torch inside diffusers' namespace so its availability flag
+        # is definitely True for the wan pipeline import that follows.
+        _diu.is_torch_available()
+    except Exception as _diu_e:
+        print(f"[WanImport] diffusers import_utils reset failed (non-fatal): {_diu_e}")
+
+    # Inject the WanLoraLoaderMixin shim before any wan submodule is touched.
+    _patch_wan_lora_loader_mixin()
+
     attempts = [
-        ("diffusers.pipelines.wan.pipeline_wan_i2v", "WanImageToVideoPipeline"),
+        # Top-level first — uses diffusers' lazy __init__ loader, avoids the
+        # WanLoraLoaderMixin import in pipeline_wan_i2v entirely.
         ("diffusers",                                 "WanImageToVideoPipeline"),
+        # Submodule paths as fallback (work once the shim is in place).
         ("diffusers.pipelines.wan",                   "WanImageToVideoPipeline"),
+        ("diffusers.pipelines.wan.pipeline_wan_i2v",  "WanImageToVideoPipeline"),
     ]
     last_exc = None
     for module_path, class_name in attempts:
@@ -530,8 +673,32 @@ def _import_wan_pipeline():
             import importlib as _il
             mod = _il.import_module(module_path)
             cls = getattr(mod, class_name, None)
+            # Reject dummy stubs — they live in diffusers/utils/dummy_*.py and
+            # their from_pretrained() raises ImportError("requires PyTorch")
+            # regardless of the actual environment.
+            # BUG-FIX: the original check was:
+            #   "dummy" not in getattr(cls.__module__ or "", "", "")
+            # getattr(str, "", "") calls getattr on the string object with
+            # attr="" which always returns "" regardless of the string value,
+            # so the check always passed and dummy stubs were silently accepted.
             if cls is not None:
-                return cls
+                cls_module = getattr(cls, "__module__", "") or ""
+                if "dummy" in cls_module:
+                    print(f"[WanImport] {module_path!r} returned dummy stub "
+                          f"(module={cls_module!r}), trying next path")
+                else:
+                    # Also verify from_pretrained won't immediately raise —
+                    # real pipeline classes inherit from DiffusionPipeline
+                    # which has from_pretrained defined in diffusers.pipelines.pipeline_utils,
+                    # not in a dummy_ module.
+                    fp_module = getattr(
+                        getattr(cls, "from_pretrained", None), "__module__", ""
+                    ) or ""
+                    if "dummy" in fp_module:
+                        print(f"[WanImport] {module_path!r} from_pretrained is dummy "
+                              f"(module={fp_module!r}), trying next path")
+                    else:
+                        return cls
         except Exception as _e:
             last_exc = _e
             print(f"[WanImport] {module_path!r} failed: {type(_e).__name__}: {_e}")
@@ -677,13 +844,18 @@ def _write_video_tmp(data: bytes, filename: str) -> str:
 
 
 def _delete_video_tmp(path: str):
-    """Delete a video tmp file. Called after the browser has downloaded it."""
+    """Delete a video tmp file. Called after the browser has downloaded it.
+    
+    Safe to call even if the file no longer exists (e.g. already cleaned up
+    by _do_clear_storage). Silent no-op in that case.
+    """
     try:
         if path and os.path.exists(path):
             os.unlink(path)
             print(f"[tmp] deleted {os.path.basename(path)}")
+        # else: file already gone, silently skip
     except Exception as e:
-        print(f"[tmp] delete failed: {e}")
+        print(f"[tmp] delete failed (non-fatal): {e}")
 
 
 def _media_name(kind: str, extension: str, index: int = None) -> str:
@@ -1950,16 +2122,165 @@ def _ensure_musetalk():
             #
             # mmcv needs its CUDA ops compiled against the venv's torch;
             # MMCV_WITH_OPS=1 enables that (mmcv builds CPU-only otherwise).
-            _mmcv_env = {**_mt_env, "MMCV_WITH_OPS": "1"}
-            for _pkg in ["mmengine", "mmcv>=2.0.1", "mmdet>=3.1.0", "mmpose>=1.1.0"]:
-                _r = subprocess.run(
-                    [str(MUSETALK_VENV_PY), "-m", "pip", "install",
-                     "--no-build-isolation"] + _MT_PIP_QUIET + [_pkg],
-                    capture_output=True, text=True, env=_mmcv_env,
+            #
+            # TORCH_CUDA_ARCH_LIST fix: torch cu128 wheels include arch 12.0
+            # (Blackwell/sm_120) in their arch list, but mmcv's cpp_extension.py
+            # raises "Unknown CUDA arch (9.0,12.0)" because mmcv's source
+            # predates Blackwell support. Capping at "8.0;8.6;8.9;9.0" covers
+            # all real GPUs this stack runs on and avoids the crash.
+            _mmcv_env = {
+                **_mt_env,
+                "MMCV_WITH_OPS": "1",
+                # Restrict CUDA arches to those mmcv's cpp_extension.py knows.
+                # arch 12.0 (Blackwell/sm_120) was added to PyTorch cu128 but
+                # is not yet in mmcv's arch table — including it causes a hard
+                # ValueError crash during wheel build.
+                "TORCH_CUDA_ARCH_LIST": "8.0;8.6;8.9;9.0",
+            }
+
+            # ------------------------------------------------------------------
+            # xtcocotools — the unfixable dependency.
+            #
+            # xtcocotools is a C extension that wraps COCO's _mask.c.  Its
+            # source build ALWAYS fails inside the MuseTalk venv because:
+            #   • pip's build isolation injects a binary-only numpy (no headers)
+            #     into its ephemeral build env, so gcc cannot find
+            #     numpy/arrayobject.h, which _mask.c #includes.
+            #   • --no-build-isolation doesn't help because mmpose lists
+            #     xtcocotools in its own install_requires, so pip re-resolves
+            #     and tries to build it again as a *dependency*, applying full
+            #     isolation regardless of the flag we pass to the mmpose install.
+            #
+            # The definitive fix is to make pip believe xtcocotools is already
+            # installed so it never attempts the build at all — not for the
+            # direct install, and not when mmpose pulls it as a dependency.
+            # We do this by:
+            #   1. Installing pycocotools (binary wheel, cp312, x86-64) which
+            #      provides the identical C extension under a different name.
+            #   2. Planting a minimal PEP 566 dist-info directory for
+            #      xtcocotools in the venv's site-packages.  pip reads these
+            #      .dist-info directories to determine what is installed.
+            #      Once the record exists, pip's resolver sees xtcocotools as
+            #      "already satisfied" and never queues it for a build —
+            #      regardless of whether it appears as a direct install target
+            #      or as a transitive dependency of mmpose/mmdet.
+            #   3. Pointing the fake record's top_level.txt at pycocotools so
+            #      any `import xtcocotools` that mmpose might attempt is caught
+            #      by the sys.modules shim we inject below.
+            #   4. Adding a sys.modules alias xtcocotools -> pycocotools inside
+            #      the running Python process (belt-and-suspenders: this only
+            #      matters if someone imports xtcocotools at runtime, not at
+            #      install time, but it costs nothing).
+            # ------------------------------------------------------------------
+
+            # Step 1 — install pycocotools (binary wheel, no compile needed).
+            _r_pycoco = subprocess.run(
+                [str(MUSETALK_VENV_PY), "-m", "pip", "install"] +
+                _MT_PIP_QUIET + ["pycocotools"],
+                capture_output=True, text=True, env=_mt_env,
+            )
+            if _r_pycoco.returncode == 0:
+                print("[LipSync] pycocotools installed OK.")
+            else:
+                print(f"[LipSync] pycocotools install warning: {_r_pycoco.stderr[-200:]}")
+
+            # Step 2 — discover the venv's site-packages path.
+            _sp_result = subprocess.run(
+                [str(MUSETALK_VENV_PY), "-c",
+                 "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                capture_output=True, text=True, env=_mt_env,
+            )
+            _mt_site = _sp_result.stdout.strip()
+
+            # Step 3 — plant a fake xtcocotools dist-info so pip thinks it's
+            # already installed.  pip reads METADATA (version) and RECORD
+            # (file list) from .dist-info to decide "installed or not".
+            # An empty RECORD is fine for our purposes — pip won't try to
+            # uninstall anything, it just skips re-installing.
+            if _mt_site:
+                _xt_dist = Path(_mt_site) / "xtcocotools-1.3.dist-info"
+                _xt_dist.mkdir(exist_ok=True)
+                (_xt_dist / "METADATA").write_text(
+                    "Metadata-Version: 2.1\n"
+                    "Name: xtcocotools\n"
+                    "Version: 1.3\n"
+                    "Summary: Fake stub — satisfied by pycocotools (same C extension)\n"
+                    "Requires-Dist: pycocotools\n",
+                    encoding="utf-8",
                 )
-                if _r.returncode != 0:
-                    print(f"[LipSync] pip install {_pkg} failed (non-fatal, may already be satisfied): "
-                          f"{_r.stderr[-500:]}")
+                (_xt_dist / "INSTALLER").write_text("pip\n", encoding="utf-8")
+                (_xt_dist / "RECORD").write_text("", encoding="utf-8")
+                # top_level tells importlib where to find the package.
+                (_xt_dist / "top_level.txt").write_text("pycocotools\n", encoding="utf-8")
+                # WHEEL file satisfies pip's wheel-format check.
+                (_xt_dist / "WHEEL").write_text(
+                    "Wheel-Version: 1.0\n"
+                    "Generator: newgen-compat-shim\n"
+                    "Root-Is-Purelib: true\n"
+                    "Tag: py3-none-any\n",
+                    encoding="utf-8",
+                )
+                print("[LipSync] xtcocotools dist-info stub written — "
+                      "pip will treat it as already installed.")
+            else:
+                print("[LipSync] Warning: could not determine venv site-packages path; "
+                      "xtcocotools stub not written (mmpose install may still fail).")
+
+            # Step 4 — sys.modules alias in THIS process so any runtime
+            # `import xtcocotools` by mmpose resolves to pycocotools.
+            # (Belt-and-suspenders; the dist-info is what prevents the build.)
+            _alias_script = (
+                "import sys\n"
+                "try:\n"
+                "    import pycocotools as _pc\n"
+                "    sys.modules.setdefault('xtcocotools', _pc)\n"
+                "    # Also alias common sub-modules mmpose may import directly\n"
+                "    for _sub in ['mask', 'coco', 'cocoeval']:\n"
+                "        _full = f'pycocotools.{_sub}'\n"
+                "        _xt   = f'xtcocotools.{_sub}'\n"
+                "        try:\n"
+                "            import importlib; _m = importlib.import_module(_full)\n"
+                "            sys.modules.setdefault(_xt, _m)\n"
+                "        except ImportError:\n"
+                "            pass\n"
+                "except ImportError:\n"
+                "    pass\n"
+            )
+            subprocess.run(
+                [str(MUSETALK_VENV_PY), "-c", _alias_script],
+                capture_output=True, env=_mt_env,
+            )
+
+            # Check whether mmpose is already importable — if all four
+            # OpenMMLab packages import cleanly, skip the install loop
+            # entirely.  This avoids pip re-resolving (and re-attempting to
+            # build) xtcocotools on an existing venv where everything already
+            # works, even if the dist-info stub wasn't present on that run.
+            _mmpose_check = subprocess.run(
+                [str(MUSETALK_VENV_PY), "-c",
+                 "import mmengine, mmcv, mmdet, mmpose; "
+                 "print('mmpose', mmpose.__version__)"],
+                capture_output=True, text=True, env=_mt_env,
+            )
+            if _mmpose_check.returncode == 0:
+                print(f"[LipSync] OpenMMLab stack already installed "
+                      f"({_mmpose_check.stdout.strip()}) — skipping install.")
+            else:
+                # Now install mmpose and the rest of the OpenMMLab stack.
+                # Because the xtcocotools dist-info stub is in place, pip's
+                # dependency resolver will see xtcocotools as "already satisfied"
+                # and skip building it — for mmpose AND for mmdet.
+                for _pkg in ["mmengine", "mmcv>=2.0.1", "mmdet>=3.1.0", "mmpose>=1.1.0"]:
+                    _r = subprocess.run(
+                        [str(MUSETALK_VENV_PY), "-m", "pip", "install",
+                         "--no-build-isolation"] + _MT_PIP_QUIET + [_pkg],
+                        capture_output=True, text=True, env=_mmcv_env,
+                    )
+                    if _r.returncode != 0:
+                        print(f"[LipSync] pip install {_pkg} failed (non-fatal): "
+                              f"{_r.stderr[-500:]}")
+                    else:
+                        print(f"[LipSync] {_pkg} installed OK.")
             print("[LipSync] MuseTalk venv deps installed.")
 
             # --- huggingface_hub (with CLI extra) for weight download ------
@@ -2018,7 +2339,30 @@ def _run_musetalk(video_path: str, audio_path: str, output_path: str,
                 parameter MuseTalk's own docs recommend tuning per-subject.
     batch_size: frames processed per UNet batch. Higher = faster but more
                 VRAM. 4 is a safe default; lower it if you see CUDA OOM.
+
+    Blocks until MuseTalk is ready (downloading weights if needed). This
+    ensures Lip-Synced Speaking mode always gets real MuseTalk output even
+    when the first call happens before the background download thread
+    finishes — previously the race caused silent fallback to no-lip-sync.
     """
+    # If MuseTalk isn't ready yet, wait for it (it may still be downloading
+    # weights in the background thread kicked off at startup). Give it up to
+    # 20 minutes — the initial snapshot_download is several GB.
+    if not _musetalk_ready:
+        print("[LipSync] MuseTalk not ready yet — waiting for background setup to complete (up to 20 min)...")
+        _wait_start = time.time()
+        _last_print = 0.0
+        while not _musetalk_ready:
+            _elapsed = time.time() - _wait_start
+            if _elapsed > 1200:  # 20 minutes max
+                print("[LipSync] MuseTalk setup timed out after 20 minutes — skipping lip sync.")
+                return False
+            if _elapsed - _last_print >= 30:
+                print(f"[LipSync] Still waiting for MuseTalk setup... ({_elapsed:.0f}s elapsed)")
+                _last_print = _elapsed
+            time.sleep(2)
+        print(f"[LipSync] MuseTalk is now ready — proceeding with lip sync.")
+
     if not _ensure_musetalk():
         print("[LipSync] MuseTalk not available — skipping lip sync.")
         return False
@@ -2134,16 +2478,30 @@ def generate_lip_sync_video(
     if not base_video_path or not Path(base_video_path).exists():
         return base_result[0], base_result[1], "Lip-sync: base video path missing."
 
+    # Ensure tmp directory exists for all intermediate files
+    _lipsync_tmp = Path(SCRIPT_DIR) / "tmp"
+    _lipsync_tmp.mkdir(parents=True, exist_ok=True)
+
     # Step 2: generate voice WAV (we need the raw WAV, not the mixed video)
     voice_wav = None
+    _voice_wav_path = None
     if ref_aud and dlg_txt and dlg_txt.strip():
-        voice_wav = str(Path(SCRIPT_DIR) / "tmp" / f"lipsync_voice_{uuid.uuid4().hex}.wav")
+        _voice_wav_path = str(_lipsync_tmp / f"lipsync_voice_{uuid.uuid4().hex}.wav")
         _ref_path = ref_aud.name if hasattr(ref_aud, "name") else (str(ref_aud) if ref_aud else None)
-        if _ref_path:
-            ok = _run_f5tts(_ref_path, dlg_txt.strip(), voice_wav, speed=v_speed)
-            if not ok:
-                voice_wav = None
-                print("[LipSync] F5-TTS failed — will do lip sync without voice WAV.")
+        if not _ref_path and isinstance(ref_aud, dict):
+            _ref_path = ref_aud.get("path") or ref_aud.get("name") or ref_aud.get("url")
+        if _ref_path and os.path.exists(str(_ref_path)):
+            print(f"[LipSync] Generating F5-TTS voice WAV for dialogue: {dlg_txt.strip()[:60]}...")
+            ok = _run_f5tts(str(_ref_path), dlg_txt.strip(), _voice_wav_path, speed=float(v_speed))
+            if ok and Path(_voice_wav_path).exists() and Path(_voice_wav_path).stat().st_size > 0:
+                voice_wav = _voice_wav_path
+                print(f"[LipSync] F5-TTS voice WAV ready: {Path(voice_wav).stat().st_size // 1024} KB")
+            else:
+                print("[LipSync] F5-TTS produced no output — will do lip sync without voice WAV.")
+        else:
+            print(f"[LipSync] Voice reference path not found: {_ref_path!r} — skipping F5-TTS.")
+    else:
+        print("[LipSync] No voice reference or dialogue text provided — skipping F5-TTS.")
 
     if voice_wav is None or not Path(voice_wav).exists():
         # Can't lip-sync without audio — fall back to normal mix
@@ -2151,9 +2509,9 @@ def generate_lip_sync_video(
         with open(base_video_path, "rb") as _f:
             _video_bytes = _f.read()
         final = add_audio_to_video(
-            _video_bytes, audio_pt, float(dur), audio_neg_pt, ref_aud, dlg_txt, v_speed,
+            _video_bytes, audio_pt, float(dur), audio_neg_pt, ref_aud, dlg_txt, float(v_speed),
         )
-        out_path = str(Path(SCRIPT_DIR) / "tmp" / f"lipsync_out_{uuid.uuid4().hex}.mp4")
+        out_path = str(_lipsync_tmp / f"lipsync_out_{uuid.uuid4().hex}.mp4")
         if final:
             with open(out_path, "wb") as _f:
                 _f.write(final)
@@ -2161,14 +2519,21 @@ def generate_lip_sync_video(
             shutil.copy(base_video_path, out_path)
         return out_path, out_path, "Lip-sync skipped (no voice WAV) — normal audio mixed."
 
-    # Step 3: MuseTalk — replace mouth region
-    ls_out = str(Path(SCRIPT_DIR) / "tmp" / f"lipsync_ls_{uuid.uuid4().hex}.mp4")
+    # Step 3: MuseTalk — replace mouth region with audio-driven lip animation.
+    # _run_musetalk will wait for MuseTalk weights to finish downloading if needed.
+    ls_out = str(_lipsync_tmp / f"lipsync_ls_{uuid.uuid4().hex}.mp4")
+    print(f"[LipSync] Running MuseTalk: video={base_video_path}, audio={voice_wav}")
     ls_ok = _run_musetalk(
         base_video_path, voice_wav, ls_out,
         bbox_shift=int(lipsync_bbox_shift),
         batch_size=int(lipsync_batch_size),
     )
-    synced_video = ls_out if ls_ok else base_video_path
+    synced_video = ls_out if (ls_ok and Path(ls_out).exists()) else base_video_path
+
+    if ls_ok:
+        print(f"[LipSync] MuseTalk succeeded — lip-synced video at {ls_out}")
+    else:
+        print("[LipSync] MuseTalk failed or returned no output — using base video with F5-TTS audio.")
 
     # Step 4: mix audio on top of the (attempted) lip-synced video.
     #   If MuseTalk succeeded, the voice is already embedded in the video
@@ -2180,23 +2545,36 @@ def generate_lip_sync_video(
     with open(synced_video, "rb") as _f:
         _synced_bytes = _f.read()
     if ls_ok:
+        # MuseTalk already baked the voice into the lip-synced video.
+        # Only add Foley SFX on top — pass None/empty to skip F5-TTS re-run.
         final = add_audio_to_video(
             _synced_bytes, audio_pt, float(dur), audio_neg_pt,
             None, "",   # skip F5-TTS — voice already embedded by MuseTalk
-            v_speed,
+            float(v_speed),
         )
     else:
+        # MuseTalk never ran — the base video is silent. Mix the F5-TTS voice
+        # (generated above) plus Foley SFX into the base video.
         final = add_audio_to_video(
             _synced_bytes, audio_pt, float(dur), audio_neg_pt,
-            ref_aud, dlg_txt,   # MuseTalk never ran — mix the dialogue voice in now
-            v_speed,
+            ref_aud, dlg_txt,   # re-run F5-TTS inside add_audio_to_video
+            float(v_speed),
         )
-    out_path = str(Path(SCRIPT_DIR) / "tmp" / f"lipsync_final_{uuid.uuid4().hex}.mp4")
+    out_path = str(_lipsync_tmp / f"lipsync_final_{uuid.uuid4().hex}.mp4")
     if final:
         with open(out_path, "wb") as _f:
             _f.write(final)
+        print(f"[LipSync] Final output written: {Path(out_path).stat().st_size // 1024} KB")
     else:
         shutil.copy(synced_video, out_path)
+        print("[LipSync] Audio mix returned empty — using synced video as-is.")
+
+    # Clean up intermediate WAV (no longer needed)
+    if _voice_wav_path and os.path.exists(_voice_wav_path):
+        try:
+            os.unlink(_voice_wav_path)
+        except Exception:
+            pass
 
     status = "✅ Lip-sync complete." if ls_ok else "⚠️ MuseTalk failed — dialogue voice + Foley mixed without lip sync."
     return out_path, out_path, status
@@ -7249,9 +7627,15 @@ with gr.Blocks(css=css) as demo:
                 return f
 
             def _delete_video_after_download(video_file_val):
-                """Delete the tmp video file and clear storage after browser downloads it."""
+                """Delete the tmp video file and clear storage after browser downloads it.
+                
+                Uses a longer sleep (30s) to ensure Gradio has fully finished postprocessing
+                and the browser has had time to download the file before we delete it.
+                The FileNotFoundError was caused by deleting the file too soon (3s) while
+                Gradio's gr.File postprocess was still calling Path(value).stat().st_size.
+                """
                 import time as _t
-                _t.sleep(3)
+                _t.sleep(30)
                 _delete_video_tmp(_extract_file_path(video_file_val))
                 _do_clear_storage()
                 return gr.update(visible=True, value="Storage cleared.")

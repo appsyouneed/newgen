@@ -19,17 +19,27 @@
 # setup.sh patches gradio/oauth.py with a shim after install so this is safe.
 huggingface-hub>=0.34.0,<1.0
 
-# transformers >=4.52.0: Qwen-Image-Edit-2511's text_encoder config uses the
-# newer nested `text_config` composite format. Before 4.52.0,
-# Qwen2_5_VLConfig.sub_configs lacked "text_config", so the nested dict was
-# never wrapped in Qwen2_5_VLTextConfig and stayed a raw dict — then
-# GenerationConfig.from_model_config() calls decoder_config.to_dict() on it
-# and crashes with "'dict' object has no attribute 'to_dict'".
-transformers>=4.52.0,<5.0
+# transformers PINNED EXACTLY — do not turn this back into a range.
+# Needs >=4.52.0 for Qwen-Image-Edit-2511's nested text_config format
+# (Qwen2_5_VLConfig.sub_configs lacked "text_config" before 4.52.0, so the
+# nested dict stayed raw and GenerationConfig.from_model_config() crashed
+# calling .to_dict() on it).
+# transformers 4.57.6 was tested here and BREAKS diffusers' Wan pipeline:
+# its lazy-import machinery fails internally and misreports it as
+# "cannot import name 'CLIPImageProcessor' from transformers", even though
+# CLIPImageProcessor itself is unaffected — the real failure is elsewhere.
+# 4.55.4 is verified working with diffusers 0.37.1's Wan pipeline and with
+# Qwen-Image-Edit-2511's config format. An open range (">=4.52.0,<5.0")
+# will silently pick up a newer, untested transformers release the next
+# time this venv is rebuilt and reintroduce this exact crash.
+transformers==4.55.4
 
 # WanImageToVideoPipeline (diffusers.pipelines.wan) was added in 0.34.0.
 # 0.33.x does not have it and will crash at import time.
-diffusers>=0.34.0,<0.38.0
+# PINNED EXACTLY to the version verified against transformers==4.55.4 above.
+# A range here can independently resolve to a diffusers release built
+# against a different transformers API and break the same way.
+diffusers==0.37.1
 
 safetensors>=0.4.0
 
