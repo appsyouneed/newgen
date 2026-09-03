@@ -73,11 +73,33 @@ echo "Upgrading pip inside venv..."
 # ---------------------------------------------------------------------------
 SYS_SITE=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || echo "")
 if [ -n "$SYS_SITE" ] && [ -d "$SYS_SITE/torch" ]; then
-    echo "System torch found at $SYS_SITE — venv will use it via PYTHONPATH."
-    export PYTHONPATH="$SYS_SITE:${PYTHONPATH:-}"
+    echo "System torch found at $SYS_SITE."
+    echo "Symlinking ONLY torch/torchvision/torchaudio/torchao (and their"
+    echo "private deps) into the venv's own site-packages, instead of"
+    echo "exporting PYTHONPATH to the whole system dist-packages dir."
+    echo "(A blanket PYTHONPATH export shadows EVERY same-named package in"
+    echo "the venv with the system copy — e.g. it silently made the app"
+    echo "import system diffusers 0.33.1 instead of the venv's own 0.37.1,"
+    echo "even though pip had correctly installed 0.37.1 into the venv.)"
+    VENV_SITE_PACKAGES="$APP_VENV/lib/$($APP_PY -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')/site-packages"
+    for pkg in torch torchgen torchvision torchaudio torchao \
+               functorch caffe2 \
+               nvidia triton; do
+        if [ -e "$SYS_SITE/$pkg" ] && [ ! -e "$VENV_SITE_PACKAGES/$pkg" ]; then
+            ln -s "$SYS_SITE/$pkg" "$VENV_SITE_PACKAGES/$pkg"
+        fi
+    done
+    # dist-info / egg-info dirs so `pip show torch` and dependency
+    # resolution inside the venv recognize torch as already satisfied.
+    for distinfo in "$SYS_SITE"/torch-*.dist-info "$SYS_SITE"/torch-*.egg-info \
+                     "$SYS_SITE"/torchvision-*.dist-info "$SYS_SITE"/torchaudio-*.dist-info \
+                     "$SYS_SITE"/torchao-*.dist-info; do
+        [ -e "$distinfo" ] || continue
+        base="$(basename "$distinfo")"
+        [ -e "$VENV_SITE_PACKAGES/$base" ] || ln -s "$distinfo" "$VENV_SITE_PACKAGES/$base"
+    done
 else
     echo "WARNING: Could not locate system torch in $SYS_SITE."
-    echo "  The app venv will attempt to use whatever torch is on PYTHONPATH at runtime."
     echo "  Do NOT let setup.sh install torch — that would overwrite your dev build."
 fi
 
@@ -91,6 +113,10 @@ echo "Installing Python application dependencies into isolated venv..."
 echo "Ensuring critical pinned packages inside venv..."
 # These are pinned to exact versions the app requires. They live only in the
 # venv — the system site-packages are never touched.
+# IMPORTANT: torch / torchvision / torchaudio / torchao are NOT installed here.
+# They come from the system Python stack via PYTHONPATH (see run_app.sh).
+# Installing them here would pull in a mismatched torch build and overwrite
+# the system torch 2.8 dev+cu128.
 "$APP_PIP" install --quiet --no-cache-dir \
     Pillow \
     "transformers>=4.52.0,<5.0" \
@@ -98,8 +124,20 @@ echo "Ensuring critical pinned packages inside venv..."
     "numpy>=1.26,<2.1" \
     "diffusers>=0.34.0,<0.38.0" \
     "safetensors>=0.4.0" \
-    torchao \
     accelerate
+
+# ---------------------------------------------------------------------------
+# CRITICAL: Evict any torch / torchvision / torchaudio / torchao that pip may
+# have pulled in as transitive dependencies of the packages above (e.g.
+# diffusers, accelerate, torchao all list torch as a dependency and pip will
+# happily download a fresh copy if it doesn't see one on sys.path at install
+# time).  We run this AFTER every pip install block so any stray copies are
+# removed before the app starts.  The system copies remain available via
+# PYTHONPATH at runtime.
+# ---------------------------------------------------------------------------
+echo "Evicting any venv-local torch/torchvision/torchaudio/torchao (must use system copies)..."
+"$APP_PIP" uninstall -y torch torchvision torchaudio torchao 2>/dev/null || true
+echo "Torch eviction done — system torch will be used via PYTHONPATH at runtime."
 
 echo "Installing torchcodec into venv (required by torchaudio.save for Foley audio)..."
 # torchaudio 2.6+ routes torchaudio.save() through TorchCodec; without it the
@@ -114,18 +152,24 @@ echo "Installing torchcodec into venv (required by torchaudio.save for Foley aud
 # ---------------------------------------------------------------------------
 echo "Patching venv gradio/oauth.py for huggingface_hub >= 0.26 compatibility..."
 VENV_SITE="$APP_VENV/lib/$(ls $APP_VENV/lib/)/site-packages"
-"$APP_PY" - <<'PYPATCH'
-import sys, pathlib, site
+OAUTH_FILE="$VENV_SITE/gradio/oauth.py"
+python3 - "$OAUTH_FILE" <<'PYPATCH'
+import sys, pathlib
 
-for sp in site.getsitepackages():
-    candidate = pathlib.Path(sp, "gradio", "oauth.py")
-    if candidate.exists():
-        text = candidate.read_text()
-        OLD = "from huggingface_hub import HfFolder, whoami"
-        if OLD not in text:
-            print(f"  Already patched or pattern not found: {candidate}")
-            break
-        NEW = """\
+candidate = pathlib.Path(sys.argv[1])
+if not candidate.exists():
+    print(f"  ERROR: not found: {candidate}")
+    sys.exit(1)
+
+text = candidate.read_text()
+
+# Remove any previously botched patch attempts, then apply cleanly.
+# The original line we need to replace is exactly:
+#   from huggingface_hub import HfFolder, whoami
+# It may have been wrapped in broken try blocks already — strip all of that
+# out and rewrite from the first import of fastapi.responses onward.
+
+GOOD = """\
 try:
     from huggingface_hub import HfFolder, whoami
 except ImportError:
@@ -139,36 +183,51 @@ except ImportError:
         @staticmethod
         def get_token():
             return _get_token()"""
-        candidate.write_text(text.replace(OLD, NEW, 1))
-        print(f"  Patched: {candidate}")
-        break
+
+# Find the block between 'from fastapi.responses import RedirectResponse'
+# and 'from .utils import get_space' and replace it wholesale.
+ANCHOR_START = "from fastapi.responses import RedirectResponse"
+ANCHOR_END = "from .utils import get_space"
+
+start = text.index(ANCHOR_START) + len(ANCHOR_START)
+end = text.index(ANCHOR_END)
+
+text = text[:start] + "\n" + GOOD + "\n\n" + text[end:]
+candidate.write_text(text)
+print(f"  Patched: {candidate}")
 PYPATCH
 
 echo "Patching venv gradio_client/utils.py for pydantic v2 bool-schema compatibility..."
-"$APP_PY" - <<'PYPATCH'
-import sys, pathlib, site
+GRADIO_CLIENT_FILE="$VENV_SITE/gradio_client/utils.py"
+python3 - "$GRADIO_CLIENT_FILE" <<'PYPATCH'
+import sys, pathlib
 
-for sp in site.getsitepackages():
-    candidate = pathlib.Path(sp, "gradio_client", "utils.py")
-    if candidate.exists():
-        text = candidate.read_text()
-        if "if not isinstance(schema, dict):" in text:
-            print(f"  Already patched: {candidate}")
-            break
-        OLD = 'def _json_schema_to_python_type(schema: Any, defs) -> str:\n    """Convert the json schema into a python type hint"""\n    if schema == {}:'
-        NEW = 'def _json_schema_to_python_type(schema: Any, defs) -> str:\n    """Convert the json schema into a python type hint"""\n    if not isinstance(schema, dict):\n        return "Any"\n    if schema == {}:'
-        if OLD in text:
-            candidate.write_text(text.replace(OLD, NEW, 1))
-            print(f"  Patched: {candidate}")
-            break
-        OLD2 = 'def get_type(schema: dict):\n    if "const" in schema:'
-        NEW2 = 'def get_type(schema: dict):\n    if not isinstance(schema, dict):\n        return "unknown"\n    if "const" in schema:'
-        if OLD2 in text:
-            candidate.write_text(text.replace(OLD2, NEW2, 1))
-            print(f"  Patched get_type fallback: {candidate}")
-            break
-        print(f"  ERROR: no matching pattern in {candidate}")
-        break
+candidate = pathlib.Path(sys.argv[1])
+if not candidate.exists():
+    print(f"  ERROR: not found: {candidate}")
+    sys.exit(1)
+
+text = candidate.read_text()
+if "if not isinstance(schema, dict):" in text:
+    print(f"  Already patched: {candidate}")
+    sys.exit(0)
+
+OLD = 'def _json_schema_to_python_type(schema: Any, defs) -> str:\n    """Convert the json schema into a python type hint"""\n    if schema == {}:'
+NEW = 'def _json_schema_to_python_type(schema: Any, defs) -> str:\n    """Convert the json schema into a python type hint"""\n    if not isinstance(schema, dict):\n        return "Any"\n    if schema == {}:'
+if OLD in text:
+    candidate.write_text(text.replace(OLD, NEW, 1))
+    print(f"  Patched: {candidate}")
+    sys.exit(0)
+
+OLD2 = 'def get_type(schema: dict):\n    if "const" in schema:'
+NEW2 = 'def get_type(schema: dict):\n    if not isinstance(schema, dict):\n        return "unknown"\n    if "const" in schema:'
+if OLD2 in text:
+    candidate.write_text(text.replace(OLD2, NEW2, 1))
+    print(f"  Patched get_type fallback: {candidate}")
+    sys.exit(0)
+
+print(f"  ERROR: no matching pattern in {candidate}")
+sys.exit(1)
 PYPATCH
 
 echo "Installing SageAttention into venv for accelerated inference..."
@@ -237,14 +296,15 @@ fi
 # ---------------------------------------------------------------------------
 cat > /root/newgen/run_app.sh << 'LAUNCHER'
 #!/bin/bash
-# Launch app.py using the isolated app venv, with system torch on PYTHONPATH.
-# This preserves the system torch 2.8 dev+cu128 while using venv's gradio/
-# diffusers/transformers/etc.
+# Launch app.py using the isolated app venv.
+# System torch is made visible via symlinks placed directly inside the
+# venv's own site-packages by setup.sh (see the SYS_SITE block above) —
+# NOT via a PYTHONPATH export. A PYTHONPATH pointing at the whole system
+# dist-packages dir would shadow every other same-named package in the
+# venv (this previously caused the app to silently load system diffusers
+# 0.33.1 instead of the venv's correctly-installed 0.37.1). Do not
+# reintroduce a PYTHONPATH export here.
 APP_VENV="/root/newgen/.app-venv"
-SYS_SITE=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || echo "")
-if [ -n "$SYS_SITE" ] && [ -d "$SYS_SITE/torch" ]; then
-    export PYTHONPATH="$SYS_SITE:${PYTHONPATH:-}"
-fi
 cd /root/newgen
 exec "$APP_VENV/bin/python" app.py "$@"
 LAUNCHER

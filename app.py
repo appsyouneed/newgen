@@ -53,6 +53,56 @@ class _TorchaoFilter(logging.Filter):
 logging.getLogger().addFilter(_TorchaoFilter())
 
 
+# ---------------------------------------------------------------------------
+# SELF-HEAL: MuseTalk weights integrity check
+#
+# A snapshot_download that gets killed mid-transfer (OOM-killed process,
+# SSH drop, disk-full) can leave a truncated file on disk that still passes
+# .exists() checks forever — causing face-parsing / VAE / UNet to load
+# garbage weights and produce corrupt or blank mouth regions instead of
+# real lip motion. We check size at startup and delete+re-download anything
+# suspiciously small. Runs once in a daemon thread so it never blocks startup.
+# ---------------------------------------------------------------------------
+def _selfheal_musetalk_weights():
+    """
+    Runs at startup in a daemon thread. Checks every MuseTalk weight file that
+    can be silently truncated by an interrupted download and deletes any that
+    are too small so _ensure_musetalk() re-downloads them cleanly.
+
+    Symptoms of bad weights:
+      - musetalk/pytorch_model.bin truncated -> UNet load error or garbage mouth region
+      - sd-vae-ft-mse/diffusion_pytorch_model.bin truncated -> corrupt/blank frames
+      - whisper/tiny.pt truncated -> RuntimeError on every job
+    """
+    _BASE = Path(__file__).parent / "MuseTalk" / "models"
+    checks = [
+        ("musetalk/pytorch_model.bin",                    5 * 1024 ** 2,   "MuseTalk UNet"),
+        ("musetalkV15/unet.pth",                           5 * 1024 ** 2,   "MuseTalk v1.5 UNet"),
+        ("sd-vae-ft-mse/diffusion_pytorch_model.bin",     100 * 1024 ** 2,  "SD VAE (~335 MB)"),
+        ("whisper/tiny.pt",                                50 * 1024 ** 2,  "Whisper tiny (~74 MB)"),
+        ("dwpose/dw-ll_ucoco_384.pth",                      5 * 1024 ** 2,  "DWPose"),
+        ("face-parse-bisent/79999_iter.pth",                5 * 1024 ** 2,  "Face-parse BiSeNet"),
+        ("face-parse-bisent/resnet18-5c106cde.pth",         5 * 1024 ** 2,  "Face-parse ResNet18"),
+    ]
+    for rel, min_bytes, label in checks:
+        p = _BASE / rel
+        try:
+            if not p.exists():
+                continue
+            sz = p.stat().st_size
+            if sz >= min_bytes:
+                print(f"[SelfHeal] {rel} OK ({sz / (1024**2):.1f} MB)")
+            else:
+                print(f"[SelfHeal] {rel} TRUNCATED ({sz / (1024**2):.1f} MB, need >{min_bytes // (1024**2)} MB) — deleting for clean re-download.")
+                p.unlink()
+                print(f"[SelfHeal] {rel} removed — will re-download on next lip-sync job.")
+        except Exception as _e:
+            print(f"[SelfHeal] {rel} check failed (non-fatal): {_e}")
+
+threading.Thread(target=_selfheal_musetalk_weights, daemon=True).start()
+# ---------------------------------------------------------------------------
+
+
 STARTUP_MODE = "vidgen"
 for _arg in sys.argv[1:]:
     _flag = _arg.lstrip("-").lower()
@@ -65,17 +115,93 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 os.makedirs("/dev/shm/newgen", exist_ok=True)
 os.makedirs(os.path.join(SCRIPT_DIR, "tmp", "gradio"), exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# EARLY FILE PATCHES — runs before any gradio import.
+# sysconfig.get_path("purelib") always returns the site-packages of the
+# running interpreter, so this works correctly inside a venv.
+# Both patches are idempotent — safe to run on every startup.
+# ---------------------------------------------------------------------------
+def _patch_gradio_oauth_early():
+    import sysconfig, pathlib
+    f = pathlib.Path(sysconfig.get_path("purelib")) / "gradio" / "oauth.py"
+    if not f.exists():
+        return
+    t = f.read_text()
+    A = "from fastapi.responses import RedirectResponse\n"
+    B = "from .utils import get_space"
+    if A not in t or B not in t:
+        return
+    s, e = t.index(A) + len(A), t.index(B)
+    good = (
+        "try:\n"
+        "    from huggingface_hub import HfFolder, whoami\n"
+        "except ImportError:\n"
+        "    from huggingface_hub import whoami\n"
+        "    try:\n"
+        "        from huggingface_hub import get_token as _get_token\n"
+        "    except ImportError:\n"
+        "        _get_token = lambda: None  # noqa: E731\n"
+        "\n"
+        "    class HfFolder:  # noqa: N801\n"
+        "        @staticmethod\n"
+        "        def get_token():\n"
+        "            return _get_token()\n"
+        "\n"
+    )
+    patched = t[:s] + good + t[e:]
+    if patched != t:
+        f.write_text(patched)
+        print("[EarlyPatch] gradio/oauth.py fixed")
+    else:
+        print("[EarlyPatch] gradio/oauth.py already clean")
+
+def _patch_gradio_client_early():
+    import sysconfig, pathlib
+    f = pathlib.Path(sysconfig.get_path("purelib")) / "gradio_client" / "utils.py"
+    if not f.exists():
+        return
+    t = f.read_text()
+    if "if not isinstance(schema, dict):" in t:
+        print("[EarlyPatch] gradio_client/utils.py already clean")
+        return
+    for old, new in [
+        (
+            'def _json_schema_to_python_type(schema: Any, defs) -> str:\n    \"\"\"Convert the json schema into a python type hint\"\"\"\n    if schema == {}:',
+            'def _json_schema_to_python_type(schema: Any, defs) -> str:\n    \"\"\"Convert the json schema into a python type hint\"\"\"\n    if not isinstance(schema, dict):\n        return \"Any\"\n    if schema == {}:',
+        ),
+        (
+            'def get_type(schema: dict):\n    if \"const\" in schema:',
+            'def get_type(schema: dict):\n    if not isinstance(schema, dict):\n        return \"unknown\"\n    if \"const\" in schema:',
+        ),
+    ]:
+        if old in t:
+            f.write_text(t.replace(old, new, 1))
+            print("[EarlyPatch] gradio_client/utils.py fixed")
+            return
+
+_patch_gradio_oauth_early()
+_patch_gradio_client_early()
+# ---------------------------------------------------------------------------
+
+
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _aesgcm_check
     del _aesgcm_check
 except ImportError:
-    # cryptography must be installed in the app venv (setup.sh / requirements.txt).
-    # We do NOT pip-install here at runtime — that would modify whatever Python
-    # environment is running and could break system packages.
-    raise RuntimeError(
-        "cryptography is not installed in the current Python environment.\n"
-        "Run setup.sh to create the app venv with all required dependencies."
+    print("[SelfHeal] cryptography missing — installing into current venv...")
+    _r = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "cryptography"],
+        capture_output=True, text=True,
     )
+    if _r.returncode != 0:
+        raise RuntimeError(
+            f"cryptography install failed:\n{_r.stderr.strip()}\n"
+            "Run setup.sh to rebuild the app venv."
+        )
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _aesgcm_check
+    del _aesgcm_check
+    print("[SelfHeal] cryptography installed OK")
 
 # ---------------------------------------------------------------------------
 # Version sanity checks — READ ONLY, never pip-install into the running env.
@@ -94,33 +220,54 @@ except ImportError:
 def _self_heal_patch_gradio_oauth():
     """Reapply the HfFolder shim into gradio/oauth.py if needed.
     Patches the file in-place (no pip, no env modification).
-    Safe to call multiple times — is a no-op if already patched."""
-    import site
+    Safe to call multiple times — is a no-op if already patched.
+
+    Uses gradio.__file__ to locate the actual loaded gradio package so this
+    works correctly inside a venv (site.getsitepackages() returns system paths
+    when called from venv python, causing patches to land in the wrong place).
+    """
     try:
-        for sp_dir in site.getsitepackages():
-            candidate = Path(sp_dir, "gradio", "oauth.py")
-            if candidate.exists():
-                text = candidate.read_text()
-                OLD = "from huggingface_hub import HfFolder, whoami"
-                if OLD not in text:
-                    return  # already patched or different gradio version
-                NEW = (
-                    "try:\n"
-                    "    from huggingface_hub import HfFolder, whoami\n"
-                    "except ImportError:\n"
-                    "    from huggingface_hub import whoami\n"
-                    "    try:\n"
-                    "        from huggingface_hub import get_token as _get_token\n"
-                    "    except ImportError:\n"
-                    "        _get_token = lambda: None  # noqa: E731\n\n"
-                    "    class HfFolder:  # noqa: N801\n"
-                    "        @staticmethod\n"
-                    "        def get_token():\n"
-                    "            return _get_token()"
-                )
-                candidate.write_text(text.replace(OLD, NEW, 1))
-                print(f"[Patch] gradio/oauth.py patched at {candidate}")
-                return
+        import gradio as _gradio
+        candidate = Path(_gradio.__file__).parent / "oauth.py"
+        if not candidate.exists():
+            print(f"[Patch] gradio/oauth.py not found at {candidate}")
+            return
+        text = candidate.read_text()
+
+        # Strip any previously botched double-try patch by replacing everything
+        # between the RedirectResponse import and 'from .utils import get_space'
+        # so repeated runs always produce a clean result.
+        ANCHOR_START = "from fastapi.responses import RedirectResponse"
+        ANCHOR_END = "from .utils import get_space"
+        if ANCHOR_START not in text or ANCHOR_END not in text:
+            print(f"[Patch] gradio/oauth.py: anchor lines not found, skipping")
+            return
+
+        # Check if already cleanly patched (has try/except but no double-try)
+        between_start = text.index(ANCHOR_START) + len(ANCHOR_START)
+        between_end = text.index(ANCHOR_END)
+        between = text[between_start:between_end]
+        if "except ImportError" in between and "    try:\n    from" not in between and "try:\n    try:" not in between:
+            print(f"[Patch] gradio/oauth.py already correctly patched")
+            return
+
+        GOOD = (
+            "\ntry:\n"
+            "    from huggingface_hub import HfFolder, whoami\n"
+            "except ImportError:\n"
+            "    from huggingface_hub import whoami\n"
+            "    try:\n"
+            "        from huggingface_hub import get_token as _get_token\n"
+            "    except ImportError:\n"
+            "        _get_token = lambda: None  # noqa: E731\n\n"
+            "    class HfFolder:  # noqa: N801\n"
+            "        @staticmethod\n"
+            "        def get_token():\n"
+            "            return _get_token()\n\n"
+        )
+        text = text[:between_start] + GOOD + text[between_end:]
+        candidate.write_text(text)
+        print(f"[Patch] gradio/oauth.py patched at {candidate}")
     except Exception as _e:
         print(f"[Patch] gradio oauth patch failed (non-fatal): {_e}")
 
@@ -128,42 +275,49 @@ def _self_heal_patch_gradio_oauth():
 def _self_heal_patch_gradio_client_utils():
     """Reapply the pydantic v2 bool-schema guard into gradio_client/utils.py.
     Patches the file in-place (no pip, no env modification).
-    Safe to call multiple times — is a no-op if already patched."""
-    import site
+    Safe to call multiple times — is a no-op if already patched.
+
+    Uses gradio_client.__file__ to locate the actual loaded package so this
+    works correctly inside a venv.
+    """
     try:
-        for sp_dir in site.getsitepackages():
-            candidate = Path(sp_dir, "gradio_client", "utils.py")
-            if candidate.exists():
-                text = candidate.read_text()
-                if "if not isinstance(schema, dict):" in text:
-                    return  # already patched
-                OLD = (
-                    'def _json_schema_to_python_type(schema: Any, defs) -> str:\n'
-                    '    """Convert the json schema into a python type hint"""\n'
-                    '    if schema == {}:'
-                )
-                NEW = (
-                    'def _json_schema_to_python_type(schema: Any, defs) -> str:\n'
-                    '    """Convert the json schema into a python type hint"""\n'
-                    '    if not isinstance(schema, dict):\n'
-                    '        return "Any"\n'
-                    '    if schema == {}:'
-                )
-                if OLD in text:
-                    candidate.write_text(text.replace(OLD, NEW, 1))
-                    print(f"[Patch] gradio_client/utils.py patched at {candidate}")
-                    return
-                OLD2 = 'def get_type(schema: dict):\n    if "const" in schema:'
-                NEW2 = (
-                    'def get_type(schema: dict):\n'
-                    '    if not isinstance(schema, dict):\n'
-                    '        return "unknown"\n'
-                    '    if "const" in schema:'
-                )
-                if OLD2 in text:
-                    candidate.write_text(text.replace(OLD2, NEW2, 1))
-                    print(f"[Patch] gradio_client/utils.py (get_type fallback) patched at {candidate}")
-                    return
+        import gradio_client as _gradio_client
+        candidate = Path(_gradio_client.__file__).parent / "utils.py"
+        if not candidate.exists():
+            print(f"[Patch] gradio_client/utils.py not found at {candidate}")
+            return
+        text = candidate.read_text()
+        if "if not isinstance(schema, dict):" in text:
+            print(f"[Patch] gradio_client/utils.py already correctly patched")
+            return
+        OLD = (
+            'def _json_schema_to_python_type(schema: Any, defs) -> str:\n'
+            '    """Convert the json schema into a python type hint"""\n'
+            '    if schema == {}:'
+        )
+        NEW = (
+            'def _json_schema_to_python_type(schema: Any, defs) -> str:\n'
+            '    """Convert the json schema into a python type hint"""\n'
+            '    if not isinstance(schema, dict):\n'
+            '        return "Any"\n'
+            '    if schema == {}:'
+        )
+        if OLD in text:
+            candidate.write_text(text.replace(OLD, NEW, 1))
+            print(f"[Patch] gradio_client/utils.py patched at {candidate}")
+            return
+        OLD2 = 'def get_type(schema: dict):\n    if "const" in schema:'
+        NEW2 = (
+            'def get_type(schema: dict):\n'
+            '    if not isinstance(schema, dict):\n'
+            '        return "unknown"\n'
+            '    if "const" in schema:'
+        )
+        if OLD2 in text:
+            candidate.write_text(text.replace(OLD2, NEW2, 1))
+            print(f"[Patch] gradio_client/utils.py (get_type fallback) patched at {candidate}")
+            return
+        print(f"[Patch] gradio_client/utils.py: no matching pattern found, skipping")
     except Exception as _e:
         print(f"[Patch] gradio_client utils patch failed (non-fatal): {_e}")
 
@@ -299,10 +453,13 @@ def _self_heal_diffusers_version():
 
 
 _self_heal_torch()              # first: transformers crashes if torch.__version__ is None
-_self_heal_diffusers_version()  # before transformers heal can downgrade diffusers
-_self_heal_gradio_version()
+_self_heal_diffusers_version()
 _self_heal_transformers_version()
-_self_heal_diffusers_version()  # after: transformers heal re-pins deps and can roll diffusers back
+# Gradio file patches run here — BEFORE gradio is imported — by importing
+# gradio temporarily just for __file__ resolution, patching, then letting the
+# real import below pick up the corrected files.
+_self_heal_gradio_version()     # patches oauth.py and gradio_client/utils.py in-place
+_self_heal_diffusers_version()  # re-check after transformers may have rolled deps
 
 os.environ.update({
     "TMPDIR": "/dev/shm/newgen",
@@ -643,6 +800,24 @@ if not os.path.exists(os.path.join(SCRIPT_DIR, "train_log", "RIFE_HDv3.py")):
         ], check=True)
     subprocess.run(["unzip", "-n", os.path.join(SCRIPT_DIR, "RIFEv4.26_0921.zip")], check=True)
 
+try:
+    import torchvision
+except ModuleNotFoundError:
+    print("[SelfHeal] torchvision missing — installing...")
+    _r = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir",
+         "torchvision", "--index-url", "https://download.pytorch.org/whl/cu130"],
+        capture_output=True, text=True,
+    )
+    if _r.returncode != 0:
+        _r = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "torchvision"],
+            capture_output=True, text=True,
+        )
+    if _r.returncode != 0:
+        raise RuntimeError(f"torchvision install failed:\n{_r.stderr.strip()}")
+    print("[SelfHeal] torchvision installed OK")
+
 sys.path.append(os.path.join(SCRIPT_DIR, "train_log"))
 from train_log.RIFE_HDv3 import Model
 
@@ -811,11 +986,12 @@ FOLEY_MODEL_DIR = Path(SCRIPT_DIR) / "HunyuanVideo-Foley-weights"
 # ---------------------------------------------------------------------------
 # Isolated venvs for audio/lipsync engines.
 #
-# ALL three engines (F5-TTS, HunyuanVideo-Foley, LatentSync) live in their
+# ALL three engines (F5-TTS, HunyuanVideo-Foley, MuseTalk) live in their
 # own venvs that are completely separate from both the system Python packages
 # and the app venv (/root/newgen/.app-venv).  This means:
 #   • protobuf conflicts between F5-TTS (>=6.33) and Foley (<5.0) are gone
-#   • LatentSync deps (mediapipe, etc.) cannot downgrade the app's numpy/torch
+#   • MuseTalk's mmcv/mmdet/mmpose (OpenMMLab) stack cannot downgrade the
+#     app's numpy/torch, and its own torch copy never touches the system one
 #   • the system torch 2.8 dev+cu128 is NEVER touched by any of these installs
 #
 # Each engine is invoked exclusively via subprocess using its own venv python.
@@ -830,9 +1006,10 @@ F5_VENV_PY  = F5_VENV_DIR / "bin" / "python"
 FOLEY_VENV_DIR = Path(SCRIPT_DIR) / ".foley-venv"
 FOLEY_VENV_PY  = FOLEY_VENV_DIR / "bin" / "python"
 
-# LatentSync venv — isolated: mediapipe + own deps, never touches system numpy
-LATENTSYNC_VENV_DIR = Path(SCRIPT_DIR) / ".latentsync-venv"
-LATENTSYNC_VENV_PY  = LATENTSYNC_VENV_DIR / "bin" / "python"
+# MuseTalk venv — isolated: mmcv/mmdet/mmpose (OpenMMLab) + own torch copy,
+# never touches system numpy/torch.
+MUSETALK_VENV_DIR = Path(SCRIPT_DIR) / ".musetalk-venv"
+MUSETALK_VENV_PY  = MUSETALK_VENV_DIR / "bin" / "python"
 
 _AUDIO_ENGINE_AVAILABLE = False   # set True once both engines verified usable
 
@@ -879,6 +1056,65 @@ def _ensure_audio_engines():
             check=False, capture_output=True,  # non-fatal: falls back to sox
         )
         print("[AudioEngine] Foley venv base ready.")
+
+    # --- Ensure `transformers` is present in the Foley venv -----------------
+    # HunyuanVideo-Foley's requirements.txt pins a git+ dev branch of
+    # transformers. The repo-requirements install below deliberately strips
+    # any line starting with "transformers" (and any git+transformers line)
+    # out of that file — see _CONFLICTING_PREFIXES further down — because
+    # blindly installing a random dev branch is risky. But since that git+
+    # line was the ONLY place `transformers` would have been installed, the
+    # net effect was that the Foley venv never got `transformers` at all,
+    # so infer.py's `from transformers import ...` crashed with
+    # "ModuleNotFoundError: No module named 'transformers'". The Foley venv
+    # is fully isolated from the rest of the app, so installing a normal,
+    # stable PyPI `transformers` release here is safe — it can't conflict
+    # with anything outside `.foley-venv`. This check runs on every startup
+    # (cheap when already satisfied) so it also repairs venvs created before
+    # this fix existed, without needing to delete/recreate them.
+    _foley_transformers_check = subprocess.run(
+        [str(FOLEY_VENV_PY), "-c", "import transformers"],
+        capture_output=True,
+    )
+    if _foley_transformers_check.returncode != 0:
+        print("[AudioEngine] Installing transformers into Foley venv ...")
+        _foley_tf_result = subprocess.run(
+            [str(FOLEY_VENV_PY), "-m", "pip", "install"] + _FOLEY_PIP_QUIET +
+            ["transformers==4.46.3"],
+            capture_output=True,
+        )
+        if _foley_tf_result.returncode == 0:
+            print("[AudioEngine] transformers installed into Foley venv.")
+        else:
+            print("[AudioEngine] Failed to install transformers into Foley venv: "
+                  f"{_foley_tf_result.stderr[-500:]}")
+    else:
+        # Even if transformers is importable, an unpinned/too-new install
+        # (e.g. from a prior run of this code before the version was pinned)
+        # may be missing APIs HunyuanVideo-Foley's synchformer/ast_model.py
+        # needs — e.g. transformers.pytorch_utils.find_pruneable_heads_and_indices
+        # was removed in newer transformers releases, causing
+        # "ImportError: cannot import name 'find_pruneable_heads_and_indices'
+        # from 'transformers.pytorch_utils'". Detect that specific breakage
+        # and pin down to a known-good version if so.
+        _foley_ast_check = subprocess.run(
+            [str(FOLEY_VENV_PY), "-c",
+             "from transformers.pytorch_utils import find_pruneable_heads_and_indices"],
+            capture_output=True,
+        )
+        if _foley_ast_check.returncode != 0:
+            print("[AudioEngine] Foley venv's transformers is missing APIs "
+                  "HunyuanVideo-Foley needs — pinning to a compatible version ...")
+            _foley_tf_result = subprocess.run(
+                [str(FOLEY_VENV_PY), "-m", "pip", "install"] + _FOLEY_PIP_QUIET +
+                ["transformers==4.46.3"],
+                capture_output=True,
+            )
+            if _foley_tf_result.returncode == 0:
+                print("[AudioEngine] transformers pinned to 4.46.3 in Foley venv.")
+            else:
+                print("[AudioEngine] Failed to pin transformers in Foley venv: "
+                      f"{_foley_tf_result.stderr[-500:]}")
 
     # --- F5-TTS (isolated venv) -----------------------------------------
     # F5-TTS's dependency chain (via cached_path -> google-cloud-storage ->
@@ -1048,7 +1284,32 @@ _F5_INFER_WORKER_SOURCE = '''\
 Args: <json_payload_file>
 JSON keys: ref_file, gen_text, out_wav, ref_text (optional), speed (optional, default 1.0)
 """
-import sys, json, os, pathlib, importlib.util
+import sys, json, os, pathlib, importlib.util, importlib.machinery, types as _types
+
+# ---------------------------------------------------------------------------
+# Stub wandb before any f5_tts import.
+# f5_tts.model.trainer does `import wandb` at module level (training dep,
+# not needed for inference). That triggers:
+#   wandb -> pydantic_core -> typing_extensions.Sentinel (missing on old system)
+# We replace wandb in sys.modules with a no-op stub BEFORE f5_tts is loaded.
+#
+# Critical: __spec__ must be a real ModuleSpec, NOT None.
+# accelerate/tracking.py calls importlib.util.find_spec("wandb") which does:
+#   if wandb.__spec__ is None: raise ValueError
+# A ModuleSpec("wandb", None) satisfies find_spec without triggering a real import.
+# ---------------------------------------------------------------------------
+_wandb_stub = _types.ModuleType("wandb")
+_wandb_stub.__spec__ = importlib.machinery.ModuleSpec("wandb", None)
+_wandb_stub.__version__ = "0.0.0"
+_wandb_stub.init   = lambda *a, **kw: None
+_wandb_stub.log    = lambda *a, **kw: None
+_wandb_stub.finish = lambda *a, **kw: None
+_wandb_stub.run    = None
+for _mod in list(sys.modules.keys()):
+    if _mod == "wandb" or _mod.startswith("wandb."):
+        sys.modules.pop(_mod, None)
+sys.modules["wandb"] = _wandb_stub
+# ---------------------------------------------------------------------------
 
 def find_f5_pkg_dir():
     spec = importlib.util.find_spec("f5_tts")
@@ -1385,50 +1646,79 @@ def add_audio_to_video(
                 print(f"[AudioEngine] F5-TTS failed: {ve}")
                 has_voice = False
 
+        # ---- Detect whether the input video already carries audio --------
+        # (e.g. dialogue MuseTalk just muxed in during lip-sync). If so,
+        # it must be preserved and mixed with any new tracks below — not
+        # silently dropped, which is what the old foley/voice-only ffmpeg
+        # commands did (they only mapped the NEW track's audio, discarding
+        # stream 0's existing audio entirely).
+        _probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", vid_tmp],
+            capture_output=True, text=True,
+        )
+        has_input_audio = bool(_probe.stdout.strip())
+
         # ---- Neither branch succeeded --------------------------------
         if not has_foley and not has_voice:
+            if has_input_audio:
+                # Nothing new to add, but the video already has audio (e.g.
+                # dialogue baked in by MuseTalk) — return it as-is rather
+                # than reporting failure and returning the original bytes
+                # unchanged (which would still be fine here, but the log
+                # message below would be misleading).
+                print("[AudioEngine] No new audio to add — video already has an audio track.")
+                _cleanup()
+                with open(vid_tmp, "rb") as fh:
+                    return fh.read()
             print("[AudioEngine] Both audio branches failed — returning silent video.")
             _cleanup()
             return video_buf
 
         # ---- FFmpeg mix & mux ----------------------------------------
-        if has_foley and has_voice:
-            # Mix voice (full volume) over foley (slightly quieter)
-            ffmpeg_cmd = [
-                "ffmpeg", "-y",
-                "-i", vid_tmp,
-                "-i", voice_wav,
-                "-i", foley_wav,
-                "-filter_complex",
-                "[1:a]volume=1.0[v];[2:a]volume=0.65[f];[v][f]amix=inputs=2:duration=longest[aout]",
-                "-map", "0:v",
-                "-map", "[aout]",
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k",
-                out_vid_tmp,
-            ]
-        elif has_voice:
-            ffmpeg_cmd = [
-                "ffmpeg", "-y",
-                "-i", vid_tmp,
-                "-i", voice_wav,
-                "-map", "0:v",
-                "-map", "1:a",
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k",
-                out_vid_tmp,
-            ]
-        else:  # foley only
-            ffmpeg_cmd = [
-                "ffmpeg", "-y",
-                "-i", vid_tmp,
-                "-i", foley_wav,
-                "-map", "0:v",
-                "-map", "1:a",
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k",
-                out_vid_tmp,
-            ]
+        # Build the list of audio sources to mix: the video's own existing
+        # audio (if any), the new voice track (if any), the new foley track
+        # (if any). Always mix rather than blindly overwrite.
+        extra_inputs = []      # extra -i args, in order, after vid_tmp
+        filter_parts = []      # per-source volume/label filters
+        mix_labels = []        # labels to feed into amix
+        next_in = 1
+
+        if has_input_audio:
+            filter_parts.append("[0:a]volume=1.0[existing]")
+            mix_labels.append("[existing]")
+        if has_voice:
+            extra_inputs.append(voice_wav)
+            filter_parts.append(f"[{next_in}:a]volume=1.0[voice]")
+            mix_labels.append("[voice]")
+            next_in += 1
+        if has_foley:
+            extra_inputs.append(foley_wav)
+            filter_parts.append(f"[{next_in}:a]volume=0.65[foley]")
+            mix_labels.append("[foley]")
+            next_in += 1
+
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", vid_tmp]
+        for _extra in extra_inputs:
+            ffmpeg_cmd += ["-i", _extra]
+
+        if len(mix_labels) == 1:
+            # Only one audio source in play — no amix needed, just relabel it.
+            filter_complex = ";".join(filter_parts) + f";{mix_labels[0]}anull[aout]"
+        else:
+            filter_complex = (
+                ";".join(filter_parts)
+                + f";{''.join(mix_labels)}amix=inputs={len(mix_labels)}:duration=longest[aout]"
+            )
+
+        ffmpeg_cmd += [
+            "-filter_complex", filter_complex,
+            "-map", "0:v",
+            "-map", "[aout]",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k",
+            out_vid_tmp,
+        ]
 
         mix_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=120)
         if mix_result.returncode != 0:
@@ -1452,185 +1742,362 @@ def add_audio_to_video(
 _ensure_audio_engines()
 
 
-# ── LatentSync (lip-sync post-processor) ─────────────────────────────────────
-LATENTSYNC_DIR = Path(SCRIPT_DIR) / "LatentSync"
-LATENTSYNC_CKPT = LATENTSYNC_DIR / "checkpoints" / "latentsync_unet.pt"
-LATENTSYNC_CONFIG = LATENTSYNC_DIR / "configs" / "unet" / "second_stage.yaml"
+# ── MuseTalk (lip-sync post-processor) ───────────────────────────────────────
+# Replaces the old LatentSync integration. Same task (video + audio -> lip
+# synced video), same isolated-venv/subprocess architecture, but MuseTalk's
+# real-time latent-inpainting UNet produces sharper mouth/teeth detail than
+# LatentSync's diffusion UNet and runs several times faster per clip.
+MUSETALK_DIR          = Path(SCRIPT_DIR) / "MuseTalk"
+MUSETALK_MODELS_DIR   = MUSETALK_DIR / "models"
+MUSETALK_UNET_CKPT    = MUSETALK_MODELS_DIR / "musetalk" / "pytorch_model.bin"
+MUSETALK_VAE_CKPT     = MUSETALK_MODELS_DIR / "sd-vae-ft-mse" / "diffusion_pytorch_model.bin"
+MUSETALK_WHISPER_CKPT = MUSETALK_MODELS_DIR / "whisper" / "tiny.pt"
 
-_latentsync_ready = False   # set True once install confirmed
-_latentsync_lock  = threading.Lock()
+_musetalk_ready = False   # set True once install confirmed
+_musetalk_lock  = threading.Lock()
 
-def _ensure_latentsync():
-    """Clone LatentSync, create its isolated venv, and download checkpoint.
 
-    LatentSync deps (mediapipe, etc.) are installed ONLY into the isolated
-    .latentsync-venv — they NEVER touch the system Python, the system torch,
-    or the app venv.  All inference is done by spawning LATENTSYNC_VENV_PY
-    as a subprocess (see _run_latentsync).
+def _ensure_musetalk():
+    """Clone MuseTalk, create its isolated venv, install the OpenMMLab stack,
+    and download all model weights.
+
+    MuseTalk's deps (mmcv, mmdet, mmpose, its own torch copy, etc.) are
+    installed ONLY into the isolated .musetalk-venv — they NEVER touch the
+    system Python, the system torch, or the app venv. All inference is done
+    by spawning MUSETALK_VENV_PY as a subprocess (see _run_musetalk).
 
     Key design decisions:
       • No --system-site-packages: the venv is fully self-contained.
-      • torch/torchaudio are installed inside the venv (separate copy) so
-        LatentSync has a stable runtime regardless of the system torch version.
-      • numpy<2.1 is enforced ONLY inside the LatentSync venv — the system
-        numpy 2.1.2 is untouched.
-      • mediapipe==0.10.11 was yanked from PyPI; we loosen it to >=0.10.13.
+      • torch/torchvision/torchaudio are installed inside the venv first, so
+        `mim install mmcv` auto-selects a prebuilt wheel matching THIS venv's
+        torch/CUDA build rather than the system torch 2.8 dev build.
+      • All model weights (UNet, VAE, whisper, dwpose, face-parse) are pulled
+        in one shot via huggingface_hub.snapshot_download of TMElyralab/MuseTalk
+        into models/, matching the repo's documented layout — this avoids
+        depending on the exact contents of the repo's own download_weights.sh,
+        which has changed across revisions.
     """
-    global _latentsync_ready
-    with _latentsync_lock:
-        if _latentsync_ready:
+    global _musetalk_ready
+    with _musetalk_lock:
+        if _musetalk_ready:
             return True
         try:
             # --- Clone repo -----------------------------------------------
-            if not LATENTSYNC_DIR.exists():
-                print("[LipSync] Cloning LatentSync...")
+            if not MUSETALK_DIR.exists():
+                print("[LipSync] Cloning MuseTalk...")
                 subprocess.run(
                     ["git", "clone", "--depth", "1",
-                     "https://github.com/bytedance/LatentSync.git",
-                     str(LATENTSYNC_DIR)],
+                     "https://github.com/TMElyralab/MuseTalk.git",
+                     str(MUSETALK_DIR)],
                     check=True, capture_output=True,
                 )
-                print("[LipSync] LatentSync cloned.")
+                print("[LipSync] MuseTalk cloned.")
 
             # --- Create isolated venv ------------------------------------
-            _LS_PIP_QUIET = [
+            _MT_PIP_QUIET = [
                 "--quiet", "--disable-pip-version-check",
                 "--root-user-action=ignore", "--no-warn-conflicts", "--no-cache-dir",
             ]
-            # pip uses TMPDIR for build isolation; /dev/shm is often noexec
-            _ls_env = {**os.environ, "TMPDIR": "/tmp"}
+            # pip uses TMPDIR for build isolation; /dev/shm is often noexec.
+            # CRITICAL: strip PYTHONPATH. run_app.sh exports PYTHONPATH
+            # pointing at the SYSTEM site-packages so the app venv can see
+            # system torch. That same env var leaks into every subprocess
+            # spawned here (os.environ is inherited), which means any pip
+            # build step in THIS venv silently falls back to importing the
+            # system torch instead of the venv's own isolated copy the
+            # instant the venv's own torch is missing or not yet installed.
+            # That's what caused the "Unknown CUDA arch (9.0,12.0)" mmcv
+            # build failure: it compiled against the system's older torch
+            # dev build, which doesn't recognize Blackwell (compute 12.0).
+            _mt_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            _mt_env["TMPDIR"] = "/tmp"
 
-            if not LATENTSYNC_VENV_PY.exists():
-                print("[LipSync] Creating isolated venv for LatentSync ...")
+            _fresh_venv = not MUSETALK_VENV_PY.exists()
+
+            # Always verify torch actually imports inside THIS venv — don't
+            # gate the install on "venv is newly created". A venv that
+            # already exists from a prior partial/failed run (as here) will
+            # otherwise never get torch installed, ever.
+            _needs_torch = True
+            if not _fresh_venv:
+                _torch_check = subprocess.run(
+                    [str(MUSETALK_VENV_PY), "-c", "import torch"],
+                    capture_output=True, env=_mt_env,
+                )
+                _needs_torch = _torch_check.returncode != 0
+
+            if _fresh_venv:
+                print("[LipSync] Creating isolated venv for MuseTalk ...")
                 subprocess.run(
-                    [sys.executable, "-m", "venv", str(LATENTSYNC_VENV_DIR)],
+                    [sys.executable, "-m", "venv", str(MUSETALK_VENV_DIR)],
                     check=True,
                 )
+
+            if _needs_torch:
+                # Install torch inside the MuseTalk venv (separate copy,
+                # does NOT affect the system torch 2.8 dev build). This must
+                # happen BEFORE mim install mmcv below, so mim can detect
+                # this venv's torch/CUDA version and fetch a matching wheel.
+                print("[LipSync] Installing torch into MuseTalk venv "
+                      "(cu128 wheel index, needed for Blackwell/sm_120 support) ...")
                 subprocess.run(
-                    [str(LATENTSYNC_VENV_PY), "-m", "pip", "install"] +
-                    _LS_PIP_QUIET + ["--upgrade", "pip"],
-                    check=True, capture_output=True, env=_ls_env,
-                )
-                # Install torch inside the LatentSync venv (separate copy,
-                # does NOT affect the system torch 2.8 dev build).
-                print("[LipSync] Installing torch into LatentSync venv ...")
-                subprocess.run(
-                    [str(LATENTSYNC_VENV_PY), "-m", "pip", "install"] +
-                    _LS_PIP_QUIET + ["torch", "torchaudio"],
-                    check=True, capture_output=True, env=_ls_env,
+                    [str(MUSETALK_VENV_PY), "-m", "pip", "install"] +
+                    _MT_PIP_QUIET +
+                    ["--index-url", "https://download.pytorch.org/whl/cu128",
+                     "torch", "torchvision", "torchaudio"],
+                    check=True, capture_output=True, env=_mt_env,
                 )
 
-            # --- Install LatentSync's requirements into its venv ----------
-            req_file = LATENTSYNC_DIR / "requirements.txt"
+            # Always ensure pip/setuptools/wheel are current, even on a venv
+            # that already exists from a prior run. Python 3.12's `venv`
+            # module stopped auto-installing setuptools/wheel (only pip),
+            # so any package here needing a source build (no prebuilt wheel)
+            # fails with "Cannot import 'setuptools.build_meta'" until this
+            # runs. Doing this unconditionally self-heals a venv that was
+            # created before this fix, without requiring a manual `rm -rf
+            # .musetalk-venv`.
+            # NOTE: setuptools is pinned <81 here. setuptools 81 (May 2025)
+            # removed pkg_resources outright, which breaks mmcv/mmpose's
+            # legacy source-build probing (and anything else on this stack
+            # that still does `import pkg_resources` under the hood).
+            subprocess.run(
+                [str(MUSETALK_VENV_PY), "-m", "pip", "install"] +
+                _MT_PIP_QUIET + ["--upgrade", "pip", "setuptools<81", "wheel"],
+                check=False, capture_output=True, env=_mt_env,
+            )
+
+            # --- Install MuseTalk's own requirements.txt -------------------
+            # MuseTalk's upstream requirements.txt pins tensorflow==2.12.0
+            # and numpy==1.23.5. Neither has a Python 3.12 wheel (TensorFlow
+            # added 3.12 support in 2.16+, NumPy in 1.26+), so pip falls back
+            # to building both from source. That source build imports
+            # setuptools.build_meta -> pkg_resources, which calls
+            # `register_finder(pkgutil.ImpImporter, ...)` — an attribute
+            # pkgutil dropped in Python 3.12 — crashing with
+            # "module 'pkgutil' has no attribute 'ImpImporter'". Confirmed
+            # from the actual traceback, not a guess.
+            #
+            # Fix: relax ONLY those two exact pins to unconstrained versions
+            # so pip resolves prebuilt cp312 wheels instead of source-
+            # building 2023-era releases. Every other pin is left untouched.
+            req_file = MUSETALK_DIR / "requirements.txt"
             if req_file.exists():
-                import re as _re
-                req_text = req_file.read_text()
-                patched = req_text
-                # mediapipe==0.10.11 was yanked from PyPI — loosen the pin.
-                patched = _re.sub(r"mediapipe==\S+", "mediapipe>=0.10.13", patched)
-                # Drop any torch/numpy pins from LatentSync's requirements.
-                # We manage those ourselves inside the venv below.
-                patched = _re.sub(r"(?m)^torch[^\n]*\n?", "", patched)
-                patched = _re.sub(r"(?m)^numpy[^\n]*\n?", "", patched)
-                # Write filtered requirements next to the original so git
-                # status on the clone is not dirtied.
-                filtered_req = LATENTSYNC_DIR / "requirements.filtered.txt"
-                filtered_req.write_text(patched)
-
+                _req_text = req_file.read_text()
+                _req_lines = []
+                for _line in _req_text.splitlines():
+                    _stripped = _line.strip()
+                    if _stripped.startswith("tensorflow==") or _stripped.startswith("tensorboard=="):
+                        _pkg_name = _stripped.split("==")[0]
+                        print(f"[LipSync] Relaxing pin '{_stripped}' -> "
+                              f"'{_pkg_name}' (no cp312 wheel for the pinned version).")
+                        _req_lines.append(_pkg_name)
+                    elif _stripped.startswith("numpy=="):
+                        print(f"[LipSync] Relaxing pin '{_stripped}' -> 'numpy>=1.26' "
+                              f"(no cp312 wheel for the pinned version).")
+                        _req_lines.append("numpy>=1.26")
+                    else:
+                        _req_lines.append(_line)
+                _patched_req_file = MUSETALK_VENV_DIR / "requirements.cp312.txt"
+                _patched_req_file.write_text("\n".join(_req_lines) + "\n")
                 subprocess.run(
-                    [str(LATENTSYNC_VENV_PY), "-m", "pip", "install",
-                     "-r", str(filtered_req)] + _LS_PIP_QUIET,
-                    check=False, env=_ls_env,
+                    [str(MUSETALK_VENV_PY), "-m", "pip", "install",
+                     "-r", str(_patched_req_file)] + _MT_PIP_QUIET,
+                    check=False, env=_mt_env,
                 )
-                # Enforce numpy<2.1 INSIDE the LatentSync venv only.
-                # The system numpy 2.1.2 is NOT touched.
-                subprocess.run(
-                    [str(LATENTSYNC_VENV_PY), "-m", "pip", "install"] +
-                    _LS_PIP_QUIET + ["--force-reinstall", "numpy>=1.26,<2.1"],
-                    check=False, env=_ls_env,
-                )
-                print("[LipSync] LatentSync venv deps installed.")
 
-            # --- Download checkpoint if missing ---------------------------
-            (LATENTSYNC_DIR / "checkpoints").mkdir(exist_ok=True)
-            if not LATENTSYNC_CKPT.exists():
-                print("[LipSync] Downloading LatentSync checkpoint (~1.7 GB)...")
+            # --- MuseTalk's bundled whisper (encoder-only) ------------------
+            # Only pip-install it if it's actually a real installable package
+            # (setup.py/pyproject.toml present) — on current repo revisions
+            # this directory is plain source with no build metadata, so
+            # `pip install --editable` fails with "does not appear to be a
+            # Python project". In that case it needs no install at all: we
+            # always invoke MuseTalk via `-m scripts.inference` with cwd set
+            # to the repo root, which puts musetalk/ on sys.path as a normal
+            # subpackage already.
+            whisper_pkg_dir = MUSETALK_DIR / "musetalk" / "whisper"
+            _whisper_installable = (
+                (whisper_pkg_dir / "setup.py").exists()
+                or (whisper_pkg_dir / "pyproject.toml").exists()
+            )
+            if whisper_pkg_dir.exists() and _whisper_installable:
                 subprocess.run(
-                    ["wget", "-q", "-O", str(LATENTSYNC_CKPT),
-                     "https://huggingface.co/ByteDance/LatentSync/resolve/main/latentsync_unet.pt"],
-                    check=True,
+                    [str(MUSETALK_VENV_PY), "-m", "pip", "install",
+                     "--editable", str(whisper_pkg_dir)] + _MT_PIP_QUIET,
+                    check=False, env=_mt_env,
                 )
-                print("[LipSync] LatentSync checkpoint ready.")
+            elif whisper_pkg_dir.exists():
+                print("[LipSync] musetalk/whisper has no setup.py/pyproject.toml — "
+                      "skipping pip install, it's used via sys.path instead.")
 
-            _latentsync_ready = True
+            # --- OpenMMLab stack via plain pip (NOT openmim) -----------------
+            # `mim` was dropped entirely. Both failure modes we hit
+            # ("No module named 'pkg_resources'" and "No module named
+            # 'pip'") come from mim's own internal subprocess probing
+            # script crashing — not from mmcv/mmpose themselves. mim spawns
+            # a throwaway `python -c "..."` snippet to detect the venv's
+            # torch/CUDA build, and that snippet assumes pkg_resources /
+            # pip are importable in ways that don't hold up on newer
+            # setuptools or in this venv's isolated build environment.
+            #
+            # On top of that, this venv's torch is a normal PyPI torch
+            # (installed a few lines up), but if it's ever bumped to a
+            # bleeding-edge dev build there is no prebuilt mmcv wheel for it
+            # anyway — mim would fall back to a from-source build regardless.
+            # So we just build from source ourselves with
+            # `pip --no-build-isolation`, which reuses this venv's own
+            # already-installed pip/setuptools/torch for the build instead
+            # of mim's flaky ephemeral probe.
+            #
+            # mmcv needs its CUDA ops compiled against the venv's torch;
+            # MMCV_WITH_OPS=1 enables that (mmcv builds CPU-only otherwise).
+            _mmcv_env = {**_mt_env, "MMCV_WITH_OPS": "1"}
+            for _pkg in ["mmengine", "mmcv>=2.0.1", "mmdet>=3.1.0", "mmpose>=1.1.0"]:
+                _r = subprocess.run(
+                    [str(MUSETALK_VENV_PY), "-m", "pip", "install",
+                     "--no-build-isolation"] + _MT_PIP_QUIET + [_pkg],
+                    capture_output=True, text=True, env=_mmcv_env,
+                )
+                if _r.returncode != 0:
+                    print(f"[LipSync] pip install {_pkg} failed (non-fatal, may already be satisfied): "
+                          f"{_r.stderr[-500:]}")
+            print("[LipSync] MuseTalk venv deps installed.")
+
+            # --- huggingface_hub (with CLI extra) for weight download ------
+            subprocess.run(
+                [str(MUSETALK_VENV_PY), "-m", "pip", "install"] +
+                _MT_PIP_QUIET + ["huggingface_hub[cli]<1.0"],
+                check=False, env=_mt_env,
+            )
+
+            # --- Download all weights in one shot -------------------------
+            # Covers musetalk/, musetalkV15/, dwpose/, face-parse-bisent/,
+            # sd-vae-ft-mse/, whisper/ in a single snapshot_download, matching
+            # the layout MuseTalk's own scripts expect under models/.
+            MUSETALK_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+            _weights_missing = (
+                not MUSETALK_UNET_CKPT.exists() or MUSETALK_UNET_CKPT.stat().st_size < 5 * 1024 ** 2
+                or not MUSETALK_VAE_CKPT.exists() or MUSETALK_VAE_CKPT.stat().st_size < 100 * 1024 ** 2
+                or not MUSETALK_WHISPER_CKPT.exists() or MUSETALK_WHISPER_CKPT.stat().st_size < 50 * 1024 ** 2
+            )
+            if _weights_missing:
+                print("[LipSync] Downloading MuseTalk model weights (several GB, one-time)...")
+                _dl_script = (
+                    "from huggingface_hub import snapshot_download\n"
+                    "snapshot_download(repo_id='TMElyralab/MuseTalk', "
+                    f"local_dir={str(MUSETALK_MODELS_DIR)!r})\n"
+                )
+                _r = subprocess.run(
+                    [str(MUSETALK_VENV_PY), "-c", _dl_script],
+                    capture_output=True, text=True, env=_mt_env, timeout=3600,
+                )
+                if _r.stdout.strip():
+                    print(f"[LipSync] weights download stdout: {_r.stdout[-1500:]}")
+                if _r.returncode != 0:
+                    raise RuntimeError(f"weights download failed: {_r.stderr[-1500:]}")
+                if not MUSETALK_UNET_CKPT.exists():
+                    raise RuntimeError(
+                        f"snapshot_download completed but {MUSETALK_UNET_CKPT} is still missing — "
+                        "the upstream repo layout may have changed."
+                    )
+                print("[LipSync] MuseTalk weights ready.")
+
+            _musetalk_ready = True
             return True
         except Exception as _e:
-            print(f"[LipSync] _ensure_latentsync failed: {_e}")
+            print(f"[LipSync] _ensure_musetalk failed: {_e}")
             return False
 
 
-def _run_latentsync(video_path: str, audio_path: str, output_path: str,
-                    inference_steps: int = 20, guidance_scale: float = 1.5) -> bool:
+def _run_musetalk(video_path: str, audio_path: str, output_path: str,
+                   bbox_shift: int = 0, batch_size: int = 4) -> bool:
     """
-    Run LatentSync on (video_path + audio_path) → output_path.
+    Run MuseTalk on (video_path + audio_path) → output_path.
     Returns True on success.
+
+    bbox_shift: controls mouth openness (positive = more open). Same
+                parameter MuseTalk's own docs recommend tuning per-subject.
+    batch_size: frames processed per UNet batch. Higher = faster but more
+                VRAM. 4 is a safe default; lower it if you see CUDA OOM.
     """
-    if not _ensure_latentsync():
-        print("[LipSync] LatentSync not available — skipping lip sync.")
+    if not _ensure_musetalk():
+        print("[LipSync] MuseTalk not available — skipping lip sync.")
         return False
 
-    infer_script = LATENTSYNC_DIR / "scripts" / "inference.sh"
-    infer_py     = LATENTSYNC_DIR / "inference.py"
+    job_dir = Path(SCRIPT_DIR) / "tmp" / f"musetalk_job_{uuid.uuid4().hex}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = job_dir / "task.yaml"
+    result_dir = job_dir / "results"
+    result_dir.mkdir(parents=True, exist_ok=True)
 
-    # Prefer the Python entry-point; fall back to the shell script.
-    # Always run through LATENTSYNC_VENV_PY — never sys.executable — so
-    # LatentSync's deps (mediapipe, etc.) stay inside the isolated venv.
-    if infer_py.exists():
-        cmd = [
-            str(LATENTSYNC_VENV_PY), str(infer_py),
-            "--unet_config_path", str(LATENTSYNC_CONFIG),
-            "--inference_ckpt_path", str(LATENTSYNC_CKPT),
-            "--video_path", video_path,
-            "--audio_path", audio_path,
-            "--video_out_path", output_path,
-            "--inference_steps", str(inference_steps),
-            "--guidance_scale", str(guidance_scale),
-        ]
-        cwd = str(LATENTSYNC_DIR)
-    elif infer_script.exists():
-        cmd = [
-            "bash", str(infer_script),
-            "--unet_config_path", str(LATENTSYNC_CONFIG),
-            "--inference_ckpt_path", str(LATENTSYNC_CKPT),
-            "--video_path", video_path,
-            "--audio_path", audio_path,
-            "--video_out_path", output_path,
-            "--inference_steps", str(inference_steps),
-            "--guidance_scale", str(guidance_scale),
-        ]
-        cwd = str(LATENTSYNC_DIR)
-    else:
-        print("[LipSync] Cannot find LatentSync inference entry-point.")
-        return False
+    # Hand-write the YAML — it's a trivially simple two-key mapping, so we
+    # avoid adding a PyYAML dependency to the parent app venv just for this.
+    cfg_path.write_text(
+        "task_0:\n"
+        f"  video_path: {os.path.abspath(video_path)}\n"
+        f"  audio_path: {os.path.abspath(audio_path)}\n",
+        encoding="utf-8",
+    )
+
+    _start_time = time.time()
+
+    # Always run through MUSETALK_VENV_PY — never sys.executable — so
+    # MuseTalk's deps (mmcv, mmdet, etc.) stay inside the isolated venv.
+    # --result_dir is passed optimistically; if this MuseTalk revision's
+    # scripts.inference doesn't accept it, we retry without it and fall
+    # back to scanning the whole repo's results/ tree for the newest mp4.
+    _base_cmd = [
+        str(MUSETALK_VENV_PY), "-m", "scripts.inference",
+        "--inference_config", str(cfg_path),
+        "--bbox_shift", str(bbox_shift),
+        "--batch_size", str(batch_size),
+    ]
+
+    def _invoke(cmd):
+        return subprocess.run(
+            cmd, cwd=str(MUSETALK_DIR), capture_output=True, text=True, timeout=900,
+        )
 
     try:
-        result = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=600,
-        )
+        result = _invoke(_base_cmd + ["--result_dir", str(result_dir)])
+        if result.returncode != 0 and "unrecognized arguments" in (result.stderr or "").lower() \
+                and "result_dir" in (result.stderr or "").lower():
+            print("[LipSync] This MuseTalk revision doesn't accept --result_dir — retrying without it.")
+            result = _invoke(_base_cmd)
+
+        if result.stdout.strip():
+            print(f"[LipSync] MuseTalk stdout: {result.stdout[-3000:]}")
         if result.returncode != 0:
-            print(f"[LipSync] LatentSync stderr: {result.stderr[-2000:]}")
+            print(f"[LipSync] MuseTalk stderr: {result.stderr[-2000:]}")
             return False
-        if not Path(output_path).exists():
-            print("[LipSync] LatentSync ran but output file not found.")
+
+        # Find the newest .mp4 produced by this run, searching our dedicated
+        # result_dir first, then falling back to the repo's default
+        # results/ tree in case this revision ignores --result_dir entirely.
+        candidates = list(result_dir.rglob("*.mp4"))
+        if not candidates:
+            default_results = MUSETALK_DIR / "results"
+            if default_results.exists():
+                candidates = [
+                    p for p in default_results.rglob("*.mp4")
+                    if p.stat().st_mtime >= _start_time - 1
+                ]
+        if not candidates:
+            print("[LipSync] MuseTalk ran but no output .mp4 was found.")
             return False
-        print("[LipSync] LatentSync completed successfully.")
+        newest = max(candidates, key=lambda p: p.stat().st_mtime)
+
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(str(newest), output_path)
+        print(f"[LipSync] MuseTalk completed successfully ({newest.name} -> {output_path}).")
         return True
     except subprocess.TimeoutExpired:
-        print("[LipSync] LatentSync timed out.")
+        print("[LipSync] MuseTalk timed out.")
         return False
     except Exception as _e:
-        print(f"[LipSync] LatentSync subprocess error: {_e}")
+        print(f"[LipSync] MuseTalk subprocess error: {_e}")
         return False
+    finally:
+        shutil.rmtree(str(job_dir), ignore_errors=True)
 
 
 def generate_lip_sync_video(
@@ -1638,14 +2105,14 @@ def generate_lip_sync_video(
     end_img, dur, res, fmul, qual, sd, rsd,
     audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
     neg_pt, esteps, eguid, fsa, fs,
-    lipsync_steps, lipsync_cfg,
+    lipsync_bbox_shift, lipsync_batch_size,
     *lora_args,
 ):
     """
     Lip-Synced Speaking mode:
       1. Generate video normally (using dialogue_text in the motion prompt).
       2. Generate F5-TTS voice WAV from the dialogue script.
-      3. Run LatentSync to replace the mouth region with audio-driven synthesis.
+      3. Run MuseTalk to replace the mouth region with audio-driven synthesis.
       4. Mix Foley SFX on top via the normal add_audio_to_video path.
     """
     # Step 1: generate base video (with audio=False so we control audio ourselves)
@@ -1681,38 +2148,62 @@ def generate_lip_sync_video(
     if voice_wav is None or not Path(voice_wav).exists():
         # Can't lip-sync without audio — fall back to normal mix
         print("[LipSync] No voice WAV available — falling back to normal audio mix.")
+        with open(base_video_path, "rb") as _f:
+            _video_bytes = _f.read()
         final = add_audio_to_video(
-            base_video_path, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
+            _video_bytes, audio_pt, float(dur), audio_neg_pt, ref_aud, dlg_txt, v_speed,
         )
         out_path = str(Path(SCRIPT_DIR) / "tmp" / f"lipsync_out_{uuid.uuid4().hex}.mp4")
-        shutil.copy(final if final else base_video_path, out_path)
+        if final:
+            with open(out_path, "wb") as _f:
+                _f.write(final)
+        else:
+            shutil.copy(base_video_path, out_path)
         return out_path, out_path, "Lip-sync skipped (no voice WAV) — normal audio mixed."
 
-    # Step 3: LatentSync — replace mouth region
+    # Step 3: MuseTalk — replace mouth region
     ls_out = str(Path(SCRIPT_DIR) / "tmp" / f"lipsync_ls_{uuid.uuid4().hex}.mp4")
-    ls_ok = _run_latentsync(
+    ls_ok = _run_musetalk(
         base_video_path, voice_wav, ls_out,
-        inference_steps=int(lipsync_steps),
-        guidance_scale=float(lipsync_cfg),
+        bbox_shift=int(lipsync_bbox_shift),
+        batch_size=int(lipsync_batch_size),
     )
     synced_video = ls_out if ls_ok else base_video_path
 
-    # Step 4: mix Foley SFX on top of the lip-synced video
-    #         pass ref_aud=None / dlg_txt="" so F5-TTS is skipped (voice already baked in)
-    final = add_audio_to_video(
-        synced_video, audio_pt, audio_neg_pt,
-        None, "",   # skip F5-TTS — voice already embedded by LatentSync
-        v_speed,
-    )
+    # Step 4: mix audio on top of the (attempted) lip-synced video.
+    #   If MuseTalk succeeded, the voice is already embedded in the video
+    #   frames/audio it produced — only add Foley SFX on top.
+    #   If MuseTalk failed, synced_video is just the silent base video, so
+    #   the F5-TTS voice_wav generated in Step 2 was NEVER embedded anywhere.
+    #   Re-mix it here (along with Foley) instead of discarding it, or the
+    #   dialogue never makes it into the output at all.
+    with open(synced_video, "rb") as _f:
+        _synced_bytes = _f.read()
+    if ls_ok:
+        final = add_audio_to_video(
+            _synced_bytes, audio_pt, float(dur), audio_neg_pt,
+            None, "",   # skip F5-TTS — voice already embedded by MuseTalk
+            v_speed,
+        )
+    else:
+        final = add_audio_to_video(
+            _synced_bytes, audio_pt, float(dur), audio_neg_pt,
+            ref_aud, dlg_txt,   # MuseTalk never ran — mix the dialogue voice in now
+            v_speed,
+        )
     out_path = str(Path(SCRIPT_DIR) / "tmp" / f"lipsync_final_{uuid.uuid4().hex}.mp4")
-    shutil.copy(final if final else synced_video, out_path)
+    if final:
+        with open(out_path, "wb") as _f:
+            _f.write(final)
+    else:
+        shutil.copy(synced_video, out_path)
 
-    status = "✅ Lip-sync complete." if ls_ok else "⚠️ LatentSync failed — normal audio mixed."
+    status = "✅ Lip-sync complete." if ls_ok else "⚠️ MuseTalk failed — dialogue voice + Foley mixed without lip sync."
     return out_path, out_path, status
 
 
-# kick off LatentSync pre-download in the background so it's ready when needed
-threading.Thread(target=_ensure_latentsync, daemon=True).start()
+# kick off MuseTalk pre-download in the background so it's ready when needed
+threading.Thread(target=_ensure_musetalk, daemon=True).start()
 
 
 MAX_SEED = np.iinfo(np.int32).max
@@ -5479,6 +5970,20 @@ body.hide-media #picgen-result-gallery video { visibility: hidden !important; }
 .gradio-container .tab-nav button { flex: 1 1 50% !important; text-align: center !important; justify-content: center !important; }
 .gradio-container .tab-nav button:nth-child(1) { order: 2 !important; }
 .gradio-container .tab-nav button:nth-child(2) { order: 1 !important; }
+/* Center all section title / heading text (Markdown headings used as
+   section titles, e.g. "### F5-TTS Voice Controls") on both tabs. */
+.gradio-container .prose h1,
+.gradio-container .prose h2,
+.gradio-container .prose h3,
+.gradio-container .prose h4,
+.gradio-container .prose h5,
+.gradio-container .prose h6 { text-align: center !important; width: 100% !important; }
+/* Accordion (expandable section) header bars: keep the title text centered
+   but pin the expand/collapse arrow icon fully to the right edge of the
+   clickable title bar. */
+.gradio-container .label-wrap { display: flex !important; align-items: center !important; justify-content: center !important; width: 100% !important; position: relative !important; }
+.gradio-container .label-wrap > span { flex: 1 1 auto !important; text-align: center !important; }
+.gradio-container .label-wrap svg { flex: 0 0 auto !important; margin-left: auto !important; position: relative !important; right: 0 !important; }
 """
 
 
@@ -5868,8 +6373,8 @@ with gr.Blocks(css=css) as demo:
                             "with a picgen prompt (Qwen generates the last frame) and a "
                             "motion prompt (Wan animates from current to generated frame); "
                             "uses Generation Steps and Frame-Edit Guidance sliders. "
-                            "Lip-Synced Speaking = generate video then run LatentSync "
-                            "(ByteDance) to drive mouth movements from your Dialogue Script — "
+                            "Lip-Synced Speaking = generate video then run MuseTalk "
+                            "(TMElyralab) to drive mouth movements from your Dialogue Script — "
                             "requires Voice Reference Clip + Dialogue Script in the Sound section."
                         ),
                     )
@@ -5915,6 +6420,13 @@ with gr.Blocks(css=css) as demo:
                             label="Generation Steps",
                             info="Auto-set by LoRAs or manually override",
                         )
+
+                    with gr.Group():
+                        resolution = gr.Radio(
+                            choices=["240p", "480p", "600p", "720p", "1080p"], value="480p",
+                            label="Resolution",
+                            info="240p=ultra-fast/tiny, 480p=fast, 600p=balanced, 720p=high quality, 1080p=max (slow, VRAM heavy)",
+                        )
                     
                     def update_flow_shift_interactivity(auto_enabled):
                         if auto_enabled:
@@ -5928,96 +6440,6 @@ with gr.Blocks(css=css) as demo:
                         outputs=[flow_shift],
                     )
 
-                    with gr.Group():
-                        add_audio_cb = gr.Checkbox(label="Add Audio (F5-TTS + HunyuanVideo-Foley)", value=True)
-                        # ── Top row: all four panels side-by-side ──────────────────────
-                        with gr.Row():
-                            audio_prompt_tb = gr.Textbox(
-                                label="Sound Effects / Foley Prompt", value="quiet ambience, soft room tone",
-                                lines=4, scale=1,
-                            )
-                            audio_negative_prompt_tb = gr.Textbox(
-                                label="Audio Negative Prompt", value="music, noise, wind, crowd",
-                                placeholder="e.g. music, noise, wind, crowd",
-                                lines=4, scale=1,
-                            )
-                            with gr.Column(scale=1):
-                                gr.Markdown("**Voice Cloning (optional)** — upload a 5-10s reference clip and type the dialogue to speak. Leave blank to skip.")
-                                ref_audio_input = gr.File(
-                                    label="Voice Reference Clip (upload .wav/.mp3, 5-10s)",
-                                    file_types=[".wav", ".mp3", ".flac", ".ogg", ".m4a"],
-                                    file_count="single",
-                                )
-                            dialogue_text_tb = gr.Textbox(
-                                label="Dialogue Script",
-                                placeholder="Leave blank to skip voice cloning",
-                                lines=4, scale=1,
-                            )
-                        # ── Voice Speed ────────────────────────────────────────────────
-                        gr.Markdown("**Voice Speed** — controls how fast the cloned voice speaks. 1.0 is natural; try 0.75–0.85 if she sounds rushed.")
-                        with gr.Row():
-                            voice_speed_slider = gr.Slider(
-                                label="Voice Speed",
-                                minimum=0.5,
-                                maximum=1.5,
-                                step=0.05,
-                                value=0.8,
-                                scale=3,
-                            )
-                        with gr.Row():
-                            voice_speed_very_slow_btn = gr.Button("🐢 Very Slow (0.6)", size="sm", scale=1)
-                            voice_speed_slow_btn      = gr.Button("🐌 Slow (0.75)",     size="sm", scale=1)
-                            voice_speed_normal_btn    = gr.Button("🎙️ Normal (1.0)",    size="sm", scale=1)
-                            voice_speed_fast_btn      = gr.Button("⚡ Fast (1.2)",       size="sm", scale=1)
-                        voice_speed_very_slow_btn.click(fn=lambda: 0.6,  outputs=[voice_speed_slider])
-                        voice_speed_slow_btn.click(     fn=lambda: 0.75, outputs=[voice_speed_slider])
-                        voice_speed_normal_btn.click(   fn=lambda: 1.0,  outputs=[voice_speed_slider])
-                        voice_speed_fast_btn.click(     fn=lambda: 1.2,  outputs=[voice_speed_slider])
-
-                        # ── F5-TTS voice control quick-insert buttons ──────────────────
-                        gr.Markdown(
-                            "### 🎙️ F5-TTS Voice Controls — click any button to insert into Dialogue Script"
-                        )
-                        gr.Markdown("**Punctuation for pacing & breath:**")
-                        with gr.Row():
-                            _ins_comma  = gr.Button(", — short pause / breath beat",              size="sm")
-                            _ins_period = gr.Button(". / ! / ? — longer pause, sentence boundary", size="sm")
-                            _ins_ellip  = gr.Button("... — extended pause / trailing off",         size="sm")
-                            _ins_emdash = gr.Button("— (em-dash) — abrupt cut / interruption",    size="sm")
-
-                        def _append_to_dialogue(current_text, insert_str):
-                            """Append insert_str to whatever is already in the dialogue box."""
-                            return (current_text or "") + insert_str
-
-                        _ins_comma.click(
-                            fn=lambda t: _append_to_dialogue(t, ", "),
-                            inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
-                        )
-                        _ins_period.click(
-                            fn=lambda t: _append_to_dialogue(t, ". "),
-                            inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
-                        )
-                        _ins_ellip.click(
-                            fn=lambda t: _append_to_dialogue(t, "... "),
-                            inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
-                        )
-                        _ins_emdash.click(
-                            fn=lambda t: _append_to_dialogue(t, " — "),
-                            inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
-                        )
-
-                        gr.Markdown(
-                            "**Capitalization for emphasis:** F5 is sensitive to capitalization for stress — "
-                            "`I LOVE this` will make LOVE land harder than `I love this`. Not perfect, but noticeable.\n\n"
-                            "**Repetition for elongation:** Stretch a vowel by writing it as you'd say it — "
-                            "`nooo`, `pleease`, `yeeees`. F5 treats the extra letters as held phonemes.\n\n"
-                            "**Phonetic spelling for tricky pronunciation:** If a word sounds wrong, spell it "
-                            "phonetically — `Anth-ro-pic` instead of `Anthropic`, `eye-kon` instead of `icon`. "
-                            "Hyphens help segment syllables.\n\n"
-                            "**Whispered / breathy tone:** F5 clones the reference voice's character — so the "
-                            "clearest lever is your reference clip itself. A breathy 5-second clip → breathy output. "
-                            "An excited clip → excited clone. Record different reference clips for different moods."
-                        )
 
                 with gr.Column(scale=1):
                     vidgen_progress = gr.Markdown(
@@ -6120,15 +6542,101 @@ with gr.Blocks(css=css) as demo:
                     )
 
                     with gr.Group():
-                        resolution = gr.Radio(
-                            choices=["240p", "480p", "600p", "720p", "1080p"], value="480p",
-                            label="Resolution",
-                            info="240p=ultra-fast/tiny, 480p=fast, 600p=balanced, 720p=high quality, 1080p=max (slow, VRAM heavy)",
-                        )
                         edit_guidance = gr.Slider(
                             1.0, 10.0, value=1.0, step=0.1,
                             label="Frame-Edit Guidance (Qwen stage)",
                         )
+
+            with gr.Group():
+                add_audio_cb = gr.Checkbox(label="Add Audio (F5-TTS + HunyuanVideo-Foley)", value=True)
+                # ── Top row: all four panels side-by-side ──────────────────────
+                with gr.Row():
+                    audio_prompt_tb = gr.Textbox(
+                        label="Sound Effects / Foley Prompt", value="quiet ambience, soft room tone",
+                        lines=4, scale=1,
+                    )
+                    audio_negative_prompt_tb = gr.Textbox(
+                        label="Audio Negative Prompt", value="music, noise, wind, crowd",
+                        placeholder="e.g. music, noise, wind, crowd",
+                        lines=4, scale=1,
+                    )
+                    with gr.Column(scale=1):
+                        gr.Markdown("**Voice Cloning (optional)** — upload a 5-10s reference clip and type the dialogue to speak. Leave blank to skip.")
+                        ref_audio_input = gr.File(
+                            label="Voice Reference Clip (upload .wav/.mp3, 5-10s)",
+                            file_types=[".wav", ".mp3", ".flac", ".ogg", ".m4a"],
+                            file_count="single",
+                        )
+                    dialogue_text_tb = gr.Textbox(
+                        label="Dialogue Script",
+                        placeholder="Leave blank to skip voice cloning",
+                        lines=4, scale=1,
+                    )
+                # ── Voice Speed ────────────────────────────────────────────────
+                gr.Markdown("**Voice Speed** — controls how fast the cloned voice speaks. 1.0 is natural; try 0.75–0.85 if she sounds rushed.")
+                with gr.Row():
+                    voice_speed_slider = gr.Slider(
+                        label="Voice Speed",
+                        minimum=0.5,
+                        maximum=1.5,
+                        step=0.05,
+                        value=0.8,
+                        scale=3,
+                    )
+                with gr.Row():
+                    voice_speed_very_slow_btn = gr.Button("🐢 Very Slow (0.6)", size="sm", scale=1)
+                    voice_speed_slow_btn      = gr.Button("🐌 Slow (0.75)",     size="sm", scale=1)
+                    voice_speed_normal_btn    = gr.Button("🎙️ Normal (1.0)",    size="sm", scale=1)
+                    voice_speed_fast_btn      = gr.Button("⚡ Fast (1.2)",       size="sm", scale=1)
+                voice_speed_very_slow_btn.click(fn=lambda: 0.6,  outputs=[voice_speed_slider])
+                voice_speed_slow_btn.click(     fn=lambda: 0.75, outputs=[voice_speed_slider])
+                voice_speed_normal_btn.click(   fn=lambda: 1.0,  outputs=[voice_speed_slider])
+                voice_speed_fast_btn.click(     fn=lambda: 1.2,  outputs=[voice_speed_slider])
+
+                # ── F5-TTS voice control quick-insert buttons ──────────────────
+                gr.Markdown(
+                    "### 🎙️ F5-TTS Voice Controls — click any button to insert into Dialogue Script"
+                )
+                gr.Markdown("**Punctuation for pacing & breath:**")
+                with gr.Row():
+                    _ins_comma  = gr.Button(", — short pause / breath beat",              size="sm")
+                    _ins_period = gr.Button(". / ! / ? — longer pause, sentence boundary", size="sm")
+                    _ins_ellip  = gr.Button("... — extended pause / trailing off",         size="sm")
+                    _ins_emdash = gr.Button("— (em-dash) — abrupt cut / interruption",    size="sm")
+
+                def _append_to_dialogue(current_text, insert_str):
+                    """Append insert_str to whatever is already in the dialogue box."""
+                    return (current_text or "") + insert_str
+
+                _ins_comma.click(
+                    fn=lambda t: _append_to_dialogue(t, ", "),
+                    inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
+                )
+                _ins_period.click(
+                    fn=lambda t: _append_to_dialogue(t, ". "),
+                    inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
+                )
+                _ins_ellip.click(
+                    fn=lambda t: _append_to_dialogue(t, "... "),
+                    inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
+                )
+                _ins_emdash.click(
+                    fn=lambda t: _append_to_dialogue(t, " — "),
+                    inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
+                )
+
+                gr.Markdown(
+                    "**Capitalization for emphasis:** F5 is sensitive to capitalization for stress — "
+                    "`I LOVE this` will make LOVE land harder than `I love this`. Not perfect, but noticeable.\n\n"
+                    "**Repetition for elongation:** Stretch a vowel by writing it as you'd say it — "
+                    "`nooo`, `pleease`, `yeeees`. F5 treats the extra letters as held phonemes.\n\n"
+                    "**Phonetic spelling for tricky pronunciation:** If a word sounds wrong, spell it "
+                    "phonetically — `Anth-ro-pic` instead of `Anthropic`, `eye-kon` instead of `icon`. "
+                    "Hyphens help segment syllables.\n\n"
+                    "**Whispered / breathy tone:** F5 clones the reference voice's character — so the "
+                    "clearest lever is your reference clip itself. A breathy 5-second clip → breathy output. "
+                    "An excited clip → excited clone. Record different reference clips for different moods."
+                )
 
             with gr.Group(visible=False) as sequence_group:
                 gr.Markdown(
@@ -6210,24 +6718,24 @@ with gr.Blocks(css=css) as demo:
             with gr.Group(visible=False) as lip_sync_group:
                 gr.Markdown(
                     "**Lip-Synced Speaking** — generates video with subject speaking, "
-                    "then runs **LatentSync** (ByteDance, 2025) to replace the mouth region "
+                    "then runs **MuseTalk** (TMElyralab) to replace the mouth region "
                     "with audio-driven synthesis locked to your Dialogue Script. "
                     "Requires a Voice Reference Clip + Dialogue Script in the Sound section above. "
-                    "LatentSync downloads automatically (~1.7 GB) on first use.\n\n"
+                    "MuseTalk downloads automatically (several GB) on first use.\n\n"
                     "Pipeline: Wan generates video → F5-TTS generates voice WAV → "
-                    "LatentSync drives mouth → Foley SFX mixed on top."
+                    "MuseTalk drives mouth → Foley SFX mixed on top."
                 )
                 with gr.Row():
                     lipsync_steps_sl = gr.Slider(
-                        label="LatentSync Inference Steps",
-                        minimum=5, maximum=50, step=1, value=20,
-                        info="More steps = better quality, slower. 20 is a good default.",
+                        label="MuseTalk Mouth Openness (bbox_shift)",
+                        minimum=-9, maximum=9, step=1, value=0,
+                        info="Positive = mouth opens more, negative = opens less. 0 is a good default.",
                         scale=2,
                     )
                     lipsync_cfg_sl = gr.Slider(
-                        label="LatentSync Guidance Scale",
-                        minimum=0.5, maximum=5.0, step=0.1, value=1.5,
-                        info="Higher = mouth follows audio more strictly. 1.5–2.0 recommended.",
+                        label="MuseTalk Batch Size",
+                        minimum=1, maximum=16, step=1, value=4,
+                        info="Higher = faster, more VRAM. Lower this if you see CUDA out-of-memory.",
                         scale=2,
                     )
 

@@ -41,7 +41,12 @@ numpy>=1.26,<2.2
 accelerate
 sentencepiece
 peft
-torchao
+# torchao / torchvision / torch / torchaudio: NOT listed here.
+# All are provided by the system Python stack (torch 2.8 dev+cu128) and made
+# available to the venv via PYTHONPATH at runtime (see run_app.sh / autorun.sh).
+# Installing any of them here would pull in a mismatched torch build as a
+# dependency, overwriting the system dev build and breaking CUDA compatibility.
+# setup.sh explicitly uninstalls any stray copies after this file runs.
 
 # --- Image/Video processing --------------------------------------------------
 opencv-python
@@ -67,6 +72,7 @@ ftfy
 tqdm
 typing-extensions
 requests
+cryptography
 
 # av: used directly by app.py for video frame extraction/encoding.
 av
