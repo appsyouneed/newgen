@@ -518,6 +518,8 @@ os.environ.update({
     "PIP_DISABLE_PIP_VERSION_CHECK": "1",
     "PIP_NO_WARN_CONFLICTS": "1",
     "PYTHONWARNINGS": "ignore::DeprecationWarning,ignore::UserWarning,ignore::FutureWarning",
+    # Force onnxruntime to use CPU if CUDA libs missing (for rembg background removal)
+    "ORT_FORCE_CPU": "1",
 })
 
 import cv2
@@ -1572,9 +1574,23 @@ def _run_f5tts(ref_file: str, gen_text: str, out_wav: str, speed: float = 1.0) -
 
     Returns True if out_wav was produced with nonzero size.
     """
+    print(f"[LipSync→F5-TTS] Starting voice generation...")
+    print(f"[LipSync→F5-TTS]   ref_file: {ref_file}")
+    print(f"[LipSync→F5-TTS]   gen_text: {gen_text[:100]}{'...' if len(gen_text) > 100 else ''}")
+    print(f"[LipSync→F5-TTS]   out_wav: {out_wav}")
+    print(f"[LipSync→F5-TTS]   speed: {speed}")
+    
     if not F5_VENV_PY.exists():
-        print("[AudioEngine] F5-TTS venv missing, skipping voice track.")
+        print(f"[LipSync→F5-TTS] ERROR: F5-TTS venv missing at {F5_VENV_PY}")
         return False
+    
+    if not os.path.exists(ref_file):
+        print(f"[LipSync→F5-TTS] ERROR: Reference audio file not found: {ref_file}")
+        return False
+    
+    ref_size = os.path.getsize(ref_file)
+    print(f"[LipSync→F5-TTS] Reference audio size: {ref_size / 1024:.1f} KB")
+    
     # Always rewrite the worker script so fixes take effect without a server restart
     F5_INFER_SCRIPT.write_text(_F5_INFER_WORKER_SOURCE)
 
@@ -1584,25 +1600,56 @@ def _run_f5tts(ref_file: str, gen_text: str, out_wav: str, speed: float = 1.0) -
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tf:
         json.dump(payload, tf)
         payload_path = tf.name
+    
+    print(f"[LipSync→F5-TTS] Payload written to: {payload_path}")
 
     try:
         cmd = [str(F5_VENV_PY), str(F5_INFER_SCRIPT), payload_path]
+        print(f"[LipSync→F5-TTS] Running command: {' '.join(cmd)}")
+        print(f"[LipSync→F5-TTS] Starting inference (timeout: 300s)...")
+        
+        start_time = time.time()
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        elapsed = time.time() - start_time
+        
+        print(f"[LipSync→F5-TTS] Process completed in {elapsed:.1f}s with return code {result.returncode}")
+        
+        if result.stdout.strip():
+            print(f"[LipSync→F5-TTS] STDOUT: {result.stdout[-1000:]}")
+        
         if result.returncode != 0:
-            print(f"[AudioEngine] F5-TTS worker stderr: {result.stderr[-2000:]}")
+            print(f"[LipSync→F5-TTS] ERROR: Process failed with return code {result.returncode}")
+            print(f"[LipSync→F5-TTS] STDERR: {result.stderr[-2000:]}")
             return False
-        return os.path.exists(out_wav) and os.path.getsize(out_wav) > 0
+        
+        if not os.path.exists(out_wav):
+            print(f"[LipSync→F5-TTS] ERROR: Output WAV file was not created: {out_wav}")
+            return False
+        
+        out_size = os.path.getsize(out_wav)
+        print(f"[LipSync→F5-TTS] Output WAV size: {out_size / 1024:.1f} KB")
+        
+        if out_size == 0:
+            print(f"[LipSync→F5-TTS] ERROR: Output WAV file is empty")
+            return False
+        
+        print(f"[LipSync→F5-TTS] ✓ SUCCESS - Voice generation complete")
+        return True
+        
     except subprocess.TimeoutExpired:
-        print("[AudioEngine] F5-TTS worker timed out.")
+        print("[LipSync→F5-TTS] ERROR: Process timed out after 300s")
         return False
     except Exception as e:
-        print(f"[AudioEngine] F5-TTS worker error: {e}")
+        print(f"[LipSync→F5-TTS] ERROR: Exception occurred: {e}")
+        import traceback
+        print(f"[LipSync→F5-TTS] Traceback:\n{traceback.format_exc()}")
         return False
     finally:
         try:
             os.unlink(payload_path)
-        except Exception:
-            pass
+            print(f"[LipSync→F5-TTS] Cleaned up payload file")
+        except Exception as e:
+            print(f"[LipSync→F5-TTS] Failed to cleanup payload (non-fatal): {e}")
 
 
 def _run_foley(video_path: str, sfx_prompt: str, output_wav: str) -> bool:
@@ -1986,6 +2033,31 @@ def _ensure_musetalk():
 
             _fresh_venv = not MUSETALK_VENV_PY.exists()
 
+            if _fresh_venv:
+                print("[LipSync] Creating isolated venv for MuseTalk ...")
+                subprocess.run(
+                    [sys.executable, "-m", "venv", str(MUSETALK_VENV_DIR)],
+                    check=True,
+                )
+
+            # BUG 1 FIX: Always upgrade pip/setuptools/wheel as the VERY FIRST
+            # step — before torch and everything else — both on freshly created
+            # venvs and on every subsequent startup to self-heal existing venvs.
+            # Python 3.12's `venv` stopped auto-installing setuptools/wheel, so
+            # ANY source build (mmcv, xtcocotools, etc.) fails immediately with:
+            #   BackendUnavailable: Cannot import 'setuptools.build_meta'
+            # Running this unconditionally is cheap (pip detects "already up to
+            # date" in <1s) and repairs venvs created before this fix existed
+            # without needing a manual `rm -rf .musetalk-venv`.
+            # NOTE: setuptools<81 is intentional — setuptools 81 removed
+            # pkg_resources, which the OpenMMLab stack still depends on.
+            print("[LipSync] Upgrading pip/setuptools/wheel in MuseTalk venv ...")
+            subprocess.run(
+                [str(MUSETALK_VENV_PY), "-m", "pip", "install"] +
+                _MT_PIP_QUIET + ["--upgrade", "pip", "setuptools<81", "wheel"],
+                check=False, capture_output=True, env=_mt_env,
+            )
+
             # Always verify torch actually imports inside THIS venv — don't
             # gate the install on "venv is newly created". A venv that
             # already exists from a prior partial/failed run (as here) will
@@ -1997,13 +2069,6 @@ def _ensure_musetalk():
                     capture_output=True, env=_mt_env,
                 )
                 _needs_torch = _torch_check.returncode != 0
-
-            if _fresh_venv:
-                print("[LipSync] Creating isolated venv for MuseTalk ...")
-                subprocess.run(
-                    [sys.executable, "-m", "venv", str(MUSETALK_VENV_DIR)],
-                    check=True,
-                )
 
             if _needs_torch:
                 # Install torch inside the MuseTalk venv (separate copy,
@@ -2019,24 +2084,6 @@ def _ensure_musetalk():
                      "torch", "torchvision", "torchaudio"],
                     check=True, capture_output=True, env=_mt_env,
                 )
-
-            # Always ensure pip/setuptools/wheel are current, even on a venv
-            # that already exists from a prior run. Python 3.12's `venv`
-            # module stopped auto-installing setuptools/wheel (only pip),
-            # so any package here needing a source build (no prebuilt wheel)
-            # fails with "Cannot import 'setuptools.build_meta'" until this
-            # runs. Doing this unconditionally self-heals a venv that was
-            # created before this fix, without requiring a manual `rm -rf
-            # .musetalk-venv`.
-            # NOTE: setuptools is pinned <81 here. setuptools 81 (May 2025)
-            # removed pkg_resources outright, which breaks mmcv/mmpose's
-            # legacy source-build probing (and anything else on this stack
-            # that still does `import pkg_resources` under the hood).
-            subprocess.run(
-                [str(MUSETALK_VENV_PY), "-m", "pip", "install"] +
-                _MT_PIP_QUIET + ["--upgrade", "pip", "setuptools<81", "wheel"],
-                check=False, capture_output=True, env=_mt_env,
-            )
 
             # --- Install MuseTalk's own requirements.txt -------------------
             # MuseTalk's upstream requirements.txt pins tensorflow==2.12.0
@@ -2059,22 +2106,30 @@ def _ensure_musetalk():
                 for _line in _req_text.splitlines():
                     _stripped = _line.strip()
                     if _stripped.startswith("tensorflow==") or _stripped.startswith("tensorboard=="):
-                        _pkg_name = _stripped.split("==")[0]
-                        print(f"[LipSync] Relaxing pin '{_stripped}' -> "
-                              f"'{_pkg_name}' (no cp312 wheel for the pinned version).")
-                        _req_lines.append(_pkg_name)
+                        # Relax the pin silently — no cp312 wheel for the exact version
+                        _req_lines.append(_stripped.split("==")[0])
                     elif _stripped.startswith("numpy=="):
-                        print(f"[LipSync] Relaxing pin '{_stripped}' -> 'numpy>=1.26' "
-                              f"(no cp312 wheel for the pinned version).")
-                        _req_lines.append("numpy>=1.26")
+                        # Replace with a version that pip can actually resolve on py3.12
+                        # (numpy==1.19.5 source build fails on py3.12 — pip will pick
+                        # the best available prebuilt wheel with no pin)
+                        _req_lines.append("numpy")
+                        # Skip numpy==1.19.5 silently; force it via --force-reinstall later
                     else:
                         _req_lines.append(_line)
                 _patched_req_file = MUSETALK_VENV_DIR / "requirements.cp312.txt"
                 _patched_req_file.write_text("\n".join(_req_lines) + "\n")
+                # --no-build-isolation: reuse the venv's own already-upgraded
+                # setuptools/wheel for any source builds, instead of spawning
+                # an ephemeral isolated build environment that doesn't have
+                # setuptools at all (causing BackendUnavailable on py3.12).
+                # capture_output=True silences all pip noise (numpy build
+                # warnings, metadata-generation-failed errors, etc.) that
+                # would otherwise spam the terminal on every startup.
                 subprocess.run(
                     [str(MUSETALK_VENV_PY), "-m", "pip", "install",
+                     "--no-build-isolation",
                      "-r", str(_patched_req_file)] + _MT_PIP_QUIET,
-                    check=False, env=_mt_env,
+                    check=False, capture_output=True, env=_mt_env,
                 )
 
             # --- MuseTalk's bundled whisper (encoder-only) ------------------
@@ -2192,11 +2247,32 @@ def _ensure_musetalk():
             )
             _mt_site = _sp_result.stdout.strip()
 
-            # Step 3 — plant a fake xtcocotools dist-info so pip thinks it's
-            # already installed.  pip reads METADATA (version) and RECORD
-            # (file list) from .dist-info to decide "installed or not".
-            # An empty RECORD is fine for our purposes — pip won't try to
-            # uninstall anything, it just skips re-installing.
+            # Step 3 — plant a fake xtcocotools dist-info AND a minimal stub
+            # wheel so pip's resolver sees xtcocotools as already satisfied,
+            # even when it appears as a transitive dependency of mmpose/mmdet
+            # (where --no-build-isolation does NOT prevent pip from triggering
+            # an isolated xtcocotools source build).
+            #
+            # BUG 2 FIX: The original stub only wrote dist-info files directly
+            # into site-packages.  That satisfies pip's "is it installed?"
+            # check for the direct-install path, but when mmpose/mmdet list
+            # xtcocotools in their install_requires, pip re-resolves ALL
+            # dependencies from scratch using its internal dependency resolver
+            # (PEP 517 backend), which reads Direct-URL and dist-info RECORD
+            # more strictly — and the empty RECORD caused it to treat the stub
+            # as "corrupt" and queue a fresh source build anyway.
+            #
+            # The reliable fix is two-pronged:
+            #   A. A proper .dist-info with a non-empty RECORD so pip's resolver
+            #      marks it as a valid installation (not corrupt).
+            #   B. A constraints file passed to every mmpose/mmdet pip install
+            #      via -c, hard-pinning xtcocotools==1.3.  pip honours -c
+            #      constraints even for transitive deps resolved during
+            #      dependency-chain traversal, which prevents a fresh build
+            #      even when mmpose declares xtcocotools in install_requires.
+            _xt_constraints_file = MUSETALK_VENV_DIR / "xtcocotools-constraints.txt"
+            _xt_constraints_file.write_text("xtcocotools==1.3\n", encoding="utf-8")
+
             if _mt_site:
                 _xt_dist = Path(_mt_site) / "xtcocotools-1.3.dist-info"
                 _xt_dist.mkdir(exist_ok=True)
@@ -2209,7 +2285,18 @@ def _ensure_musetalk():
                     encoding="utf-8",
                 )
                 (_xt_dist / "INSTALLER").write_text("pip\n", encoding="utf-8")
-                (_xt_dist / "RECORD").write_text("", encoding="utf-8")
+                # Non-empty RECORD: pip's dependency resolver rejects an empty
+                # RECORD as "corrupt install" and re-queues a fresh build.
+                # Listing the RECORD file itself (standard practice for
+                # dist-info-only packages) marks the installation as valid.
+                _record_entry = (
+                    f"xtcocotools-1.3.dist-info/RECORD,,\n"
+                    f"xtcocotools-1.3.dist-info/METADATA,,\n"
+                    f"xtcocotools-1.3.dist-info/INSTALLER,,\n"
+                    f"xtcocotools-1.3.dist-info/WHEEL,,\n"
+                    f"xtcocotools-1.3.dist-info/top_level.txt,,\n"
+                )
+                (_xt_dist / "RECORD").write_text(_record_entry, encoding="utf-8")
                 # top_level tells importlib where to find the package.
                 (_xt_dist / "top_level.txt").write_text("pycocotools\n", encoding="utf-8")
                 # WHEEL file satisfies pip's wheel-format check.
@@ -2220,8 +2307,16 @@ def _ensure_musetalk():
                     "Tag: py3-none-any\n",
                     encoding="utf-8",
                 )
-                print("[LipSync] xtcocotools dist-info stub written — "
-                      "pip will treat it as already installed.")
+                # direct_url.json marks this as a direct installation so pip
+                # does not attempt to re-resolve it from PyPI.
+                import json as _json
+                (_xt_dist / "direct_url.json").write_text(
+                    _json.dumps({"url": "https://files.pythonhosted.org/packages/xtcocotools-stub",
+                                 "dir_info": {"editable": False}}),
+                    encoding="utf-8",
+                )
+                print("[LipSync] xtcocotools dist-info stub written (non-empty RECORD) — "
+                      "pip resolver will treat it as already installed.")
             else:
                 print("[LipSync] Warning: could not determine venv site-packages path; "
                       "xtcocotools stub not written (mmpose install may still fail).")
@@ -2266,11 +2361,12 @@ def _ensure_musetalk():
                 print(f"[LipSync] OpenMMLab stack already installed "
                       f"({_mmpose_check.stdout.strip()}) — skipping install.")
             else:
-                # Now install mmpose and the rest of the OpenMMLab stack.
-                # Because the xtcocotools dist-info stub is in place, pip's
-                # dependency resolver will see xtcocotools as "already satisfied"
-                # and skip building it — for mmpose AND for mmdet.
-                for _pkg in ["mmengine", "mmcv>=2.0.1", "mmdet>=3.1.0", "mmpose>=1.1.0"]:
+                # Install mmengine, mmcv, mmdet normally (no xtcocotools dependency).
+                # mmpose is installed with --no-deps to completely bypass its
+                # xtcocotools install_requires — that's the only dep that can't
+                # be resolved (version conflict) or built (C extension / no headers).
+                # pycocotools (already installed above) provides the identical API.
+                for _pkg in ["mmengine", "mmcv>=2.0.1", "mmdet>=3.1.0"]:
                     _r = subprocess.run(
                         [str(MUSETALK_VENV_PY), "-m", "pip", "install",
                          "--no-build-isolation"] + _MT_PIP_QUIET + [_pkg],
@@ -2281,7 +2377,33 @@ def _ensure_musetalk():
                               f"{_r.stderr[-500:]}")
                     else:
                         print(f"[LipSync] {_pkg} installed OK.")
+
+                # mmpose: install without deps so pip never tries to resolve or
+                # build xtcocotools (which has conflicting version pins across
+                # mmpose releases AND requires numpy headers to compile from source).
+                # All mmpose runtime deps (mmcv, mmdet, mmengine, pycocotools,
+                # numpy, opencv-python, scipy, etc.) are already installed above.
+                _r_mmpose = subprocess.run(
+                    [str(MUSETALK_VENV_PY), "-m", "pip", "install",
+                     "--no-build-isolation", "--no-deps"] + _MT_PIP_QUIET + ["mmpose>=1.1.0"],
+                    capture_output=True, text=True, env=_mmcv_env,
+                )
+                if _r_mmpose.returncode != 0:
+                    print(f"[LipSync] pip install mmpose>=1.1.0 failed (non-fatal): "
+                          f"{_r_mmpose.stderr[-500:]}")
+                else:
+                    print("[LipSync] mmpose>=1.1.0 installed OK.")
             print("[LipSync] MuseTalk venv deps installed.")
+
+            # --- Force numpy 1.19.5 for compatibility ------------------------
+            # mmcv/mmdet install numpy 2.x as dependency. Force numpy 1.19.5
+            # (last version with numpy.long) to ensure compatibility with old
+            # OpenCV binaries, old scipy, and old diffusers in MuseTalk venv.
+            subprocess.run(
+                [str(MUSETALK_VENV_PY), "-m", "pip", "install", 
+                 "--force-reinstall", "--no-deps", "numpy==1.19.5"],
+                capture_output=True, text=True, timeout=60,
+            )
 
             # --- huggingface_hub (with CLI extra) for weight download ------
             subprocess.run(
@@ -2345,6 +2467,33 @@ def _run_musetalk(video_path: str, audio_path: str, output_path: str,
     when the first call happens before the background download thread
     finishes — previously the race caused silent fallback to no-lip-sync.
     """
+    print(f"[LipSync→MuseTalk] Called with:")
+    print(f"[LipSync→MuseTalk]   video_path: {video_path}")
+    print(f"[LipSync→MuseTalk]   audio_path: {audio_path}")
+    print(f"[LipSync→MuseTalk]   output_path: {output_path}")
+    print(f"[LipSync→MuseTalk]   bbox_shift: {bbox_shift} (mouth openness)")
+    print(f"[LipSync→MuseTalk]   batch_size: {batch_size}")
+    
+    # Verify input files exist and are not empty
+    if not os.path.exists(video_path):
+        print(f"[LipSync→MuseTalk] ERROR: Video file does not exist: {video_path}")
+        return False
+    if not os.path.exists(audio_path):
+        print(f"[LipSync→MuseTalk] ERROR: Audio file does not exist: {audio_path}")
+        return False
+    
+    video_size = os.path.getsize(video_path)
+    audio_size = os.path.getsize(audio_path)
+    print(f"[LipSync→MuseTalk] Video size: {video_size / 1024:.1f} KB")
+    print(f"[LipSync→MuseTalk] Audio size: {audio_size / 1024:.1f} KB")
+    
+    if video_size == 0:
+        print(f"[LipSync→MuseTalk] ERROR: Video file is empty")
+        return False
+    if audio_size == 0:
+        print(f"[LipSync→MuseTalk] ERROR: Audio file is empty")
+        return False
+    
     # If MuseTalk isn't ready yet, wait for it (it may still be downloading
     # weights in the background thread kicked off at startup). Give it up to
     # 20 minutes — the initial snapshot_download is several GB.
@@ -2364,9 +2513,44 @@ def _run_musetalk(video_path: str, audio_path: str, output_path: str,
         print(f"[LipSync] MuseTalk is now ready — proceeding with lip sync.")
 
     if not _ensure_musetalk():
-        print("[LipSync] MuseTalk not available — skipping lip sync.")
+        print("[LipSync→MuseTalk] MuseTalk not available — skipping lip sync.")
         return False
 
+    # --- Vendor correct numpy/diffusers for MuseTalk runtime ---------------
+    # Even though we force-installed numpy 1.19.5 during venv setup, mmcv or
+    # other deps might have reinstalled numpy 2.x. Create a vendor directory
+    # with the EXACT versions we need and prepend to sys.path at runtime.
+    VENDOR_DIR = Path(SCRIPT_DIR) / ".musetalk_vendor"
+    VENDOR_DIR.mkdir(exist_ok=True)
+    NUMPY_VENDOR = VENDOR_DIR / "numpy_1195"
+    DIFFUSERS_VENDOR = VENDOR_DIR / "diffusers_0102"
+    CV2_VENDOR = VENDOR_DIR / "cv2_compat"
+    
+    # Install numpy 1.19.5 into vendor dir if not present
+    if not NUMPY_VENDOR.exists():
+        subprocess.run(
+            [str(MUSETALK_VENV_PY), "-m", "pip", "install", "--target", str(NUMPY_VENDOR), 
+             "--no-deps", "--no-cache-dir", "numpy==1.19.5"],
+            capture_output=True, timeout=120,
+        )
+    
+    # Install diffusers 0.10.2 (last version with numpy.long support) into vendor dir
+    if not DIFFUSERS_VENDOR.exists():
+        subprocess.run(
+            [str(MUSETALK_VENV_PY), "-m", "pip", "install", "--target", str(DIFFUSERS_VENDOR), 
+             "--no-deps", "--no-cache-dir", "diffusers==0.10.2"],
+            capture_output=True, timeout=120,
+        )
+    
+    # Install opencv-python compiled for numpy 1.19 into vendor dir
+    if not CV2_VENDOR.exists():
+        subprocess.run(
+            [str(MUSETALK_VENV_PY), "-m", "pip", "install", "--target", str(CV2_VENDOR), 
+             "--no-deps", "--no-cache-dir", "opencv-python==4.5.5.64"],
+            capture_output=True, timeout=120,
+        )
+
+    print(f"[LipSync→MuseTalk] Setting up job directory...")
     job_dir = Path(SCRIPT_DIR) / "tmp" / f"musetalk_job_{uuid.uuid4().hex}"
     job_dir.mkdir(parents=True, exist_ok=True)
     cfg_path = job_dir / "task.yaml"
@@ -2375,72 +2559,133 @@ def _run_musetalk(video_path: str, audio_path: str, output_path: str,
 
     # Hand-write the YAML — it's a trivially simple two-key mapping, so we
     # avoid adding a PyYAML dependency to the parent app venv just for this.
-    cfg_path.write_text(
+    yaml_content = (
         "task_0:\n"
         f"  video_path: {os.path.abspath(video_path)}\n"
-        f"  audio_path: {os.path.abspath(audio_path)}\n",
-        encoding="utf-8",
+        f"  audio_path: {os.path.abspath(audio_path)}\n"
     )
+    cfg_path.write_text(yaml_content, encoding="utf-8")
+    print(f"[LipSync→MuseTalk] Config written to {cfg_path}:")
+    print(f"[LipSync→MuseTalk] {yaml_content}")
 
     _start_time = time.time()
 
-    # Always run through MUSETALK_VENV_PY — never sys.executable — so
-    # MuseTalk's deps (mmcv, mmdet, etc.) stay inside the isolated venv.
-    # --result_dir is passed optimistically; if this MuseTalk revision's
-    # scripts.inference doesn't accept it, we retry without it and fall
-    # back to scanning the whole repo's results/ tree for the newest mp4.
+    # Create wrapper script that forces vendored numpy/cv2/diffusers before MuseTalk runs
+    wrapper_script = job_dir / "run_with_vendored_deps.py"
+    wrapper_script.write_text(f"""#!/usr/bin/env python3
+import sys
+import os
+
+# CRITICAL: Remove any pre-loaded numpy/cv2 modules that might have wrong versions
+for mod in list(sys.modules.keys()):
+    if mod.startswith('numpy') or mod.startswith('cv2'):
+        del sys.modules[mod]
+
+# CRITICAL: Prepend vendor dirs FIRST before ANY imports
+sys.path.insert(0, r"{NUMPY_VENDOR}")
+sys.path.insert(0, r"{CV2_VENDOR}")
+sys.path.insert(0, r"{DIFFUSERS_VENDOR}")
+
+# Change to MuseTalk directory so 'scripts' module is importable
+os.chdir(r"{MUSETALK_DIR}")
+# Add MuseTalk dir to path so scripts module is found
+sys.path.insert(0, r"{MUSETALK_DIR}")
+
+# Verify correct numpy is loaded
+import numpy as np
+if not hasattr(np, 'long'):
+    print(f"ERROR: numpy {{np.__version__}} does not have 'long' attribute", file=sys.stderr)
+    sys.exit(1)
+
+# Now run MuseTalk with correct dependencies
+import runpy
+runpy.run_module("scripts.inference", run_name="__main__")
+""")
+
+    # Run via wrapper script instead of direct -m invocation
     _base_cmd = [
-        str(MUSETALK_VENV_PY), "-m", "scripts.inference",
+        str(MUSETALK_VENV_PY), str(wrapper_script),
         "--inference_config", str(cfg_path),
         "--bbox_shift", str(bbox_shift),
         "--batch_size", str(batch_size),
     ]
+    
+    print(f"[LipSync→MuseTalk] Running MuseTalk command:")
+    print(f"[LipSync→MuseTalk] {' '.join(_base_cmd)}")
+    print(f"[LipSync→MuseTalk] Working directory: {MUSETALK_DIR}")
 
     def _invoke(cmd):
+        print(f"[LipSync→MuseTalk] Executing: {' '.join(cmd)}")
         return subprocess.run(
             cmd, cwd=str(MUSETALK_DIR), capture_output=True, text=True, timeout=900,
         )
 
     try:
+        print(f"[LipSync→MuseTalk] Starting MuseTalk inference (timeout: 900s)...")
         result = _invoke(_base_cmd + ["--result_dir", str(result_dir)])
+        
+        elapsed = time.time() - _start_time
+        print(f"[LipSync→MuseTalk] Process completed in {elapsed:.1f}s with return code {result.returncode}")
+        
         if result.returncode != 0 and "unrecognized arguments" in (result.stderr or "").lower() \
                 and "result_dir" in (result.stderr or "").lower():
-            print("[LipSync] This MuseTalk revision doesn't accept --result_dir — retrying without it.")
+            print("[LipSync→MuseTalk] This MuseTalk revision doesn't accept --result_dir — retrying without it.")
             result = _invoke(_base_cmd)
+            elapsed = time.time() - _start_time
+            print(f"[LipSync→MuseTalk] Retry completed in {elapsed:.1f}s with return code {result.returncode}")
 
         if result.stdout.strip():
-            print(f"[LipSync] MuseTalk stdout: {result.stdout[-3000:]}")
+            print(f"[LipSync→MuseTalk] ===== STDOUT START =====")
+            print(f"{result.stdout[-3000:]}")
+            print(f"[LipSync→MuseTalk] ===== STDOUT END =====")
         if result.returncode != 0:
-            print(f"[LipSync] MuseTalk stderr: {result.stderr[-2000:]}")
+            print(f"[LipSync→MuseTalk] ===== STDERR START (return code {result.returncode}) =====")
+            print(f"{result.stderr[-2000:]}")
+            print(f"[LipSync→MuseTalk] ===== STDERR END =====")
             return False
 
         # Find the newest .mp4 produced by this run, searching our dedicated
         # result_dir first, then falling back to the repo's default
         # results/ tree in case this revision ignores --result_dir entirely.
+        print(f"[LipSync→MuseTalk] Searching for output video...")
+        print(f"[LipSync→MuseTalk] Checking result_dir: {result_dir}")
         candidates = list(result_dir.rglob("*.mp4"))
+        print(f"[LipSync→MuseTalk] Found {len(candidates)} .mp4 files in result_dir")
+        
         if not candidates:
             default_results = MUSETALK_DIR / "results"
+            print(f"[LipSync→MuseTalk] Checking default results: {default_results}")
             if default_results.exists():
+                all_mp4s = list(default_results.rglob("*.mp4"))
                 candidates = [
-                    p for p in default_results.rglob("*.mp4")
+                    p for p in all_mp4s
                     if p.stat().st_mtime >= _start_time - 1
                 ]
+                print(f"[LipSync→MuseTalk] Found {len(candidates)} recent .mp4 files (out of {len(all_mp4s)} total)")
+        
         if not candidates:
-            print("[LipSync] MuseTalk ran but no output .mp4 was found.")
+            print("[LipSync→MuseTalk] ERROR: MuseTalk ran but no output .mp4 was found.")
             return False
+            
         newest = max(candidates, key=lambda p: p.stat().st_mtime)
+        print(f"[LipSync→MuseTalk] Selected output: {newest}")
+        print(f"[LipSync→MuseTalk] Output size: {newest.stat().st_size / 1024:.1f} KB")
 
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(str(newest), output_path)
-        print(f"[LipSync] MuseTalk completed successfully ({newest.name} -> {output_path}).")
+        print(f"[LipSync→MuseTalk] ✓ Copied to final output: {output_path}")
+        print(f"[LipSync→MuseTalk] ✓ SUCCESS - Lip-sync processing complete")
         return True
     except subprocess.TimeoutExpired:
-        print("[LipSync] MuseTalk timed out.")
+        print("[LipSync→MuseTalk] ERROR: Process timed out after 900s")
         return False
     except Exception as _e:
-        print(f"[LipSync] MuseTalk subprocess error: {_e}")
+        print(f"[LipSync→MuseTalk] ERROR: Subprocess exception: {_e}")
+        import traceback
+        print(f"[LipSync→MuseTalk] Traceback:\n{traceback.format_exc()}")
         return False
     finally:
+        print(f"[LipSync→MuseTalk] Cleaning up job directory: {job_dir}")
         shutil.rmtree(str(job_dir), ignore_errors=True)
 
 
@@ -2459,7 +2704,11 @@ def generate_lip_sync_video(
       3. Run MuseTalk to replace the mouth region with audio-driven synthesis.
       4. Mix Foley SFX on top via the normal add_audio_to_video path.
     """
+    print(f"[LipSync] Starting Lip-Synced Speaking mode...")
+    print(f"[LipSync] Parameters: bbox_shift={lipsync_bbox_shift}, batch_size={lipsync_batch_size}")
+    
     # Step 1: generate base video (with audio=False so we control audio ourselves)
+    print(f"[LipSync] Step 1/4: Generating base video...")
     base_result = generate_video(
         ref_image,
         # Append speaking cue to prompt so Wan poses the mouth open
@@ -2472,17 +2721,26 @@ def generate_lip_sync_video(
         *lora_args,
     )
     if base_result is None or base_result[0] is None:
+        print("[LipSync] ERROR: Base video generation returned None")
         return None, None, "Lip-sync: base video generation failed."
 
     base_video_path = base_result[1]   # raw file path (video_file component)
     if not base_video_path or not Path(base_video_path).exists():
+        print(f"[LipSync] ERROR: Base video path missing or doesn't exist: {base_video_path}")
         return base_result[0], base_result[1], "Lip-sync: base video path missing."
 
+    print(f"[LipSync] Base video generated successfully: {base_video_path}")
+    
     # Ensure tmp directory exists for all intermediate files
     _lipsync_tmp = Path(SCRIPT_DIR) / "tmp"
     _lipsync_tmp.mkdir(parents=True, exist_ok=True)
 
     # Step 2: generate voice WAV (we need the raw WAV, not the mixed video)
+    print(f"[LipSync] Step 2/4: Generating voice WAV...")
+    print(f"[LipSync] Dialogue text provided: {repr(dlg_txt)}")
+    print(f"[LipSync] Dialogue text stripped: {repr(dlg_txt.strip() if dlg_txt else '')}")
+    print(f"[LipSync] Reference audio provided: {ref_aud is not None}")
+    
     voice_wav = None
     _voice_wav_path = None
     if ref_aud and dlg_txt and dlg_txt.strip():
@@ -2490,22 +2748,40 @@ def generate_lip_sync_video(
         _ref_path = ref_aud.name if hasattr(ref_aud, "name") else (str(ref_aud) if ref_aud else None)
         if not _ref_path and isinstance(ref_aud, dict):
             _ref_path = ref_aud.get("path") or ref_aud.get("name") or ref_aud.get("url")
+        
+        print(f"[LipSync] Reference audio path resolved to: {_ref_path}")
+        
         if _ref_path and os.path.exists(str(_ref_path)):
-            print(f"[LipSync] Generating F5-TTS voice WAV for dialogue: {dlg_txt.strip()[:60]}...")
+            print(f"[LipSync] ✓ Reference audio file exists")
+            print(f"[LipSync] Generating F5-TTS voice WAV for dialogue:")
+            print(f"[LipSync]   Full text: {dlg_txt.strip()}")
+            print(f"[LipSync]   Text length: {len(dlg_txt.strip())} characters")
+            print(f"[LipSync]   Voice speed: {v_speed}")
+            
             ok = _run_f5tts(str(_ref_path), dlg_txt.strip(), _voice_wav_path, speed=float(v_speed))
+            
             if ok and Path(_voice_wav_path).exists() and Path(_voice_wav_path).stat().st_size > 0:
                 voice_wav = _voice_wav_path
-                print(f"[LipSync] F5-TTS voice WAV ready: {Path(voice_wav).stat().st_size // 1024} KB")
+                wav_size_kb = Path(voice_wav).stat().st_size // 1024
+                print(f"[LipSync] ✓ F5-TTS voice WAV ready: {wav_size_kb} KB")
+                print(f"[LipSync] ✓ Voice WAV will be used for lip-sync: {voice_wav}")
             else:
-                print("[LipSync] F5-TTS produced no output — will do lip sync without voice WAV.")
+                print("[LipSync] ✗ F5-TTS produced no output — will do lip sync without voice WAV.")
         else:
-            print(f"[LipSync] Voice reference path not found: {_ref_path!r} — skipping F5-TTS.")
+            print(f"[LipSync] ✗ Voice reference path not found or doesn't exist: {_ref_path!r}")
+            print(f"[LipSync]   Skipping F5-TTS voice generation")
     else:
-        print("[LipSync] No voice reference or dialogue text provided — skipping F5-TTS.")
+        print("[LipSync] ✗ Missing requirements for voice generation:")
+        if not ref_aud:
+            print("[LipSync]   - No voice reference audio provided")
+        if not dlg_txt or not dlg_txt.strip():
+            print(f"[LipSync]   - No dialogue text provided (got: {repr(dlg_txt)})")
 
     if voice_wav is None or not Path(voice_wav).exists():
         # Can't lip-sync without audio — fall back to normal mix
         print("[LipSync] No voice WAV available — falling back to normal audio mix.")
+        print("[LipSync] Step 3/4: Skipped (no audio for lip-sync)")
+        print("[LipSync] Step 4/4: Mixing normal audio...")
         with open(base_video_path, "rb") as _f:
             _video_bytes = _f.read()
         final = add_audio_to_video(
@@ -2517,10 +2793,12 @@ def generate_lip_sync_video(
                 _f.write(final)
         else:
             shutil.copy(base_video_path, out_path)
+        print(f"[LipSync] Completed with fallback audio. Output: {out_path}")
         return out_path, out_path, "Lip-sync skipped (no voice WAV) — normal audio mixed."
 
     # Step 3: MuseTalk — replace mouth region with audio-driven lip animation.
     # _run_musetalk will wait for MuseTalk weights to finish downloading if needed.
+    print(f"[LipSync] Step 3/4: Running MuseTalk for lip animation...")
     ls_out = str(_lipsync_tmp / f"lipsync_ls_{uuid.uuid4().hex}.mp4")
     print(f"[LipSync] Running MuseTalk: video={base_video_path}, audio={voice_wav}")
     ls_ok = _run_musetalk(
@@ -2536,6 +2814,7 @@ def generate_lip_sync_video(
         print("[LipSync] MuseTalk failed or returned no output — using base video with F5-TTS audio.")
 
     # Step 4: mix audio on top of the (attempted) lip-synced video.
+    print(f"[LipSync] Step 4/4: Mixing final audio tracks...")
     #   If MuseTalk succeeded, the voice is already embedded in the video
     #   frames/audio it produced — only add Foley SFX on top.
     #   If MuseTalk failed, synced_video is just the silent base video, so
@@ -2544,9 +2823,12 @@ def generate_lip_sync_video(
     #   dialogue never makes it into the output at all.
     with open(synced_video, "rb") as _f:
         _synced_bytes = _f.read()
+    print(f"[LipSync] Read synced video: {len(_synced_bytes)} bytes")
+    
     if ls_ok:
         # MuseTalk already baked the voice into the lip-synced video.
         # Only add Foley SFX on top — pass None/empty to skip F5-TTS re-run.
+        print("[LipSync] Adding Foley SFX to lip-synced video...")
         final = add_audio_to_video(
             _synced_bytes, audio_pt, float(dur), audio_neg_pt,
             None, "",   # skip F5-TTS — voice already embedded by MuseTalk
@@ -2555,6 +2837,7 @@ def generate_lip_sync_video(
     else:
         # MuseTalk never ran — the base video is silent. Mix the F5-TTS voice
         # (generated above) plus Foley SFX into the base video.
+        print("[LipSync] Re-mixing F5-TTS voice + Foley into base video...")
         final = add_audio_to_video(
             _synced_bytes, audio_pt, float(dur), audio_neg_pt,
             ref_aud, dlg_txt,   # re-run F5-TTS inside add_audio_to_video
@@ -2566,17 +2849,20 @@ def generate_lip_sync_video(
             _f.write(final)
         print(f"[LipSync] Final output written: {Path(out_path).stat().st_size // 1024} KB")
     else:
-        shutil.copy(synced_video, out_path)
         print("[LipSync] Audio mix returned empty — using synced video as-is.")
+        shutil.copy(synced_video, out_path)
 
     # Clean up intermediate WAV (no longer needed)
     if _voice_wav_path and os.path.exists(_voice_wav_path):
         try:
             os.unlink(_voice_wav_path)
-        except Exception:
-            pass
+            print(f"[LipSync] Cleaned up intermediate WAV: {_voice_wav_path}")
+        except Exception as e:
+            print(f"[LipSync] Failed to clean up WAV (non-fatal): {e}")
 
     status = "✅ Lip-sync complete." if ls_ok else "⚠️ MuseTalk failed — dialogue voice + Foley mixed without lip sync."
+    print(f"[LipSync] COMPLETE: {status}")
+    print(f"[LipSync] Output file: {out_path}")
     return out_path, out_path, status
 
 
@@ -3423,8 +3709,17 @@ def _remove_background_rembg(pil_image: Image.Image) -> Image.Image:
     Returns RGBA image. Falls back to original image converted to RGBA if rembg unavailable.
     """
     try:
-        from rembg import remove, new_session
-        session = new_session("birefnet-general")
+        # BUG 3 FIX: Force CPU-only execution by passing providers explicitly.
+        # Setting ORT_FORCE_CPU=1 in os.environ is ignored by onnxruntime after
+        # the first session is created — the CUDA provider is already registered
+        # in the process and the env-var check only runs at import time.
+        # Passing providers=['CPUExecutionProvider'] directly to new_session()
+        # bypasses the CUDA provider entirely, regardless of process-level state.
+        import warnings
+        warnings.filterwarnings('ignore', category=UserWarning)
+
+        from rembg import new_session, remove
+        session = new_session("birefnet-general", providers=["CPUExecutionProvider"])
         rgba = remove(pil_image.convert("RGBA"), session=session)
         return rgba
     except ImportError:
@@ -3604,6 +3899,7 @@ def _complete_body_safe(rgba: Image.Image) -> Image.Image:
             gen_rgb = gen_rgb.resize((new_w, new_h), Image.LANCZOS)
 
         # Alpha for the generated result (whole canvas), from rembg.
+        # This must be computed here so gen_alpha is defined before use below.
         gen_alpha = np.array(
             _remove_background_rembg(gen_rgb).split()[3], dtype=np.uint8
         )
@@ -3839,63 +4135,108 @@ def _merge_into_person_photo(
     base_photo: Image.Image,
     other_rgba: Image.Image,
     add_side: str,
+    gender_base: str | None = None,
+    gender_other: str | None = None,
 ) -> Image.Image:
     """
-    Build the "Person A" / "Person B" result FAST (one Qwen pass) and SEAMLESS
-    (no dividing line):
+    Pixel-accurate Person A/B merge:
 
-    - The chosen person's photo (already body-completed by the caller) is the
-      base scene, anchored to one side and edge-replicated to fill the whole
-      canvas so there is never any raw white.
-    - The OTHER person (already body-completed, background-removed) is placed
-      into the added space beside them.
-    - ONE Qwen pass then blends the whole thing into a single continuous scene
-      with no visible seam between the two halves.
-    - Finally the base person is restored with a FEATHERED inner edge, so the
-      person stays unaltered while the boundary toward the other person has no
-      hard dividing line.
+    1. Scale the other person's crop to match the base person's height (so they
+       look the same size standing next to each other).
+    2. Measure the scaled crop's pixel width and add a comfortable padding margin
+       (20 % extra) — this is exactly how many pixels to add to the base photo.
+    3. Scale the base photo to fit the output height, place it on the chosen side
+       of an extended canvas whose extra strip is exactly (scaled-other-width +
+       margin) pixels wide.
+    4. Run ONE Qwen outpaint pass to fill the empty strip so the background
+       continues seamlessly — Qwen only ever sees white in the empty strip, so
+       it cannot bleed the other person's content in.
+    5. Hard-paste the exact original base photo back over its region (the outpaint
+       pass must NOT change anything already visible).
+    6. Composite the other person's crop into the filled strip at the correct
+       position and height — bottom-aligned to the base person's feet.
 
-    add_side = "right"  -> base photo on the LEFT,  other person on the RIGHT
-                           (used by the "Person A" option)
-    add_side = "left"   -> base photo on the RIGHT, other person on the LEFT
-                           (used by the "Person B" option)
+    add_side = "right" → base photo on the LEFT,  other person on the RIGHT
+    add_side = "left"  → base photo on the RIGHT, other person on the LEFT
     """
-    OUT_W, OUT_H = 1280, 720
+    # ── Constants ──────────────────────────────────────────────────────────────
+    OUT_H = 720          # fixed output height
+    PADDING_FACTOR = 1.25  # 25 % extra space so the other person isn't crammed
+    MARGIN_PX = 24       # minimum extra pixels on each side of the pasted person
 
-    # Fit the base photo to full canvas height, anchored to its side. The
-    # opposite side is the added space for the other person.
-    base_region_w = int(OUT_W * 0.55)
+    # ── Step 1: scale base photo to output height ──────────────────────────────
     base_rgb = base_photo.convert("RGB")
-    scale = min(base_region_w / base_rgb.width, OUT_H / base_rgb.height)
-    bw = max(1, int(base_rgb.width * scale))
-    bh = max(1, int(base_rgb.height * scale))
-    base_fit = base_rgb.resize((bw, bh), Image.LANCZOS)
+    base_scale = OUT_H / base_rgb.height
+    base_w = max(1, int(base_rgb.width  * base_scale))
+    base_h = OUT_H
+    base_fit = base_rgb.resize((base_w, base_h), Image.LANCZOS)
+    print(f"[merge] base photo scaled to {base_w}×{base_h}")
 
-    y_off = (OUT_H - bh) // 2
-    base_x = 0 if add_side == "right" else (OUT_W - bw)
+    # ── Step 2: body-complete + scale other person to match base height ────────
+    # Target: the other person should appear roughly the same height as the base
+    # person (who fills the full OUT_H).  We scale the other person so their
+    # body height equals OUT_H * 0.92 (slightly shorter so the composition feels
+    # natural — two people standing together are rarely exactly the same height
+    # in frame).
+    other_target_h = int(OUT_H * 0.92)
 
-    canvas_rgb = Image.new("RGB", (OUT_W, OUT_H), (255, 255, 255))
-    canvas_rgb.paste(base_fit, (base_x, y_off))
+    # Scale other person proportionally to target height; never upscale beyond
+    # their natural resolution.
+    ow, oh = other_rgba.size
+    o_scale = min(other_target_h / oh, 1.0)   # never upscale
+    other_w = max(1, int(ow * o_scale))
+    other_h = max(1, int(oh * o_scale))
+    # Resize RGBA (split+merge to preserve alpha)
+    _or, _og, _ob, _oa = other_rgba.split()
+    other_rgb_r = Image.merge("RGB", (_or, _og, _ob)).resize((other_w, other_h), Image.LANCZOS)
+    other_alpha_r = _oa.resize((other_w, other_h), Image.LANCZOS)
+    other_alpha_arr = np.where(np.array(other_alpha_r, dtype=np.uint8) > 128, 255, 0).astype(np.uint8)
+    other_scaled = other_rgb_r.convert("RGBA")
+    other_scaled.putalpha(Image.fromarray(other_alpha_arr, "L"))
+    print(f"[merge] other person scaled to {other_w}×{other_h} (target h={other_target_h})")
 
-    # --- Outpaint the empty side so the environment extends naturally.
+    # ── Step 3: compute strip width and total canvas width ────────────────────
+    strip_w = max(MARGIN_PX * 2 + other_w, int(other_w * PADDING_FACTOR))
+    OUT_W   = base_w + strip_w
+    print(f"[merge] strip_w={strip_w}, total canvas={OUT_W}×{OUT_H}")
+
+    # ── Step 4: build the canvas — base photo on the anchored side, white strip ─
+    canvas = Image.new("RGB", (OUT_W, OUT_H), (255, 255, 255))
+    if add_side == "right":
+        base_x = 0
+    else:
+        base_x = strip_w
+    canvas.paste(base_fit, (base_x, 0))
+
+    # ── Step 5: gender preservation clause ────────────────────────────────────
+    _gender_notes = []
+    if gender_base and gender_base.lower() == "man":
+        _gender_notes.append("the man's penis remains the same in every way, completely unchanged and still fully visible")
+    if gender_other and gender_other.lower() == "man":
+        _gender_notes.append("the man's penis remains the same in every way, completely unchanged and still fully visible")
+    _gender_clause = (". " + "; ".join(_gender_notes)) if _gender_notes else ""
+
+    # ── Step 6: Qwen outpaint — fill the white strip to match the background ──
     extend_dir = "to the right" if add_side == "right" else "to the left"
     outpaint_instruction = (
         f"Extend and continue this photo's background and environment {extend_dir} "
-        "into the empty area, seamlessly matching the existing scene, lighting, "
-        "colors and perspective. Keep everything already visible unchanged. "
-        "Do not add any people — only extend the empty background scenery."
+        "into the empty white area on that side, seamlessly matching the existing "
+        "scene, lighting, colors, floor, walls and perspective. Keep everything "
+        "already visible in the photo completely unchanged — do not alter the "
+        f"person or anything else already visible. Only paint into the empty white area{_gender_clause}."
     )
 
-    extended_bg = canvas_rgb
+    extended_bg = canvas.copy()
     try:
         activate_pic()
         torch.cuda.set_device(PIC_DEVICE)
+        torch.cuda.synchronize(PIC_DEVICE)
         with torch.cuda.device(PIC_DEVICE):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 result = pic_pipe(
-                    image=[canvas_rgb],
+                    image=[canvas],
                     prompt=outpaint_instruction,
-                    negative_prompt="people, person, extra person, duplicate, seam, border, frame",
+                    negative_prompt="people, person, extra person, duplicate, seam, dividing line, border, frame, watermark",
                     num_inference_steps=4,
                     true_cfg_scale=1.0,
                     generator=torch.Generator(device=PIC_DEVICE).manual_seed(
@@ -3906,40 +4247,43 @@ def _merge_into_person_photo(
         if gen.size != (OUT_W, OUT_H):
             gen = gen.resize((OUT_W, OUT_H), Image.LANCZOS)
         extended_bg = gen
+        print("[merge] outpaint succeeded")
     except Exception as e:
-        print(f"[merge] background outpaint failed ({e}); using un-extended scene")
-        extended_bg = canvas_rgb
+        print(f"[merge] outpaint failed ({e}); using plain canvas")
+        extended_bg = canvas.copy()
 
-    # --- Hard-restore the ORIGINAL base photo region so the chosen person is
-    #     never duplicated or edited; only the added strip keeps Qwen scenery.
+    # ── Step 7: hard-restore the EXACT original base photo pixels ─────────────
+    # The outpaint must not alter anything already in the photo.  Re-paste the
+    # exact scaled base photo over its region so nothing changes there.
     final = extended_bg.copy()
-    final.paste(base_fit, (base_x, y_off))
+    final.paste(base_fit, (base_x, 0))
 
-    # --- Place the OTHER (cropped, body-completed) person into the added space,
-    #     scaled to match the base person's height, bottom-aligned to the floor.
-    added_w = OUT_W - bw
-    if added_w < 8:
-        added_w = OUT_W // 2  # safety fallback
+    # ── Step 8: composite the other person into the strip ─────────────────────
+    # Position: horizontally centred in the strip, vertically bottom-aligned
+    # to the base person's feet (both people share the same floor line).
+    base_baseline = OUT_H   # base person fills full height → feet at bottom
 
-    target_h = min(bh, int(OUT_H * 0.95))
-    other = _scale_subject_to_fit(other_rgba, max(1, added_w - 8), target_h)
-
-    base_baseline = y_off + bh          # base person's feet line (approx)
-    other_y = max(0, base_baseline - other.height)
     if add_side == "right":
-        strip_left = bw
+        strip_left = base_w
     else:
         strip_left = 0
-    other_x = strip_left + max(0, (added_w - other.width) // 2)
-    other_x = max(0, min(other_x, OUT_W - other.width))
+
+    other_x = strip_left + max(0, (strip_w - other_w) // 2)
+    other_x = max(0, min(other_x, OUT_W - other_w))
+    other_y = max(0, base_baseline - other_h)
 
     final_rgba = final.convert("RGBA")
-    final_rgba.paste(other, (other_x, other_y), other)
-    return final_rgba.convert("RGB")
+    final_rgba.paste(other_scaled, (other_x, other_y), other_scaled)
+    result_rgb = final_rgba.convert("RGB")
+    print(f"[merge] other person pasted at ({other_x}, {other_y}), final canvas {OUT_W}×{OUT_H}")
+    return result_rgb
 
 
 def merge_photos_fn(img_a, img_b, bg_choice: str | None = None,
-                    extra_prompt: str | None = None) -> Image.Image | None:
+                    extra_prompt: str | None = None,
+                    gender_a: str | None = None,
+                    gender_b: str | None = None,
+                    add_side: str = "right") -> Image.Image | None:
     """
     Merge two photos side by side on a chosen background.
 
@@ -3985,15 +4329,17 @@ def merge_photos_fn(img_a, img_b, bg_choice: str | None = None,
     # is blended in ONE Qwen pass (no separate normalize/outpaint passes — keeps
     # it fast). Body-completion only runs if a subject is actually clipped.
     if bg_choice == "Person A":
-        print("[merge] Person A: complete A on-photo, place B, blend...")
+        print(f"[merge] Person A: complete A on-photo, place B to the {add_side}...")
         base_a = _complete_body_on_photo(pil_a)          # missing parts only (skipped if whole)
         rgba_b = _complete_body_safe(rgba_b)             # missing parts only (skipped if whole)
-        return _merge_into_person_photo(base_a, rgba_b, add_side="right")
+        return _merge_into_person_photo(base_a, rgba_b, add_side=add_side,
+                                        gender_base=gender_a, gender_other=gender_b)
     if bg_choice == "Person B":
-        print("[merge] Person B: complete B on-photo, place A, blend...")
+        print(f"[merge] Person B: complete B on-photo, place A to the {add_side}...")
         base_b = _complete_body_on_photo(pil_b)          # missing parts only (skipped if whole)
         rgba_a = _complete_body_safe(rgba_a)             # missing parts only (skipped if whole)
-        return _merge_into_person_photo(base_b, rgba_a, add_side="left")
+        return _merge_into_person_photo(base_b, rgba_a, add_side=add_side,
+                                        gender_base=gender_b, gender_other=gender_a)
 
     # All other backgrounds (white / Qwen scene): body-complete both cutouts,
     # then lay them out side by side. No original pixels are altered.
@@ -5938,12 +6284,20 @@ def infer_with_preclear(
     except Exception as _e:
         print(f"[picgen pre-clear] storage clear failed (non-fatal): {_e}")
 
-    filepaths, seed_out, urls_json = infer(
-        images_b64_json, prompt, negative_prompt, seed, randomize_seed,
-        true_guidance_scale, num_inference_steps, height, width,
-        num_images_per_prompt, progress,
-    )
-    yield filepaths, seed_out, urls_json
+    try:
+        filepaths, seed_out, urls_json = infer(
+            images_b64_json, prompt, negative_prompt, seed, randomize_seed,
+            true_guidance_scale, num_inference_steps, height, width,
+            num_images_per_prompt, progress,
+        )
+        yield filepaths, seed_out, urls_json
+    except gr.Error:
+        # Re-raise gr.Error cleanly — Gradio shows the message in the UI.
+        # The exception is intentional (e.g. "no images uploaded") so we
+        # don't need the full Python traceback in the terminal.
+        raise
+    except Exception as _infer_e:
+        raise gr.Error(f"Generation failed: {_infer_e}") from None
 
 
 def infer(
@@ -5970,7 +6324,7 @@ def infer(
     generator = torch.Generator(device=PIC_DEVICE).manual_seed(seed)
     pil_images = b64_to_pil_list(images_b64_json)
     if not pil_images:
-        raise gr.Error("Please upload at least one image.")
+        raise gr.Error("Please upload at least one image.") from None
     _t_decoded = time.time()
 
     if height == 256 and width == 256:
@@ -6056,8 +6410,12 @@ def infer(
 
 gallery_js = r"""
 () => {
+// Keep the image array alive across re-inits so images added before a
+// Gradio DOM refresh are not lost.
+if (!window.__picgenImages) window.__picgenImages = [];
+if (!window.__picgenSelected) window.__picgenSelected = { idx: -1 };
+
 function init() {
-    if (window.__picgenInitDone) return;
     const galleryGrid  = document.getElementById('image-gallery-grid');
     const dropZone     = document.getElementById('gallery-drop-zone');
     const uploadPrompt = document.getElementById('upload-prompt');
@@ -6067,13 +6425,22 @@ function init() {
     const btnRemove    = document.getElementById('tb-remove');
     const btnClear     = document.getElementById('tb-clear');
     if (!galleryGrid || !fileInput || !dropZone) { setTimeout(init, 250); return; }
-    window.__picgenInitDone = true;
-    let images = [];
+
+    // If the grid is already connected and has our listener marker, skip.
+    // But if the element was replaced (e.g. Gradio re-rendered the tab),
+    // we must re-attach all listeners to the new DOM nodes.
+    if (galleryGrid._picgenListenerAttached && galleryGrid.isConnected) return;
+    galleryGrid._picgenListenerAttached = true;
+
+    let images = window.__picgenImages;
+    let selectedIdx = window.__picgenSelected.idx;
     window.__uploadedImages = images;
-    let selectedIdx = -1;
 
     function syncToGradio() {
+        if (window.__picgenSuppressSync) return;
         window.__uploadedImages = images;
+        window.__picgenImages = images;
+        window.__picgenSelected.idx = selectedIdx;
         const b64Array = images.map(img => img.b64);
         const container = document.getElementById('hidden-images-b64');
         if (!container) return;
@@ -6094,6 +6461,17 @@ function init() {
     }
     window.__addImage = addImage;
 
+    // Replace all images with a single new one (used by outpaint popup)
+    function replaceImages(b64, name) {
+        images.length = 0;
+        selectedIdx = -1;
+        images.push({id: Date.now() + Math.random(), b64: b64, name: name});
+        window.__uploadedImages = images;
+        window.__picgenImages = images;
+        renderGallery(); syncToGradio();
+    }
+    window.__replaceImages = replaceImages;
+
     function removeImage(idx) {
         images.splice(idx, 1);
         if (selectedIdx === idx) selectedIdx = -1;
@@ -6102,10 +6480,24 @@ function init() {
     }
 
     function clearAll() {
-        images = []; window.__uploadedImages = images; selectedIdx = -1;
+        images.length = 0;
+        window.__uploadedImages = images;
+        window.__picgenImages = images;
+        selectedIdx = -1;
         renderGallery(); syncToGradio();
     }
     window.__clearAll = clearAll;
+
+    function setSelected(idx) {
+        selectedIdx = idx;
+        window.__picgenSelected.idx = selectedIdx;
+        // Re-render to reflect selection highlight without full DOM rebuild
+        galleryGrid.querySelectorAll('.gallery-thumb').forEach((el) => {
+            const i = parseInt(el.dataset.idx);
+            if (i === selectedIdx) el.classList.add('selected');
+            else el.classList.remove('selected');
+        });
+    }
 
     function renderGallery() {
         if (images.length === 0) {
@@ -6115,22 +6507,29 @@ function init() {
         }
         if (uploadPrompt) uploadPrompt.style.display = 'none';
         galleryGrid.style.display = 'grid';
+        // Build HTML — each thumb gets its own inline onclick-less markup;
+        // all events are handled by the single capture-phase delegated listener
+        // attached to galleryGrid below (survives innerHTML replacement).
         let html = '';
         images.forEach((img, i) => {
             const sel = i === selectedIdx ? ' selected' : '';
+            // NOTE: thumb-remove must NOT be wrapped in overflow:hidden parent
+            // at the CSS level — we moved it outside the inner img wrapper so
+            // it is always in the hit-test area regardless of overflow clipping.
             html += '<div class="gallery-thumb' + sel + '" data-idx="' + i + '">'
                   + '<img src="' + img.b64 + '" alt="' + (img.name||'image') + '">'
                   + '<span class="thumb-badge">#' + (i+1) + '</span>'
-                  + '<button class="thumb-remove" data-remove="' + i + '">\u2715</button>'
+                  + '<button class="thumb-remove" data-remove="' + i + '" '
+                  + 'style="position:absolute;top:4px;right:4px;z-index:100;'
+                  + 'width:22px;height:22px;border-radius:50%;background:rgba(0,0,0,0.8);'
+                  + 'color:#fff;border:1px solid rgba(255,255,255,0.5);cursor:pointer;'
+                  + 'display:flex;align-items:center;justify-content:center;font-size:11px;'
+                  + 'pointer-events:auto;">\u2715</button>'
                   + '</div>';
         });
-        html += '<div class="gallery-add-card" id="gallery-add-card"><span class="add-icon">+</span><span class="add-text">Add</span></div>';
+        html += '<div class="gallery-add-card" id="gallery-add-card" style="pointer-events:auto;">'
+              + '<span class="add-icon">+</span><span class="add-text">Add</span></div>';
         galleryGrid.innerHTML = html;
-        // Click handling is done ONCE via delegation on galleryGrid (see the
-        // capture-phase listener attached in init), so we do NOT attach any
-        // per-element listeners here. Delegation on the container survives
-        // innerHTML re-renders and cannot be blocked by child stacking/overlay
-        // quirks that were swallowing the X / Add clicks.
     }
 
     function showLightbox(b64) {
@@ -6144,8 +6543,6 @@ function init() {
                 + '<button id="picgen-lb-close" style="position:fixed;top:16px;right:20px;width:36px;height:36px;border-radius:50%;background:rgba(0,0,0,0.7);color:#fff;border:1px solid rgba(255,255,255,0.3);cursor:pointer;font-size:20px;line-height:1;display:flex;align-items:center;justify-content:center;z-index:10000;">\u00d7</button>'
                 + '</div>';
             document.body.appendChild(lb);
-            // Any click anywhere on the lightbox closes it, so a full-screen
-            // fixed overlay can never be left open and block the buttons under it.
             lb.addEventListener('click', () => { lb.style.display = 'none'; });
             document.getElementById('picgen-lb-close').addEventListener('click', (e) => { e.stopPropagation(); lb.style.display = 'none'; });
             document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && lb.style.display === 'flex') lb.style.display = 'none'; });
@@ -6161,29 +6558,14 @@ function init() {
             reader.onload = (e) => {
                 const img = new Image();
                 img.onload = () => {
-                    // Resize to 512px (pipeline resizes to this for VAE anyway)
                     const maxSize = 512;
-                    let width = img.width;
-                    let height = img.height;
-                    
-                    if (width > height) {
-                        height = Math.round((height * maxSize) / width);
-                        width = maxSize;
-                    } else {
-                        width = Math.round((width * maxSize) / height);
-                        height = maxSize;
-                    }
-                    
-                    // Create canvas and resize
+                    let width = img.width, height = img.height;
+                    if (width > height) { height = Math.round((height * maxSize) / width); width = maxSize; }
+                    else { width = Math.round((width * maxSize) / height); height = maxSize; }
                     const canvas = document.createElement('canvas');
-                    canvas.width = width;
-                    canvas.height = height;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(img, 0, 0, width, height);
-                    
-                    // Convert to base64 with quality optimization
-                    const resizedB64 = canvas.toDataURL('image/jpeg', 0.95);
-                    addImage(resizedB64, file.name);
+                    canvas.width = width; canvas.height = height;
+                    canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+                    addImage(canvas.toDataURL('image/jpeg', 0.95), file.name);
                 };
                 img.src = e.target.result;
             };
@@ -6193,47 +6575,73 @@ function init() {
 
     fileInput.addEventListener('change', (e) => { processFiles(e.target.files); e.target.value = ''; });
     if (uploadClick) uploadClick.addEventListener('click', () => fileInput.click());
-    if (btnUpload) btnUpload.addEventListener('click', () => fileInput.click());
+    if (btnUpload)   btnUpload.addEventListener('click',   () => fileInput.click());
 
-    // SINGLE delegated click handler on the grid, in the CAPTURE phase, so it
-    // fires before anything on the children and cannot be swallowed by child
-    // stacking contexts / overlays. This replaces the per-element listeners
-    // and the drop-zone catch-all that were failing to register X / Add clicks.
+    // ── Single capture-phase delegated listener on the grid ──────────────────
+    // Fires before any bubble-phase handlers on children. Handles X remove,
+    // Add card, and thumb selection. Using capture ensures the dropZone's
+    // bubble-phase click handler (which opens the file picker) never receives
+    // events that originated inside the grid.
     galleryGrid.addEventListener('click', (e) => {
+        // X button — remove by index
         const removeBtn = e.target.closest('.thumb-remove');
         if (removeBtn) {
-            e.preventDefault(); e.stopPropagation();
-            removeImage(parseInt(removeBtn.dataset.remove));
+            e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+            removeImage(parseInt(removeBtn.dataset.remove, 10));
             return;
         }
+        // Add card — open file picker
         if (e.target.closest('.gallery-add-card')) {
-            e.preventDefault(); e.stopPropagation();
+            e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
             fileInput.click();
             return;
         }
+        // Thumb body — toggle selection (single click) / lightbox (dblclick)
         const thumb = e.target.closest('.gallery-thumb');
         if (thumb) {
-            e.preventDefault(); e.stopPropagation();
-            const idx = parseInt(thumb.dataset.idx);
-            if (!isNaN(idx) && images[idx]) showLightbox(images[idx].b64);
+            e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+            const idx = parseInt(thumb.dataset.idx, 10);
+            if (!isNaN(idx)) {
+                if (selectedIdx === idx) {
+                    // Second click on same thumb opens lightbox
+                    if (images[idx]) showLightbox(images[idx].b64);
+                } else {
+                    setSelected(idx);
+                }
+            }
             return;
         }
-    }, true);  // capture
+    }, true); // capture phase
 
-    // Clicking empty space in the drop zone (not on the grid) opens the picker.
+    // Drop-zone background click opens file picker — but only when the click
+    // did NOT originate inside the grid (grid events are fully stopped above).
     dropZone.addEventListener('click', (e) => {
-        if (e.target.closest('#image-gallery-grid') ||
-            e.target.closest('#upload-click-area')) return;
+        if (e.target.closest('#image-gallery-grid')) return;
+        if (e.target.closest('#upload-click-area')) return;
         fileInput.click();
     });
+
     if (btnRemove) btnRemove.addEventListener('click', () => { if (selectedIdx >= 0) removeImage(selectedIdx); });
-    if (btnClear) btnClear.addEventListener('click', clearAll);
-    dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+    if (btnClear)  btnClear.addEventListener( 'click', clearAll);
+    dropZone.addEventListener('dragover',  (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); });
     dropZone.addEventListener('dragleave', (e) => { e.preventDefault(); dropZone.classList.remove('drag-over'); });
-    dropZone.addEventListener('drop', (e) => { e.preventDefault(); dropZone.classList.remove('drag-over'); if (e.dataTransfer.files.length) processFiles(e.dataTransfer.files); });
+    dropZone.addEventListener('drop',      (e) => { e.preventDefault(); dropZone.classList.remove('drag-over'); if (e.dataTransfer.files.length) processFiles(e.dataTransfer.files); });
+    // Render any images that were already in the persistent store before this re-init
     renderGallery();
+    if (images.length > 0) syncToGradio();
 }
 init();
+// Re-run init on DOM mutations in case Gradio remounts the picgen tab's HTML
+let _picgenObserverTimer = null;
+const _picgenObserver = new MutationObserver(() => {
+    // Debounce: only act after mutations settle (50ms quiet period)
+    clearTimeout(_picgenObserverTimer);
+    _picgenObserverTimer = setTimeout(() => {
+        const g = document.getElementById('image-gallery-grid');
+        if (g && !g._picgenListenerAttached) init();
+    }, 50);
+});
+_picgenObserver.observe(document.body, { childList: true, subtree: true });
 }
 """
 
@@ -6276,7 +6684,8 @@ body, .gradio-container { margin: 0 !important; padding: 0 !important; max-width
    and let images size to their container. */
 #merge-custom-gallery { width: 100% !important; }
 #merge-custom-gallery img { object-fit: contain !important; }
-.gallery-thumb { position: relative; aspect-ratio: 1; border-radius: 8px; overflow: hidden; cursor: pointer; border: 2px solid var(--border-color-primary); transition: border-color .2s ease, box-shadow .2s ease; background: var(--background-fill-primary); display: flex; align-items: center; justify-content: center; }
+.gallery-thumb { position: relative; aspect-ratio: 1; border-radius: 8px; overflow: visible; cursor: pointer; border: 2px solid var(--border-color-primary); transition: border-color .2s ease, box-shadow .2s ease; background: var(--background-fill-primary); display: flex; align-items: center; justify-content: center; }
+.gallery-thumb > img { border-radius: 6px; overflow: hidden; }
 .gallery-thumb:hover { border-color: var(--color-accent); }
 .gallery-thumb.selected { border-color: var(--color-accent) !important; box-shadow: 0 0 0 3px rgba(var(--color-accent-soft), .3); }
 .gallery-thumb img { width: 100%; height: 100%; object-fit: contain; display: block !important; }
@@ -7368,6 +7777,12 @@ with gr.Blocks(css=css) as demo:
                             height=200,
                             format="png",
                         )
+                        merge_gender_a = gr.Radio(
+                            choices=["Man", "Woman"],
+                            value=None,
+                            label="Person A gender (optional)",
+                            info="Select Man to preserve explicit male anatomy unchanged.",
+                        )
                     with gr.Column(scale=1, min_width=140):
                         merge_img_b = gr.Image(
                             label="Person B",
@@ -7376,6 +7791,12 @@ with gr.Blocks(css=css) as demo:
                             elem_id="merge-img-b",
                             height=200,
                             format="png",
+                        )
+                        merge_gender_b = gr.Radio(
+                            choices=["Man", "Woman"],
+                            value=None,
+                            label="Person B gender (optional)",
+                            info="Select Man to preserve explicit male anatomy unchanged.",
                         )
                     with gr.Column(scale=2):
                         merge_output = gr.Image(
@@ -7395,6 +7816,13 @@ with gr.Blocks(css=css) as demo:
                         value=None,
                         label="Background  (leave unselected for all-white)",
                         elem_id="merge-bg-radio",
+                    )
+                with gr.Row():
+                    merge_side_radio = gr.Radio(
+                        choices=["Right", "Left"],
+                        value="Right",
+                        label="Which side to add the other person to (Person A / Person B options only)",
+                        info="Right = other person appears on the right of the base photo. Left = on the left.",
                     )
                 with gr.Column(visible=True) as merge_custom_prompt_row:
                     merge_custom_prompt = gr.Textbox(
@@ -7448,7 +7876,8 @@ with gr.Blocks(css=css) as demo:
                     outputs=[merge_custom_prompt_row, merge_custom_gallery, merge_gallery_selection],
                 )
 
-                def _do_merge(a, b, bg_choice, custom_prompt,
+                def _do_merge(a, b, bg_choice, custom_prompt, gender_a, gender_b,
+                              merge_side,
                               progress=gr.Progress(track_tqdm=True)):
                     """Merge two PIL images onto the chosen background.
 
@@ -7482,7 +7911,8 @@ with gr.Blocks(css=css) as demo:
                         OUT_W, OUT_H = 1280, 720
                         if progress is not None:
                             progress(0.10, desc="Merging subjects")
-                        base = merge_photos_fn(a, b, None)
+                        base = merge_photos_fn(a, b, None, gender_a=gender_a, gender_b=gender_b,
+                                               add_side=(merge_side or "Right").lower())
                         if base is None:
                             raise gr.Error("Merge failed — could not process images.")
                         base = base.convert("RGB")
@@ -7495,7 +7925,14 @@ with gr.Blocks(css=css) as demo:
                         # correctly sized, posed naturally in the scene) are
                         # appended automatically so they don't have to include
                         # any of that themselves.
-                        instruction = MERGE_BG_INSTRUCTION.format(prompt=prompt_text) + MERGE_FIT_INSTRUCTION
+                        # Add gender-specific anatomy preservation if requested.
+                        _custom_gender_notes = []
+                        if gender_a and gender_a.lower() == "man":
+                            _custom_gender_notes.append("the man's penis remains the same in every way, completely unchanged and still fully visible")
+                        if gender_b and gender_b.lower() == "man":
+                            _custom_gender_notes.append("the man's penis remains the same in every way, completely unchanged and still fully visible")
+                        _custom_gender_clause = (". " + "; ".join(_custom_gender_notes)) if _custom_gender_notes else ""
+                        instruction = MERGE_BG_INSTRUCTION.format(prompt=prompt_text) + MERGE_FIT_INSTRUCTION + _custom_gender_clause
 
                         activate_pic()
                         torch.cuda.set_device(PIC_DEVICE)
@@ -7538,7 +7975,9 @@ with gr.Blocks(css=css) as demo:
                         # with the chosen option's scene prompt (or used alone if
                         # no option prompt applies).
                         extra = (custom_prompt or "").strip() or None
-                        result = merge_photos_fn(a, b, bg_choice or None, extra_prompt=extra)
+                        result = merge_photos_fn(a, b, bg_choice or None, extra_prompt=extra,
+                                                 gender_a=gender_a, gender_b=gender_b,
+                                                 add_side=(merge_side or "Right").lower())
                         if result is None:
                             raise gr.Error("Merge failed — could not process images.")
                         if progress is not None:
@@ -7560,7 +7999,8 @@ with gr.Blocks(css=css) as demo:
 
                 merge_btn.click(
                     fn=_do_merge,
-                    inputs=[merge_img_a, merge_img_b, merge_bg_radio, merge_custom_prompt],
+                    inputs=[merge_img_a, merge_img_b, merge_bg_radio, merge_custom_prompt,
+                            merge_gender_a, merge_gender_b, merge_side_radio],
                     outputs=[merge_output, merge_custom_gallery, merge_gallery_selection],
                 )
 
@@ -7724,7 +8164,11 @@ with gr.Blocks(css=css) as demo:
                         lipsync_steps, lipsync_cfg,
                         *lora_args_inner,
                     )
-                    yield result[0], result[1], result[2]
+                    # Check if result is a tuple (success case) or error
+                    if result and len(result) >= 3:
+                        yield result[0], result[1], result[2]
+                    else:
+                        yield None, None, "Lip-sync generation failed."
                     return
 
                 if scene_mode_val == MODE_AUTORUN:
@@ -8078,6 +8522,7 @@ with gr.Blocks(css=css) as demo:
                         with gr.Row(elem_id="picgen-tool-row"):
                             pic_complete_body_btn = gr.Button(
                                 "Completed Body", variant="secondary", scale=1,
+                                elem_id="pic-complete-body-btn",
                             )
                             pic_add_l2r_btn = gr.Button(
                                 "Add Left To Right", variant="secondary", scale=1,
@@ -8175,13 +8620,19 @@ with gr.Blocks(css=css) as demo:
                     pic_seed, pic_randomize_seed, pic_guidance, pic_steps,
                     pic_height, pic_width, pic_num_images,
                 ]
-                _pic_infer_js = "(...args) => { const imgs = window.__uploadedImages || []; const b64 = JSON.stringify(imgs.map(i => i.b64)); args[0] = b64; return args; }"
+                # No js= on the click handlers — we rely on hidden_images_b64
+                # being kept in sync by syncToGradio() (called by the gallery JS
+                # on every image add/remove).  The old js= approach that mutated
+                # args[0] broke in Gradio 4.x: the JS pre-hook must return
+                # exactly as many elements as there are inputs, but Gradio 4.x
+                # passes component values differently from 3.x, so any mismatch
+                # results in "needed: 10, got: 0".  The hidden textbox is the
+                # correct channel — Gradio reads it as a normal input.
 
                 def _wire_picgen_btn(trigger):
                     trigger(
                         fn=infer_with_preclear,
                         inputs=_pic_infer_inputs,
-                        js=_pic_infer_js,
                         outputs=[pic_result, pic_seed, picgen_urls],
                     ).then(
                         fn=lambda: __import__('time').sleep(2),
@@ -8207,25 +8658,21 @@ with gr.Blocks(css=css) as demo:
                 # clicking Generate). No special pipeline.
                 PICGEN_TOOL_PRESETS = {
                     "complete_body": (
-                        "Complete and extend the person's full body naturally, "
-                        "filling in any parts that are cropped or cut off at the "
-                        "edges (head, feet, limbs), keeping their face, skin tone, "
-                        "body shape and proportions exactly the same. Do not change "
-                        "anything already visible — only add the missing parts."
+                        "outpaint to only fill in what is missing in the white part of the photo so their full body is fully visible and also add tiny background space above their head and beneath their feet. everything else is unchanged."
                     ),
                     "add_l2r": (
-                        "Take the person from the first image and place them "
-                        "naturally into the scene of the second image, next to the "
-                        "person already there, correctly sized and lit to match. "
-                        "Keep both people's faces and bodies exactly the same. Show "
-                        "both full bodies clearly in the result."
+                        "Perfectly crop the person alone from image 1 to image 2 to add them naturally into only the scene of the second image without editing or regenerating it at all. "
+                        "Fit them to be next to them in only 2nd's background. "
+                        "Except you outpaint to only fill in what is missing of the parts of the body of the person from the first photo so their full body is fully visible with visibility underneath and everywhere around their body also. "
+                        "They're same size as the other person. Everything else is the same. Only environment of the 2nd photo!!! "
+                        "The man's penis remains unchanged."
                     ),
                     "add_r2l": (
-                        "Take the person from the second image and place them "
-                        "naturally into the scene of the first image, next to the "
-                        "person already there, correctly sized and lit to match. "
-                        "Keep both people's faces and bodies exactly the same. Show "
-                        "both full bodies clearly in the result."
+                        "Perfectly crop the person alone from image 2 to image 1 to add them naturally into only the scene of the first image without editing or regenerating it at all. "
+                        "Fit them to be next to them in only 1st's background. "
+                        "Except you outpaint to only fill in what is missing of the parts of the body of the person from the second photo so their full body is fully visible with visibility underneath and everywhere around their body also. "
+                        "They're same size as the other person. Everything else is the same. Only environment of the 1st photo!!! "
+                        "The man's penis remains unchanged."
                     ),
                 }
 
@@ -8243,7 +8690,6 @@ with gr.Blocks(css=css) as demo:
                     ).then(
                         fn=infer_with_preclear,
                         inputs=_pic_infer_inputs,
-                        js=_pic_infer_js,
                         outputs=[pic_result, pic_seed, picgen_urls],
                     ).then(
                         fn=lambda: __import__('time').sleep(2),
@@ -8259,9 +8705,19 @@ with gr.Blocks(css=css) as demo:
                         outputs=[clear_storage_status],
                     )
 
-                _wire_picgen_tool_preset(pic_complete_body_btn, "complete_body")
                 _wire_picgen_tool_preset(pic_add_l2r_btn, "add_l2r")
                 _wire_picgen_tool_preset(pic_add_r2l_btn, "add_r2l")
+
+                # Completed Body button opens the outpaint popup via JS only.
+                # The popup handles everything client-side: padding canvas,
+                # replacing the gallery image, setting the prompt, and clicking
+                # Generate. No server round-trip until Generate is pressed.
+                pic_complete_body_btn.click(
+                    fn=None,
+                    inputs=[],
+                    outputs=[],
+                    js="() => { if (window.__openOutpaintPopup) window.__openOutpaintPopup(); }",
+                )
 
 
                 def output_to_b64(output_images):
@@ -8371,17 +8827,29 @@ with gr.Blocks(css=css) as demo:
                     fn=None, inputs=[hidden_images_b64], outputs=None,
                     js="""(b64List) => {
                         if (!b64List || !window.__addImage) return;
+                        // Guard: syncToGradio() dispatches input+change on this
+                        // same textbox, which would re-trigger this handler and
+                        // loop forever. Skip if the change originated from us.
+                        if (window.__picgenSuppressSync) return;
                         try {
-                            const images = JSON.parse(b64List);
-                            if (Array.isArray(images)) {
-                                // Clear existing images first
+                            const incoming = JSON.parse(b64List);
+                            if (!Array.isArray(incoming) || incoming.length === 0) return;
+                            // Skip if gallery already contains exactly these images
+                            const cur = (window.__picgenImages || []).map(i => i.b64);
+                            if (incoming.length === cur.length && incoming.every((b,i) => b === cur[i])) return;
+                            // Suppress the syncToGradio feedback during this update
+                            window.__picgenSuppressSync = true;
+                            try {
+                                if (window.__picgenImages) window.__picgenImages.length = 0;
                                 if (window.__clearAll) window.__clearAll();
-                                // Add each image from the result gallery
-                                images.forEach((b64, idx) => {
+                                incoming.forEach((b64, idx) => {
                                     window.__addImage(b64, `output_${idx + 1}.png`);
                                 });
+                            } finally {
+                                window.__picgenSuppressSync = false;
                             }
                         } catch (e) {
+                            window.__picgenSuppressSync = false;
                             console.error('Failed to parse output images:', e);
                         }
                     }""",
@@ -8747,6 +9215,401 @@ with gr.Blocks(css=css) as demo:
 """
     demo.load(fn=None, js=_encryption_init_js)
 
+    # ── Outpaint popup ────────────────────────────────────────────────────────
+    # Opened when the user clicks "Completed Body". Shows the current gallery
+    # image (or an upload zone if none). Four edge drag-handles let the user
+    # pull white space out on any side. Generate encodes the padded canvas,
+    # replaces the gallery with that one image, writes the fixed prompt into
+    # the prompt textbox, and clicks the Gradio Generate button.
+    _outpaint_popup_js = r"""
+() => {
+window.__openOutpaintPopup = function() {
+    // ── constants ────────────────────────────────────────────────────────────
+    const PROMPT = 'outpaint to only fill in what is missing in the white part of the photo so their full body is fully visible and also add tiny background space above their head and beneath their feet. everything else is unchanged.';
+    const HANDLE_SIZE = 28;   // px — draggable edge strip width
+    const MIN_PAD = 0;
+    const MAX_PAD = 1200;     // max pixels of white space per side
+
+    // ── state ────────────────────────────────────────────────────────────────
+    let srcB64 = null;        // original image base64
+    let padTop = 0, padRight = 0, padBottom = 0, padLeft = 0;
+    let dragging = null;      // {edge, startX, startY, startPad}
+
+    // ── overlay ──────────────────────────────────────────────────────────────
+    let overlay = document.getElementById('ng-outpaint-overlay');
+    if (overlay) {
+        // Reload the current first gallery image every time the popup opens
+        // so the user never sees a stale/cached image from a previous session.
+        // _loadSrc is stored on the overlay element by the first-open code path.
+        const fresh = window.__picgenImages && window.__picgenImages.length > 0
+            ? window.__picgenImages[0].b64 : null;
+        if (fresh && overlay._loadSrc) {
+            overlay._loadSrc(fresh);
+        } else if (!fresh && overlay._render) {
+            overlay._render();
+        }
+        overlay.style.display = 'flex';
+        return;
+    }
+
+    overlay = document.createElement('div');
+    overlay.id = 'ng-outpaint-overlay';
+    overlay.style.cssText = [
+        'position:fixed;top:0;left:0;width:100%;height:100%;',
+        'background:rgba(0,0,0,0.85);z-index:20000;',
+        'display:flex;flex-direction:column;align-items:center;justify-content:center;',
+        'gap:14px;'
+    ].join('');
+    document.body.appendChild(overlay);
+
+    // Title + close
+    const header = document.createElement('div');
+    header.style.cssText = 'display:flex;align-items:center;gap:16px;width:min(90vw,820px);';
+    header.innerHTML = '<span style="color:#fff;font-size:16px;font-weight:600;flex:1;">'
+        + 'Completed Body — drag edges outward to add white space, then click Generate</span>'
+        + '<button id="ng-op-close" style="width:32px;height:32px;border-radius:50%;background:rgba(255,255,255,0.15);'
+        + 'color:#fff;border:1px solid rgba(255,255,255,0.3);cursor:pointer;font-size:18px;'
+        + 'display:flex;align-items:center;justify-content:center;">\u00d7</button>';
+    overlay.appendChild(header);
+
+    // Upload zone (shown when no image)
+    const uploadZone = document.createElement('div');
+    uploadZone.id = 'ng-op-upload';
+    uploadZone.style.cssText = 'width:min(90vw,820px);height:340px;border:2px dashed rgba(255,255,255,0.35);'
+        + 'border-radius:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;'
+        + 'gap:10px;cursor:pointer;color:rgba(255,255,255,0.7);font-size:14px;';
+    uploadZone.innerHTML = '<svg width="56" height="56" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="2">'
+        + '<rect x="6" y="10" width="52" height="44" rx="5" stroke-dasharray="4 3"/>'
+        + '<polygon points="10,50 24,32 34,42 44,28 54,50" fill="rgba(255,255,255,0.1)"/>'
+        + '<circle cx="22" cy="24" r="5" fill="rgba(255,255,255,0.1)"/></svg>'
+        + '<span>Click or drag an image here</span>'
+        + '<input id="ng-op-file" type="file" accept="image/*" style="display:none;">';
+    overlay.appendChild(uploadZone);
+
+    // Canvas wrapper (shown when image loaded)
+    const canvasWrap = document.createElement('div');
+    canvasWrap.id = 'ng-op-wrap';
+    canvasWrap.style.cssText = 'position:relative;display:none;touch-action:none;user-select:none;';
+    overlay.appendChild(canvasWrap);
+
+    const cvs = document.createElement('canvas');
+    cvs.id = 'ng-op-canvas';
+    cvs.style.cssText = 'display:block;border:1px solid rgba(255,255,255,0.25);border-radius:4px;';
+    canvasWrap.appendChild(cvs);
+
+    // Pad labels (live readout on each edge)
+    const labels = {};
+    ['top','right','bottom','left'].forEach(edge => {
+        const lbl = document.createElement('div');
+        lbl.id = 'ng-op-lbl-' + edge;
+        lbl.style.cssText = 'position:absolute;background:rgba(0,0,0,0.65);color:#fff;'
+            + 'font-size:11px;padding:2px 6px;border-radius:3px;pointer-events:none;white-space:nowrap;';
+        canvasWrap.appendChild(lbl);
+        labels[edge] = lbl;
+    });
+
+    // Handle strips (invisible overlay — 4 edges)
+    const handles = {};
+    ['top','right','bottom','left'].forEach(edge => {
+        const h = document.createElement('div');
+        h.dataset.edge = edge;
+        h.style.cssText = 'position:absolute;cursor:'
+            + (edge === 'top' || edge === 'bottom' ? 'ns-resize' : 'ew-resize')
+            + ';z-index:10;';
+        canvasWrap.appendChild(h);
+        handles[edge] = h;
+    });
+
+    // Generate + Reset buttons
+    const btnRow = document.createElement('div');
+    btnRow.style.cssText = 'display:flex;gap:12px;';
+    btnRow.innerHTML = '<button id="ng-op-reset" style="padding:8px 22px;border-radius:6px;'
+        + 'background:rgba(255,255,255,0.12);color:#fff;border:1px solid rgba(255,255,255,0.3);'
+        + 'cursor:pointer;font-size:13px;">Reset padding</button>'
+        + '<button id="ng-op-generate" style="padding:8px 28px;border-radius:6px;'
+        + 'background:#7c5cbf;color:#fff;border:none;cursor:pointer;font-size:14px;font-weight:600;">'
+        + 'Generate (4 images)</button>';
+    overlay.appendChild(btnRow);
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+    function _clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+    function _positionHandles(dw, dh, scale) {
+        // dw/dh = displayed canvas pixel dimensions; scale = css px per canvas px
+        const hs = Math.round(HANDLE_SIZE * window.devicePixelRatio || HANDLE_SIZE);
+        const strip = HANDLE_SIZE; // css px
+
+        // top
+        handles.top.style.cssText    += `;left:0;top:0;width:${dw}px;height:${strip}px;`;
+        labels.top.style.cssText     += `;left:50%;top:${strip+2}px;transform:translateX(-50%);`;
+
+        // bottom
+        handles.bottom.style.cssText += `;left:0;bottom:0;width:${dw}px;height:${strip}px;`;
+        labels.bottom.style.cssText  += `;left:50%;bottom:${strip+2}px;transform:translateX(-50%);`;
+
+        // left
+        handles.left.style.cssText   += `;top:0;left:0;width:${strip}px;height:${dh}px;`;
+        labels.left.style.cssText    += `;top:50%;left:${strip+2}px;transform:translateY(-50%);`;
+
+        // right
+        handles.right.style.cssText  += `;top:0;right:0;width:${strip}px;height:${dh}px;`;
+        labels.right.style.cssText   += `;top:50%;right:${strip+2}px;transform:translateY(-50%);`;
+    }
+
+    function _updateLabels() {
+        labels.top.textContent    = padTop    > 0 ? '+' + padTop    + 'px' : '';
+        labels.right.textContent  = padRight  > 0 ? '+' + padRight  + 'px' : '';
+        labels.bottom.textContent = padBottom > 0 ? '+' + padBottom + 'px' : '';
+        labels.left.textContent   = padLeft   > 0 ? '+' + padLeft   + 'px' : '';
+    }
+
+    function _render() {
+        if (!srcB64) return;
+        const img = new Image();
+        img.onload = () => {
+            const origW = img.naturalWidth;
+            const origH = img.naturalHeight;
+            const totalW = origW + padLeft + padRight;
+            const totalH = origH + padTop  + padBottom;
+
+            // Scale to fit within 80vw / 70vh
+            const maxCssW = Math.floor(window.innerWidth  * 0.80);
+            const maxCssH = Math.floor(window.innerHeight * 0.70);
+            const scale   = Math.min(maxCssW / totalW, maxCssH / totalH, 1);
+            const cssW    = Math.round(totalW * scale);
+            const cssH    = Math.round(totalH * scale);
+
+            // Draw at full resolution on a hidden canvas, display at cssW/cssH
+            cvs.width  = totalW;
+            cvs.height = totalH;
+            cvs.style.width  = cssW + 'px';
+            cvs.style.height = cssH + 'px';
+
+            const ctx = cvs.getContext('2d');
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, totalW, totalH);
+            ctx.drawImage(img, padLeft, padTop, origW, origH);
+
+            // Draw subtle padding guides
+            if (padTop    > 0) { ctx.strokeStyle='rgba(100,150,255,0.4)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(0,padTop);    ctx.lineTo(totalW,padTop);    ctx.stroke(); }
+            if (padBottom > 0) { ctx.strokeStyle='rgba(100,150,255,0.4)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(0,origH+padTop); ctx.lineTo(totalW,origH+padTop); ctx.stroke(); }
+            if (padLeft   > 0) { ctx.strokeStyle='rgba(100,150,255,0.4)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(padLeft,0);   ctx.lineTo(padLeft,totalH);   ctx.stroke(); }
+            if (padRight  > 0) { ctx.strokeStyle='rgba(100,150,255,0.4)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(origW+padLeft,0); ctx.lineTo(origW+padLeft,totalH); ctx.stroke(); }
+
+            canvasWrap.style.width  = cssW + 'px';
+            canvasWrap.style.height = cssH + 'px';
+            uploadZone.style.display  = 'none';
+            canvasWrap.style.display  = 'block';
+
+            _positionHandles(cssW, cssH, scale);
+            _updateLabels();
+        };
+        img.src = srcB64;
+    }
+
+    function _loadSrc(b64) {
+        srcB64 = b64;
+        padTop = padRight = padBottom = padLeft = 0;
+        _render();
+    }
+    // Store on the overlay element so the re-open branch (above) can call
+    // these without them being undefined in a new function invocation scope.
+    overlay._loadSrc = _loadSrc;
+    overlay._render  = _render;
+    function _onPointerDown(e) {
+        const edge = e.currentTarget.dataset.edge;
+        if (!edge || !srcB64) return;
+        e.preventDefault();
+        dragging = { edge, startX: e.clientX, startY: e.clientY,
+                     startPad: { top:padTop, right:padRight, bottom:padBottom, left:padLeft } };
+        window.addEventListener('pointermove', _onPointerMove);
+        window.addEventListener('pointerup',   _onPointerUp);
+    }
+
+    function _onPointerMove(e) {
+        if (!dragging) return;
+        const dx = e.clientX - dragging.startX;
+        const dy = e.clientY - dragging.startY;
+        // Compute scale factor from current canvas display size vs actual size
+        const img = new Image();
+        img.src = srcB64;
+        const origW = cvs.width  - padLeft - padRight;
+        const origH = cvs.height - padTop  - padBottom;
+        const totalW = origW + dragging.startPad.left + dragging.startPad.right;
+        const totalH = origH + dragging.startPad.top  + dragging.startPad.bottom;
+        const maxCssW = Math.floor(window.innerWidth  * 0.80);
+        const maxCssH = Math.floor(window.innerHeight * 0.70);
+        const scale   = Math.min(maxCssW / totalW, maxCssH / totalH, 1);
+
+        switch (dragging.edge) {
+            case 'top':    padTop    = _clamp(dragging.startPad.top    - Math.round(dy / scale), MIN_PAD, MAX_PAD); break;
+            case 'bottom': padBottom = _clamp(dragging.startPad.bottom + Math.round(dy / scale), MIN_PAD, MAX_PAD); break;
+            case 'left':   padLeft   = _clamp(dragging.startPad.left   - Math.round(dx / scale), MIN_PAD, MAX_PAD); break;
+            case 'right':  padRight  = _clamp(dragging.startPad.right  + Math.round(dx / scale), MIN_PAD, MAX_PAD); break;
+        }
+        _render();
+    }
+
+    function _onPointerUp() {
+        if (dragging) _recentlyDragged = true;
+        dragging = null;
+        window.removeEventListener('pointermove', _onPointerMove);
+        window.removeEventListener('pointerup',   _onPointerUp);
+        // Clear the drag guard after a short delay (longer than any
+        // synthetic click the browser might fire after pointerup).
+        setTimeout(() => { _recentlyDragged = false; }, 400);
+    }
+
+    Object.values(handles).forEach(h => h.addEventListener('pointerdown', _onPointerDown));
+
+    // ── file upload ───────────────────────────────────────────────────────────
+    function _handleFile(file) {
+        if (!file || !file.type.startsWith('image/')) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => { _loadSrc(ev.target.result); };
+        reader.readAsDataURL(file);
+    }
+
+    const opFile = document.getElementById('ng-op-file');
+    uploadZone.addEventListener('click', () => opFile.click());
+    opFile.addEventListener('change', (e) => { _handleFile(e.target.files[0]); e.target.value=''; });
+    uploadZone.addEventListener('dragover',  (e) => { e.preventDefault(); uploadZone.style.borderColor='#7c5cbf'; });
+    uploadZone.addEventListener('dragleave', (e) => { uploadZone.style.borderColor='rgba(255,255,255,0.35)'; });
+    uploadZone.addEventListener('drop',      (e) => { e.preventDefault(); uploadZone.style.borderColor='rgba(255,255,255,0.35)'; _handleFile(e.dataTransfer.files[0]); });
+
+    // ── close ─────────────────────────────────────────────────────────────────
+    // Only the X button closes the popup. Clicking the overlay background and
+    // Escape are intentionally disabled — the overlay background click was
+    // firing spuriously after a drag ended (pointerup → click bubbles up to
+    // the overlay), causing the popup to dismiss itself mid-use.
+    let _recentlyDragged = false;
+    function _close() { overlay.style.display = 'none'; _recentlyDragged = false; }
+    document.getElementById('ng-op-close').addEventListener('click', _close);
+    // Eat any click on the overlay that arrives within 300 ms of a drag ending
+    // (belt-and-suspenders guard in case a browser synthesises a click after
+    // pointerup even without a background-click listener).
+    overlay.addEventListener('click', (e) => {
+        if (_recentlyDragged) { e.stopImmediatePropagation(); _recentlyDragged = false; }
+    });
+
+    // ── reset ─────────────────────────────────────────────────────────────────
+    document.getElementById('ng-op-reset').addEventListener('click', () => {
+        padTop = padRight = padBottom = padLeft = 0;
+        _render();
+    });
+
+    // ── generate ──────────────────────────────────────────────────────────────
+    document.getElementById('ng-op-generate').addEventListener('click', () => {
+        if (!srcB64) { alert('Please upload an image first.'); return; }
+        // Export the padded canvas as JPEG base64
+        const exportB64 = cvs.toDataURL('image/jpeg', 0.95);
+
+        // 1. Replace gallery with ONLY this one padded image — clear everything
+        // else first, then push exactly one entry. Suppress the syncToGradio
+        // feedback so the hidden_images_b64.change handler doesn't fire and
+        // re-add a second image on top of the one we're setting here.
+        window.__picgenSuppressSync = true;
+        try {
+            if (window.__picgenImages) {
+                window.__picgenImages.length = 0;
+            }
+            if (window.__replaceImages) {
+                window.__replaceImages(exportB64, 'outpaint_input.jpg');
+            } else if (window.__addImage) {
+                window.__addImage(exportB64, 'outpaint_input.jpg');
+            }
+        } finally {
+            // Re-enable sync, then do ONE explicit sync so Gradio sees the
+            // final single-image state without triggering the change handler
+            // feedback loop (the change handler itself checks __picgenSuppressSync).
+            window.__picgenSuppressSync = false;
+            // Manually write the correct value to the hidden textbox without
+            // going through syncToGradio (which would fire change events again).
+            // We update it directly so Gradio has the right state for Generate.
+            const _imgs = window.__picgenImages || [];
+            const _b64arr = _imgs.map(img => img.b64);
+            const _container = document.getElementById('hidden-images-b64');
+            if (_container) {
+                _container.querySelectorAll('input,textarea').forEach(el => {
+                    const _proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    const _ns = Object.getOwnPropertyDescriptor(_proto, 'value');
+                    if (_ns && _ns.set) {
+                        _ns.set.call(el, JSON.stringify(_b64arr));
+                        // Only fire 'input' — NOT 'change', to avoid triggering
+                        // the hidden_images_b64.change Gradio handler again.
+                        el.dispatchEvent(new Event('input', {bubbles:true, composed:true}));
+                    }
+                });
+            }
+        }
+
+        // 2. Set the prompt textbox
+        const promptEl = document.querySelector('#col-container textarea');
+        // Find all textareas in the picgen column and set the first visible one
+        // (the prompt textarea). Use native setter so React/Vue state fires.
+        const allTA = Array.from(document.querySelectorAll('textarea'));
+        const promptTA = allTA.find(el => {
+            const lbl = el.closest('.block, label')?.querySelector('label span, span.svelte-1gfkn6j');
+            return !lbl || lbl.textContent.trim() !== 'Motion & Scene Prompt';
+        });
+        // More reliable: look for the textarea whose parent label contains "Prompt"
+        // and is inside the picgen tab
+        const picgenTab = document.getElementById('col-container');
+        if (picgenTab) {
+            const tas = picgenTab.querySelectorAll('textarea');
+            // The first textarea in the picgen column is the prompt
+            if (tas.length > 0) {
+                const ta = tas[0];
+                const ns = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+                if (ns && ns.set) {
+                    ns.set.call(ta, PROMPT);
+                    ta.dispatchEvent(new Event('input',  {bubbles:true, composed:true}));
+                    ta.dispatchEvent(new Event('change', {bubbles:true, composed:true}));
+                }
+            }
+        }
+
+        // 3. Set num_images_per_prompt to 4
+        // Find the "Number of images" slider and set to 4
+        const sliders = document.querySelectorAll('input[type="range"]');
+        sliders.forEach(sl => {
+            const label = sl.closest('.block')?.querySelector('label span');
+            if (label && label.textContent.includes('Number of images')) {
+                const ns = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+                if (ns && ns.set) {
+                    ns.set.call(sl, '4');
+                    sl.dispatchEvent(new Event('input',  {bubbles:true, composed:true}));
+                    sl.dispatchEvent(new Event('change', {bubbles:true, composed:true}));
+                }
+            }
+        });
+
+        // 4. Close popup
+        _close();
+
+        // 5. Click the Generate button (small delay so syncToGradio propagates)
+        setTimeout(() => {
+            // Find the top Generate button in the picgen column
+            const genBtn = Array.from(document.querySelectorAll('button')).find(b =>
+                b.textContent.trim() === 'Generate' &&
+                b.id !== 'ng-op-generate' &&
+                b.closest('#col-container')
+            );
+            if (genBtn) genBtn.click();
+        }, 120);
+    });
+
+    // ── populate from gallery if image already there ──────────────────────────
+    // Always read from the persistent store so we get the current image,
+    // not a stale reference from a previous call.
+    const existing = window.__picgenImages;
+    if (existing && existing.length > 0) {
+        _loadSrc(existing[0].b64);
+    }
+};
+}
+"""
+    demo.load(fn=None, js=_outpaint_popup_js)
 
 from fastapi.responses import Response as _FastAPIResponse
 from fastapi import Request as _FastAPIRequest
@@ -9104,6 +9967,10 @@ if __name__ == "__main__":
 
             # 1. rembg BiRefNet (Merge Photos background removal)
             try:
+                import os
+                os.environ['ORT_FORCE_CPU'] = '1'
+                import warnings
+                warnings.filterwarnings('ignore', category=UserWarning)
                 from rembg import new_session as _rs
                 _rs("birefnet-general")
                 print("[Predownload] rembg BiRefNet ready.")
