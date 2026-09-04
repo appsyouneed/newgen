@@ -3,11 +3,14 @@
 #  NewGen VPS Launcher  --  run this on the VPS
 #
 #  Usage:
-#    bash autorun.sh           # start app.py (survives SSH disconnect)
-#    bash autorun.sh stop      # kill it
-#    bash autorun.sh status    # show PID
-#    bash autorun.sh logs      # tail live log
-#    bash autorun.sh restart   # stop then start
+#    bash run.sh              # start in vidgen mode (default)
+#    bash run.sh picgen       # start in picgen mode (Qwen loads first)
+#    bash run.sh -picgen      # same as above
+#    bash run.sh stop         # kill it
+#    bash run.sh status       # show PID
+#    bash run.sh logs         # tail live log
+#    bash run.sh restart      # stop then start
+#    bash run.sh restart picgen  # restart in picgen mode
 # ============================================================
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -41,71 +44,96 @@ do_stop() {
     if [[ -f "$PID_FILE" ]]; then
         PID=$(cat "$PID_FILE")
         if kill -0 "$PID" 2>/dev/null; then
-            echo "[autorun] Stopping PID $PID..."
+            echo "[run] Stopping PID $PID..."
             kill "$PID"
         fi
         rm -f "$PID_FILE"
     fi
     # Also catch anything missed (nohup, direct python3, venv python, etc.)
     pkill -f "app\.py" 2>/dev/null || true
-    echo "[autorun] Stopped."
+    echo "[run] Stopped."
 }
 
+# $1 = optional mode flag ("picgen" / "-picgen" / "--picgen"), empty = vidgen
 do_start() {
+    local MODE_ARG=""
+    local mode_display="vidgen (default)"
+    local raw="${1:-}"
+    local flag="${raw#-}"   # strip any leading dashes
+    flag="${flag#-}"        # strip a second dash (handles --picgen too)
+    if [[ "${flag,,}" == "picgen" ]]; then
+        MODE_ARG="--picgen"
+        mode_display="picgen"
+    fi
+
     if is_running; then
-        echo "[autorun] Already running (PID $(cat "$PID_FILE")). Run:  bash autorun.sh restart"
+        echo "[run] Already running (PID $(cat "$PID_FILE")). Run:  bash run.sh restart"
         exit 0
     fi
-    [[ -f "$APP" ]] || { echo "[autorun] ERROR: $APP not found."; exit 1; }
+    [[ -f "$APP" ]] || { echo "[run] ERROR: $APP not found."; exit 1; }
 
-    echo "[autorun] Starting app.py..."
-    echo "[autorun] Log  -> $LOG"
+    echo "[run] Starting app.py in $mode_display mode..."
+    echo "[run] Log  -> $LOG"
 
     # nohup + setsid: process survives SSH disconnect and terminal close
-    nohup setsid "$PYTHON" "$APP" > "$LOG" 2>&1 &
+    nohup setsid "$PYTHON" "$APP" $MODE_ARG > "$LOG" 2>&1 &
     echo $! > "$PID_FILE"
 
-    echo "[autorun] Waiting for startup..."
+    echo "[run] Waiting for startup..."
     for i in $(seq 1 30); do
         sleep 2
         if grep -q "Running on local URL" "$LOG" 2>/dev/null; then
-            echo "[autorun] Started (PID $(cat "$PID_FILE")). Gradio is up."
-            echo "[autorun] Confirm AutorunAPI:"
+            echo "[run] Started (PID $(cat "$PID_FILE")). Gradio is up."
+            echo "[run] Confirm AutorunAPI:"
             grep "AutorunAPI\|Running on" "$LOG" | tail -5
             echo ""
-            echo "[autorun] ── Live log (Ctrl+C to detach, app keeps running) ──"
+            echo "[run] ── Live log (Ctrl+C to detach, app keeps running) ──"
             tail -n 80 -f "$LOG"
             return
         fi
         if ! is_running; then
-            echo "[autorun] ERROR: process died. Last log:"
+            echo "[run] ERROR: process died. Last log:"
             tail -20 "$LOG"
             exit 1
         fi
     done
-    echo "[autorun] Still starting (taking longer than usual)."
+    echo "[run] Still starting (taking longer than usual)."
     echo ""
-    echo "[autorun] ── Live log (Ctrl+C to detach, app keeps running) ──"
+    echo "[run] ── Live log (Ctrl+C to detach, app keeps running) ──"
     tail -n 80 -f "$LOG"
 }
 
-case "${1:-start}" in
-    start)   do_start ;;
+# Parse command — first arg is the verb, second is optional mode
+CMD="${1:-start}"
+MODE="${2:-}"
+
+# Allow mode as first arg with no verb (e.g. bash run.sh picgen)
+case "${CMD,,}" in
+    picgen|-picgen|--picgen)
+        MODE="$CMD"
+        CMD="start"
+        ;;
+esac
+
+case "$CMD" in
+    start)   do_start "$MODE" ;;
     stop)    do_stop ;;
-    restart) do_stop; sleep 2; do_start ;;
+    restart) do_stop; sleep 2; do_start "$MODE" ;;
     status)
         if is_running; then
-            echo "[autorun] Running (PID $(cat "$PID_FILE"))"
+            echo "[run] Running (PID $(cat "$PID_FILE"))"
         else
-            echo "[autorun] Not running."
+            echo "[run] Not running."
         fi
         ;;
     logs)
-        echo "[autorun] Tailing $LOG  (Ctrl+C to stop)..."
+        echo "[run] Tailing $LOG  (Ctrl+C to stop)..."
         tail -f "$LOG"
         ;;
     *)
-        echo "Usage: bash autorun.sh [start|stop|restart|status|logs]"
+        echo "Usage: bash run.sh [picgen] [start|stop|restart|status|logs]"
+        echo "       bash run.sh picgen          # start in picgen mode"
+        echo "       bash run.sh restart picgen  # restart in picgen mode"
         exit 1
         ;;
 esac
