@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import os
 import shutil
 import subprocess
@@ -6507,16 +6507,10 @@ function init() {
         }
         if (uploadPrompt) uploadPrompt.style.display = 'none';
         galleryGrid.style.display = 'grid';
-        // Build HTML — each thumb gets its own inline onclick-less markup;
-        // all events are handled by the single capture-phase delegated listener
-        // attached to galleryGrid below (survives innerHTML replacement).
         let html = '';
         images.forEach((img, i) => {
             const sel = i === selectedIdx ? ' selected' : '';
-            // NOTE: thumb-remove must NOT be wrapped in overflow:hidden parent
-            // at the CSS level — we moved it outside the inner img wrapper so
-            // it is always in the hit-test area regardless of overflow clipping.
-            html += '<div class="gallery-thumb' + sel + '" data-idx="' + i + '">'
+            html += '<div class="gallery-thumb' + sel + '" draggable="true" data-idx="' + i + '">'
                   + '<img src="' + img.b64 + '" alt="' + (img.name||'image') + '">'
                   + '<span class="thumb-badge">#' + (i+1) + '</span>'
                   + '<button class="thumb-remove" data-remove="' + i + '" '
@@ -6552,13 +6546,13 @@ function init() {
     }
 
     function processFiles(files) {
+        const maxSize = window.__picgenMaxSize || 512;
         Array.from(files).forEach(file => {
             if (!file.type.startsWith('image/')) return;
             const reader = new FileReader();
             reader.onload = (e) => {
                 const img = new Image();
                 img.onload = () => {
-                    const maxSize = 512;
                     let width = img.width, height = img.height;
                     if (width > height) { height = Math.round((height * maxSize) / width); width = maxSize; }
                     else { width = Math.round((width * maxSize) / height); height = maxSize; }
@@ -6572,6 +6566,16 @@ function init() {
             reader.readAsDataURL(file);
         });
     }
+
+    // ── Quality selector buttons ──────────────────────────────────────────────
+    if (!window.__picgenMaxSize) window.__picgenMaxSize = 512;
+    document.querySelectorAll('.tb-quality').forEach(btn => {
+        btn.addEventListener('click', () => {
+            window.__picgenMaxSize = parseInt(btn.dataset.size, 10);
+            document.querySelectorAll('.tb-quality').forEach(b => b.classList.remove('tb-quality-active'));
+            btn.classList.add('tb-quality-active');
+        });
+    });
 
     fileInput.addEventListener('change', (e) => { processFiles(e.target.files); e.target.value = ''; });
     if (uploadClick) uploadClick.addEventListener('click', () => fileInput.click());
@@ -6619,6 +6623,55 @@ function init() {
         if (e.target.closest('#image-gallery-grid')) return;
         if (e.target.closest('#upload-click-area')) return;
         fileInput.click();
+    });
+
+    // ── Drag-to-reorder (bubble phase — separate from click capture above) ────
+    let _dragSrcIdx = -1;
+    galleryGrid.addEventListener('dragstart', (e) => {
+        const thumb = e.target.closest('.gallery-thumb');
+        if (!thumb) return;
+        _dragSrcIdx = parseInt(thumb.dataset.idx, 10);
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', String(_dragSrcIdx));
+        // Slight delay so the browser snapshot doesn't show the highlight
+        setTimeout(() => thumb.classList.add('dragging'), 0);
+    });
+    galleryGrid.addEventListener('dragend', (e) => {
+        _dragSrcIdx = -1;
+        galleryGrid.querySelectorAll('.gallery-thumb').forEach(t => {
+            t.classList.remove('drag-over', 'dragging');
+        });
+    });
+    galleryGrid.addEventListener('dragover', (e) => {
+        const thumb = e.target.closest('.gallery-thumb');
+        if (!thumb) return;
+        const overIdx = parseInt(thumb.dataset.idx, 10);
+        if (overIdx === _dragSrcIdx) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        galleryGrid.querySelectorAll('.gallery-thumb').forEach(t => t.classList.remove('drag-over'));
+        thumb.classList.add('drag-over');
+    });
+    galleryGrid.addEventListener('dragleave', (e) => {
+        const thumb = e.target.closest('.gallery-thumb');
+        if (thumb) thumb.classList.remove('drag-over');
+    });
+    galleryGrid.addEventListener('drop', (e) => {
+        const thumb = e.target.closest('.gallery-thumb');
+        if (!thumb) return;
+        e.preventDefault();
+        const destIdx = parseInt(thumb.dataset.idx, 10);
+        if (_dragSrcIdx < 0 || destIdx === _dragSrcIdx) return;
+        // Move image from srcIdx to destIdx
+        const moved = images.splice(_dragSrcIdx, 1)[0];
+        images.splice(destIdx, 0, moved);
+        // Keep selection tracking consistent
+        if (selectedIdx === _dragSrcIdx) selectedIdx = destIdx;
+        else if (_dragSrcIdx < selectedIdx && destIdx >= selectedIdx) selectedIdx--;
+        else if (_dragSrcIdx > selectedIdx && destIdx <= selectedIdx) selectedIdx++;
+        window.__picgenSelected.idx = selectedIdx;
+        renderGallery();
+        syncToGradio();
     });
 
     if (btnRemove) btnRemove.addEventListener('click', () => { if (selectedIdx >= 0) removeImage(selectedIdx); });
@@ -6684,10 +6737,12 @@ body, .gradio-container { margin: 0 !important; padding: 0 !important; max-width
    and let images size to their container. */
 #merge-custom-gallery { width: 100% !important; }
 #merge-custom-gallery img { object-fit: contain !important; }
-.gallery-thumb { position: relative; aspect-ratio: 1; border-radius: 8px; overflow: visible; cursor: pointer; border: 2px solid var(--border-color-primary); transition: border-color .2s ease, box-shadow .2s ease; background: var(--background-fill-primary); display: flex; align-items: center; justify-content: center; }
+.gallery-thumb { position: relative; aspect-ratio: 1; border-radius: 8px; overflow: visible; cursor: grab; border: 2px solid var(--border-color-primary); transition: border-color .2s ease, box-shadow .2s ease; background: var(--background-fill-primary); display: flex; align-items: center; justify-content: center; }
 .gallery-thumb > img { border-radius: 6px; overflow: hidden; }
 .gallery-thumb:hover { border-color: var(--color-accent); }
 .gallery-thumb.selected { border-color: var(--color-accent) !important; box-shadow: 0 0 0 3px rgba(var(--color-accent-soft), .3); }
+.gallery-thumb.dragging { opacity: 0.4; cursor: grabbing; }
+.gallery-thumb.drag-over { border-color: #fff !important; box-shadow: 0 0 0 3px rgba(255,255,255,0.5) !important; }
 .gallery-thumb img { width: 100%; height: 100%; object-fit: contain; display: block !important; }
 .thumb-badge { position: absolute; top: 5px; left: 5px; background: var(--color-accent); color: #fff; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 600; display: block; text-align: left; }
 .thumb-remove { position: absolute; top: 5px; right: 5px; width: 24px; height: 24px; background: rgba(0,0,0,.75); color: #fff; border: 1px solid rgba(255,255,255,.35); border-radius: 50%; cursor: pointer; display: flex !important; align-items: center; justify-content: center; font-size: 12px; transition: background .15s; line-height: 1; z-index: 50; padding: 0; pointer-events: auto !important; }
@@ -6698,8 +6753,12 @@ body, .gradio-container { margin: 0 !important; padding: 0 !important; max-width
 .gallery-add-card .add-icon { font-size: 26px; font-weight: 300; }
 .gallery-add-card .add-text { font-size: 12px; font-weight: 500; }
 .uploader-toolbar { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
+.quality-toolbar { display: flex; gap: 5px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
+.quality-label { font-size: 11px; color: var(--body-text-color-subdued); white-space: nowrap; margin-right: 2px; }
 .tb-btn { display: inline-flex; align-items: center; gap: 5px; padding: 5px 12px; border: 1px solid var(--border-color-primary); border-radius: 6px; background: var(--background-fill-secondary); cursor: pointer; font-size: 12px; font-weight: 500; transition: all .15s; }
 .tb-btn:hover { border-color: var(--color-accent); }
+.tb-quality { font-size: 11px; padding: 4px 9px; }
+.tb-quality-active { border-color: var(--color-accent) !important; background: var(--color-accent) !important; color: #fff !important; }
 /* Input photo fits inside its container without expanding it */
 #vidgen-reference { overflow: hidden !important; }
 #vidgen-reference img, #vidgen-reference video { max-height: 320px !important; max-width: 100% !important; width: auto !important; height: auto !important; object-fit: contain !important; display: block !important; margin: 0 auto !important; }
@@ -8501,6 +8560,14 @@ with gr.Blocks(css=css) as demo:
                             <button id="tb-remove" class="tb-btn">Remove Selected</button>
                             <button id="tb-clear" class="tb-btn">Clear All</button>
                         </div>
+                        <div class="quality-toolbar">
+                            <span class="quality-label">Quality:</span>
+                            <button class="tb-btn tb-quality" data-size="256">256 ⚡ Fastest</button>
+                            <button class="tb-btn tb-quality tb-quality-active" data-size="512">512 ✦ Default</button>
+                            <button class="tb-btn tb-quality" data-size="1024">1024 ▲ Better</button>
+                            <button class="tb-btn tb-quality" data-size="1920">1920 ▲▲ High</button>
+                            <button class="tb-btn tb-quality" data-size="2560">2560 ★ Max</button>
+                        </div>
                         <div id="gallery-drop-zone">
                             <div id="upload-prompt" class="upload-prompt-modern">
                                 <div id="upload-click-area" class="upload-click-area">
@@ -8521,7 +8588,7 @@ with gr.Blocks(css=css) as demo:
                         # width of the Generate button below.
                         with gr.Row(elem_id="picgen-tool-row"):
                             pic_complete_body_btn = gr.Button(
-                                "Completed Body", variant="secondary", scale=1,
+                                "Multi-Tool", variant="secondary", scale=1,
                                 elem_id="pic-complete-body-btn",
                             )
                             pic_add_l2r_btn = gr.Button(
@@ -9215,38 +9282,49 @@ with gr.Blocks(css=css) as demo:
 """
     demo.load(fn=None, js=_encryption_init_js)
 
-    # ── Outpaint popup ────────────────────────────────────────────────────────
-    # Opened when the user clicks "Completed Body". Shows the current gallery
-    # image (or an upload zone if none). Four edge drag-handles let the user
-    # pull white space out on any side. Generate encodes the padded canvas,
-    # replaces the gallery with that one image, writes the fixed prompt into
-    # the prompt textbox, and clicks the Gradio Generate button.
+    # ── Multi-Tool popup ──────────────────────────────────────────────────────
+    # Opened when the user clicks "Multi-Tool". Shows the current first gallery
+    # image (or an upload zone if none). Edge drag-handles let the user extend
+    # (outward = white space added) or crop (inward = image trimmed) on any
+    # side. Buttons: Upload (import image), Update Input (push to gallery, no
+    # generation), Reset, Generate (sets prompt + triggers normal Generate).
     _outpaint_popup_js = r"""
 () => {
 window.__openOutpaintPopup = function() {
     // ── constants ────────────────────────────────────────────────────────────
     const PROMPT = 'outpaint to only fill in what is missing in the white part of the photo so their full body is fully visible and also add tiny background space above their head and beneath their feet. everything else is unchanged.';
     const HANDLE_SIZE = 28;   // px — draggable edge strip width
-    const MIN_PAD = 0;
-    const MAX_PAD = 1200;     // max pixels of white space per side
+    const MIN_PAD = -4000;    // negative = crop inward
+    const MAX_PAD = 1200;     // positive = add white space outward
 
     // ── state ────────────────────────────────────────────────────────────────
     let srcB64 = null;        // original image base64
     let padTop = 0, padRight = 0, padBottom = 0, padLeft = 0;
-    let dragging = null;      // {edge, startX, startY, startPad}
+    let dragging = null;
+    // Index of the gallery image currently shown in the popup (cycles on swap)
+    let _galleryIdx = 0;
+    // Track whether the loaded image came from the popup's own upload
+    // (true) or was pulled from the gallery (false). Determines whether
+    // Update/Generate adds to the gallery or replaces.
+    let _fromPopupUpload = false;
 
     // ── overlay ──────────────────────────────────────────────────────────────
     let overlay = document.getElementById('ng-outpaint-overlay');
     if (overlay) {
-        // Reload the current first gallery image every time the popup opens
-        // so the user never sees a stale/cached image from a previous session.
-        // _loadSrc is stored on the overlay element by the first-open code path.
-        const fresh = window.__picgenImages && window.__picgenImages.length > 0
-            ? window.__picgenImages[0].b64 : null;
+        const imgs = window.__picgenImages || [];
+        // Restore last-viewed gallery index; clamp in case images were removed
+        _galleryIdx = Math.min(overlay._galleryIdx || 0, Math.max(0, imgs.length - 1));
+        const fresh = imgs.length > 0 ? imgs[_galleryIdx].b64 : null;
         if (fresh && overlay._loadSrc) {
+            _fromPopupUpload = false;
             overlay._loadSrc(fresh);
         } else if (!fresh && overlay._render) {
             overlay._render();
+        }
+        // Show/hide swap button depending on current image count
+        if (overlay._swapBtn) {
+            overlay._swapBtn.style.display = imgs.length > 1 ? '' : 'none';
+            overlay._swapBtn.textContent = '\u21c4 Swap (' + (imgs.length > 0 ? (_galleryIdx + 1) + '/' + imgs.length : '0') + ')';
         }
         overlay.style.display = 'flex';
         return;
@@ -9258,35 +9336,48 @@ window.__openOutpaintPopup = function() {
         'position:fixed;top:0;left:0;width:100%;height:100%;',
         'background:rgba(0,0,0,0.85);z-index:20000;',
         'display:flex;flex-direction:column;align-items:center;justify-content:center;',
-        'gap:14px;'
+        'gap:12px;'
     ].join('');
     document.body.appendChild(overlay);
 
     // Title + close
     const header = document.createElement('div');
-    header.style.cssText = 'display:flex;align-items:center;gap:16px;width:min(90vw,820px);';
-    header.innerHTML = '<span style="color:#fff;font-size:16px;font-weight:600;flex:1;">'
-        + 'Completed Body — drag edges outward to add white space, then click Generate</span>'
+    header.style.cssText = 'display:flex;align-items:center;gap:16px;width:min(92vw,860px);';
+    header.innerHTML = '<span style="color:#fff;font-size:15px;font-weight:600;flex:1;">'
+        + 'Multi-Tool \u2014 drag edges outward to add space, inward to crop</span>'
         + '<button id="ng-op-close" style="width:32px;height:32px;border-radius:50%;background:rgba(255,255,255,0.15);'
         + 'color:#fff;border:1px solid rgba(255,255,255,0.3);cursor:pointer;font-size:18px;'
         + 'display:flex;align-items:center;justify-content:center;">\u00d7</button>';
     overlay.appendChild(header);
 
-    // Upload zone (shown when no image)
-    const uploadZone = document.createElement('div');
-    uploadZone.id = 'ng-op-upload';
-    uploadZone.style.cssText = 'width:min(90vw,820px);height:340px;border:2px dashed rgba(255,255,255,0.35);'
-        + 'border-radius:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;'
-        + 'gap:10px;cursor:pointer;color:rgba(255,255,255,0.7);font-size:14px;';
-    uploadZone.innerHTML = '<svg width="56" height="56" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="2">'
-        + '<rect x="6" y="10" width="52" height="44" rx="5" stroke-dasharray="4 3"/>'
-        + '<polygon points="10,50 24,32 34,42 44,28 54,50" fill="rgba(255,255,255,0.1)"/>'
-        + '<circle cx="22" cy="24" r="5" fill="rgba(255,255,255,0.1)"/></svg>'
-        + '<span>Click or drag an image here</span>'
+    // Upload button row — always visible so user can import at any time
+    const uploadRow = document.createElement('div');
+    uploadRow.style.cssText = 'display:flex;align-items:center;gap:10px;width:min(92vw,860px);flex-wrap:wrap;';
+    uploadRow.innerHTML = '<button id="ng-op-upload-btn" style="padding:6px 16px;border-radius:6px;'
+        + 'background:rgba(255,255,255,0.12);color:#fff;border:1px solid rgba(255,255,255,0.35);'
+        + 'cursor:pointer;font-size:12px;font-weight:500;">&#128193; Import image</button>'
+        + '<button id="ng-op-swap" style="padding:6px 14px;border-radius:6px;display:none;'
+        + 'background:rgba(255,200,80,0.18);color:#ffd966;border:1px solid rgba(255,200,80,0.5);'
+        + 'cursor:pointer;font-size:12px;font-weight:600;">\u21c4 Swap (1/1)</button>'
+        + '<span id="ng-op-upload-hint" style="font-size:11px;color:rgba(255,255,255,0.45);">'
+        + 'Imports into the popup only \u2014 use Update Input or Generate to push to the gallery</span>'
         + '<input id="ng-op-file" type="file" accept="image/*" style="display:none;">';
+    overlay.appendChild(uploadRow);
+
+    // Upload drop zone — only shown when no image is loaded yet
+    const uploadZone = document.createElement('div');
+    uploadZone.id = 'ng-op-dropzone';
+    uploadZone.style.cssText = 'width:min(92vw,860px);height:280px;border:2px dashed rgba(255,255,255,0.3);'
+        + 'border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;'
+        + 'gap:8px;cursor:pointer;color:rgba(255,255,255,0.6);font-size:13px;';
+    uploadZone.innerHTML = '<svg width="48" height="48" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="2">'
+        + '<rect x="6" y="10" width="52" height="44" rx="5" stroke-dasharray="4 3"/>'
+        + '<polygon points="10,50 24,32 34,42 44,28 54,50" fill="rgba(255,255,255,0.08)"/>'
+        + '<circle cx="22" cy="24" r="5" fill="rgba(255,255,255,0.08)"/></svg>'
+        + '<span>Click here or drag an image to load it</span>';
     overlay.appendChild(uploadZone);
 
-    // Canvas wrapper (shown when image loaded)
+    // Canvas wrapper — shown once an image is loaded
     const canvasWrap = document.createElement('div');
     canvasWrap.id = 'ng-op-wrap';
     canvasWrap.style.cssText = 'position:relative;display:none;touch-action:none;user-select:none;';
@@ -9294,21 +9385,21 @@ window.__openOutpaintPopup = function() {
 
     const cvs = document.createElement('canvas');
     cvs.id = 'ng-op-canvas';
-    cvs.style.cssText = 'display:block;border:1px solid rgba(255,255,255,0.25);border-radius:4px;';
+    cvs.style.cssText = 'display:block;border:1px solid rgba(255,255,255,0.2);border-radius:4px;';
     canvasWrap.appendChild(cvs);
 
-    // Pad labels (live readout on each edge)
+    // Pad labels per edge
     const labels = {};
     ['top','right','bottom','left'].forEach(edge => {
         const lbl = document.createElement('div');
         lbl.id = 'ng-op-lbl-' + edge;
-        lbl.style.cssText = 'position:absolute;background:rgba(0,0,0,0.65);color:#fff;'
+        lbl.style.cssText = 'position:absolute;background:rgba(0,0,0,0.7);color:#fff;'
             + 'font-size:11px;padding:2px 6px;border-radius:3px;pointer-events:none;white-space:nowrap;';
         canvasWrap.appendChild(lbl);
         labels[edge] = lbl;
     });
 
-    // Handle strips (invisible overlay — 4 edges)
+    // Drag handles — 4 edges
     const handles = {};
     ['top','right','bottom','left'].forEach(edge => {
         const h = document.createElement('div');
@@ -9320,47 +9411,46 @@ window.__openOutpaintPopup = function() {
         handles[edge] = h;
     });
 
-    // Generate + Reset buttons
+    // Button row: Reset | Update Input | Generate
     const btnRow = document.createElement('div');
-    btnRow.style.cssText = 'display:flex;gap:12px;';
-    btnRow.innerHTML = '<button id="ng-op-reset" style="padding:8px 22px;border-radius:6px;'
-        + 'background:rgba(255,255,255,0.12);color:#fff;border:1px solid rgba(255,255,255,0.3);'
-        + 'cursor:pointer;font-size:13px;">Reset padding</button>'
-        + '<button id="ng-op-generate" style="padding:8px 28px;border-radius:6px;'
+    btnRow.style.cssText = 'display:flex;gap:10px;flex-wrap:wrap;justify-content:center;';
+    btnRow.innerHTML = ''
+        + '<button id="ng-op-reset" style="padding:7px 18px;border-radius:6px;'
+        + 'background:rgba(255,255,255,0.1);color:#fff;border:1px solid rgba(255,255,255,0.3);'
+        + 'cursor:pointer;font-size:13px;">Reset</button>'
+        + '<button id="ng-op-update" style="padding:7px 20px;border-radius:6px;'
+        + 'background:rgba(80,160,255,0.25);color:#fff;border:1px solid rgba(80,160,255,0.6);'
+        + 'cursor:pointer;font-size:13px;font-weight:600;">Update Input</button>'
+        + '<button id="ng-op-generate" style="padding:7px 24px;border-radius:6px;'
         + 'background:#7c5cbf;color:#fff;border:none;cursor:pointer;font-size:14px;font-weight:600;">'
         + 'Generate (4 images)</button>';
     overlay.appendChild(btnRow);
 
-    // ── helpers ──────────────────────────────────────────────────────────────
+    // ── helpers ───────────────────────────────────────────────────────────────
     function _clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
-    function _positionHandles(dw, dh, scale) {
-        // dw/dh = displayed canvas pixel dimensions; scale = css px per canvas px
-        const hs = Math.round(HANDLE_SIZE * window.devicePixelRatio || HANDLE_SIZE);
-        const strip = HANDLE_SIZE; // css px
-
-        // top
+    function _positionHandles(dw, dh) {
+        const strip = HANDLE_SIZE;
         handles.top.style.cssText    += `;left:0;top:0;width:${dw}px;height:${strip}px;`;
-        labels.top.style.cssText     += `;left:50%;top:${strip+2}px;transform:translateX(-50%);`;
-
-        // bottom
         handles.bottom.style.cssText += `;left:0;bottom:0;width:${dw}px;height:${strip}px;`;
-        labels.bottom.style.cssText  += `;left:50%;bottom:${strip+2}px;transform:translateX(-50%);`;
-
-        // left
         handles.left.style.cssText   += `;top:0;left:0;width:${strip}px;height:${dh}px;`;
-        labels.left.style.cssText    += `;top:50%;left:${strip+2}px;transform:translateY(-50%);`;
-
-        // right
         handles.right.style.cssText  += `;top:0;right:0;width:${strip}px;height:${dh}px;`;
+        labels.top.style.cssText     += `;left:50%;top:${strip+2}px;transform:translateX(-50%);`;
+        labels.bottom.style.cssText  += `;left:50%;bottom:${strip+2}px;transform:translateX(-50%);`;
+        labels.left.style.cssText    += `;top:50%;left:${strip+2}px;transform:translateY(-50%);`;
         labels.right.style.cssText   += `;top:50%;right:${strip+2}px;transform:translateY(-50%);`;
     }
 
+    function _labelText(px) {
+        if (px === 0) return '';
+        return (px > 0 ? '+' : '') + px + 'px';
+    }
+
     function _updateLabels() {
-        labels.top.textContent    = padTop    > 0 ? '+' + padTop    + 'px' : '';
-        labels.right.textContent  = padRight  > 0 ? '+' + padRight  + 'px' : '';
-        labels.bottom.textContent = padBottom > 0 ? '+' + padBottom + 'px' : '';
-        labels.left.textContent   = padLeft   > 0 ? '+' + padLeft   + 'px' : '';
+        labels.top.textContent    = _labelText(padTop);
+        labels.right.textContent  = _labelText(padRight);
+        labels.bottom.textContent = _labelText(padBottom);
+        labels.left.textContent   = _labelText(padLeft);
     }
 
     function _render() {
@@ -9369,39 +9459,65 @@ window.__openOutpaintPopup = function() {
         img.onload = () => {
             const origW = img.naturalWidth;
             const origH = img.naturalHeight;
-            const totalW = origW + padLeft + padRight;
-            const totalH = origH + padTop  + padBottom;
 
-            // Scale to fit within 80vw / 70vh
-            const maxCssW = Math.floor(window.innerWidth  * 0.80);
-            const maxCssH = Math.floor(window.innerHeight * 0.70);
+            // Effective canvas includes padding (positive) and excludes crop (negative)
+            const totalW = Math.max(1, origW + padLeft + padRight);
+            const totalH = Math.max(1, origH + padTop  + padBottom);
+
+            const maxCssW = Math.floor(window.innerWidth  * 0.82);
+            const maxCssH = Math.floor(window.innerHeight * 0.62);
             const scale   = Math.min(maxCssW / totalW, maxCssH / totalH, 1);
             const cssW    = Math.round(totalW * scale);
             const cssH    = Math.round(totalH * scale);
 
-            // Draw at full resolution on a hidden canvas, display at cssW/cssH
             cvs.width  = totalW;
             cvs.height = totalH;
             cvs.style.width  = cssW + 'px';
             cvs.style.height = cssH + 'px';
 
             const ctx = cvs.getContext('2d');
+            // White background for padded areas
             ctx.fillStyle = '#ffffff';
             ctx.fillRect(0, 0, totalW, totalH);
+            // Draw image offset by left/top padding (negative = image shifted left/up = crop)
             ctx.drawImage(img, padLeft, padTop, origW, origH);
 
-            // Draw subtle padding guides
-            if (padTop    > 0) { ctx.strokeStyle='rgba(100,150,255,0.4)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(0,padTop);    ctx.lineTo(totalW,padTop);    ctx.stroke(); }
-            if (padBottom > 0) { ctx.strokeStyle='rgba(100,150,255,0.4)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(0,origH+padTop); ctx.lineTo(totalW,origH+padTop); ctx.stroke(); }
-            if (padLeft   > 0) { ctx.strokeStyle='rgba(100,150,255,0.4)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(padLeft,0);   ctx.lineTo(padLeft,totalH);   ctx.stroke(); }
-            if (padRight  > 0) { ctx.strokeStyle='rgba(100,150,255,0.4)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(origW+padLeft,0); ctx.lineTo(origW+padLeft,totalH); ctx.stroke(); }
+            // Guide lines for padding (blue) and crop borders (red)
+            // Top
+            if (padTop !== 0) {
+                ctx.strokeStyle = padTop > 0 ? 'rgba(100,150,255,0.5)' : 'rgba(255,80,80,0.7)';
+                ctx.lineWidth = 2; ctx.setLineDash(padTop < 0 ? [6,3] : []);
+                ctx.beginPath(); ctx.moveTo(0, padTop); ctx.lineTo(totalW, padTop); ctx.stroke();
+                ctx.setLineDash([]);
+            }
+            // Bottom
+            if (padBottom !== 0) {
+                ctx.strokeStyle = padBottom > 0 ? 'rgba(100,150,255,0.5)' : 'rgba(255,80,80,0.7)';
+                ctx.lineWidth = 2; ctx.setLineDash(padBottom < 0 ? [6,3] : []);
+                ctx.beginPath(); ctx.moveTo(0, origH+padTop); ctx.lineTo(totalW, origH+padTop); ctx.stroke();
+                ctx.setLineDash([]);
+            }
+            // Left
+            if (padLeft !== 0) {
+                ctx.strokeStyle = padLeft > 0 ? 'rgba(100,150,255,0.5)' : 'rgba(255,80,80,0.7)';
+                ctx.lineWidth = 2; ctx.setLineDash(padLeft < 0 ? [6,3] : []);
+                ctx.beginPath(); ctx.moveTo(padLeft, 0); ctx.lineTo(padLeft, totalH); ctx.stroke();
+                ctx.setLineDash([]);
+            }
+            // Right
+            if (padRight !== 0) {
+                ctx.strokeStyle = padRight > 0 ? 'rgba(100,150,255,0.5)' : 'rgba(255,80,80,0.7)';
+                ctx.lineWidth = 2; ctx.setLineDash(padRight < 0 ? [6,3] : []);
+                ctx.beginPath(); ctx.moveTo(origW+padLeft, 0); ctx.lineTo(origW+padLeft, totalH); ctx.stroke();
+                ctx.setLineDash([]);
+            }
 
             canvasWrap.style.width  = cssW + 'px';
             canvasWrap.style.height = cssH + 'px';
             uploadZone.style.display  = 'none';
             canvasWrap.style.display  = 'block';
 
-            _positionHandles(cssW, cssH, scale);
+            _positionHandles(cssW, cssH);
             _updateLabels();
         };
         img.src = srcB64;
@@ -9410,12 +9526,34 @@ window.__openOutpaintPopup = function() {
     function _loadSrc(b64) {
         srcB64 = b64;
         padTop = padRight = padBottom = padLeft = 0;
+        // Persist the current gallery index on the overlay element so the
+        // re-open branch can restore it next time the popup is opened.
+        if (overlay) overlay._galleryIdx = _galleryIdx;
         _render();
     }
-    // Store on the overlay element so the re-open branch (above) can call
-    // these without them being undefined in a new function invocation scope.
     overlay._loadSrc = _loadSrc;
     overlay._render  = _render;
+
+    // ── swap button wiring ────────────────────────────────────────────────────
+    const swapBtn = document.getElementById('ng-op-swap');
+    overlay._swapBtn = swapBtn;
+    // Show button only when more than one gallery image exists
+    const _imgs0 = window.__picgenImages || [];
+    if (_imgs0.length > 1) {
+        swapBtn.style.display = '';
+        swapBtn.textContent = '\u21c4 Swap (1/' + _imgs0.length + ')';
+    }
+    swapBtn.addEventListener('click', () => {
+        const imgs = window.__picgenImages || [];
+        if (imgs.length < 2) return;
+        _galleryIdx = (_galleryIdx + 1) % imgs.length;
+        overlay._galleryIdx = _galleryIdx;
+        _fromPopupUpload = false;
+        _loadSrc(imgs[_galleryIdx].b64);
+        swapBtn.textContent = '\u21c4 Swap (' + (_galleryIdx + 1) + '/' + imgs.length + ')';
+    });
+
+    // ── drag logic ────────────────────────────────────────────────────────────
     function _onPointerDown(e) {
         const edge = e.currentTarget.dataset.edge;
         if (!edge || !srcB64) return;
@@ -9430,17 +9568,15 @@ window.__openOutpaintPopup = function() {
         if (!dragging) return;
         const dx = e.clientX - dragging.startX;
         const dy = e.clientY - dragging.startY;
-        // Compute scale factor from current canvas display size vs actual size
         const img = new Image();
         img.src = srcB64;
-        const origW = cvs.width  - padLeft - padRight;
-        const origH = cvs.height - padTop  - padBottom;
+        const origW = cvs.width  - dragging.startPad.left - dragging.startPad.right;
+        const origH = cvs.height - dragging.startPad.top  - dragging.startPad.bottom;
         const totalW = origW + dragging.startPad.left + dragging.startPad.right;
         const totalH = origH + dragging.startPad.top  + dragging.startPad.bottom;
-        const maxCssW = Math.floor(window.innerWidth  * 0.80);
-        const maxCssH = Math.floor(window.innerHeight * 0.70);
+        const maxCssW = Math.floor(window.innerWidth  * 0.82);
+        const maxCssH = Math.floor(window.innerHeight * 0.62);
         const scale   = Math.min(maxCssW / totalW, maxCssH / totalH, 1);
-
         switch (dragging.edge) {
             case 'top':    padTop    = _clamp(dragging.startPad.top    - Math.round(dy / scale), MIN_PAD, MAX_PAD); break;
             case 'bottom': padBottom = _clamp(dragging.startPad.bottom + Math.round(dy / scale), MIN_PAD, MAX_PAD); break;
@@ -9455,71 +9591,59 @@ window.__openOutpaintPopup = function() {
         dragging = null;
         window.removeEventListener('pointermove', _onPointerMove);
         window.removeEventListener('pointerup',   _onPointerUp);
-        // Clear the drag guard after a short delay (longer than any
-        // synthetic click the browser might fire after pointerup).
         setTimeout(() => { _recentlyDragged = false; }, 400);
     }
 
     Object.values(handles).forEach(h => h.addEventListener('pointerdown', _onPointerDown));
 
-    // ── file upload ───────────────────────────────────────────────────────────
+    // ── file import ───────────────────────────────────────────────────────────
     function _handleFile(file) {
         if (!file || !file.type.startsWith('image/')) return;
         const reader = new FileReader();
-        reader.onload = (ev) => { _loadSrc(ev.target.result); };
+        reader.onload = (ev) => {
+            _fromPopupUpload = true;
+            _loadSrc(ev.target.result);
+        };
         reader.readAsDataURL(file);
     }
 
     const opFile = document.getElementById('ng-op-file');
+    document.getElementById('ng-op-upload-btn').addEventListener('click', () => opFile.click());
+    opFile.addEventListener('change', (e) => { _handleFile(e.target.files[0]); e.target.value = ''; });
     uploadZone.addEventListener('click', () => opFile.click());
-    opFile.addEventListener('change', (e) => { _handleFile(e.target.files[0]); e.target.value=''; });
     uploadZone.addEventListener('dragover',  (e) => { e.preventDefault(); uploadZone.style.borderColor='#7c5cbf'; });
-    uploadZone.addEventListener('dragleave', (e) => { uploadZone.style.borderColor='rgba(255,255,255,0.35)'; });
-    uploadZone.addEventListener('drop',      (e) => { e.preventDefault(); uploadZone.style.borderColor='rgba(255,255,255,0.35)'; _handleFile(e.dataTransfer.files[0]); });
-
-    // ── close ─────────────────────────────────────────────────────────────────
-    // Only the X button closes the popup. Clicking the overlay background and
-    // Escape are intentionally disabled — the overlay background click was
-    // firing spuriously after a drag ended (pointerup → click bubbles up to
-    // the overlay), causing the popup to dismiss itself mid-use.
-    let _recentlyDragged = false;
-    function _close() { overlay.style.display = 'none'; _recentlyDragged = false; }
-    document.getElementById('ng-op-close').addEventListener('click', _close);
-    // Eat any click on the overlay that arrives within 300 ms of a drag ending
-    // (belt-and-suspenders guard in case a browser synthesises a click after
-    // pointerup even without a background-click listener).
-    overlay.addEventListener('click', (e) => {
-        if (_recentlyDragged) { e.stopImmediatePropagation(); _recentlyDragged = false; }
+    uploadZone.addEventListener('dragleave', () => { uploadZone.style.borderColor='rgba(255,255,255,0.3)'; });
+    uploadZone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        uploadZone.style.borderColor='rgba(255,255,255,0.3)';
+        _handleFile(e.dataTransfer.files[0]);
     });
 
-    // ── reset ─────────────────────────────────────────────────────────────────
-    document.getElementById('ng-op-reset').addEventListener('click', () => {
-        padTop = padRight = padBottom = padLeft = 0;
-        _render();
-    });
+    // ── export canvas to b64 ─────────────────────────────────────────────────
+    function _exportCanvas() {
+        return cvs.toDataURL('image/jpeg', 0.95);
+    }
 
-    // ── generate ──────────────────────────────────────────────────────────────
-    document.getElementById('ng-op-generate').addEventListener('click', () => {
-        if (!srcB64) { alert('Please upload an image first.'); return; }
-        // Export the padded canvas as JPEG base64
-        const exportB64 = cvs.toDataURL('image/jpeg', 0.95);
-
-        // 1. Replace gallery input with ONLY the padded canvas image.
-        // Suppress syncToGradio feedback so the hidden_images_b64.change
-        // handler cannot fire and add a second copy on top.
+    // ── push to gallery (shared by Update Input and Generate) ─────────────────
+    // If the image came from the popup's own upload, ADD it to the existing
+    // gallery without removing other images. If it came from the gallery, REPLACE.
+    function _pushToGallery(exportB64, name) {
         window.__picgenSuppressSync = true;
         try {
-            if (window.__picgenImages) window.__picgenImages.length = 0;
-            if (window.__replaceImages) {
-                window.__replaceImages(exportB64, 'outpaint_input.jpg');
-            } else if (window.__addImage) {
-                window.__addImage(exportB64, 'outpaint_input.jpg');
+            if (_fromPopupUpload) {
+                // Add alongside existing images
+                if (window.__addImage) window.__addImage(exportB64, name);
+            } else {
+                // Replace: this was a gallery image being edited
+                if (window.__picgenImages) window.__picgenImages.length = 0;
+                if (window.__replaceImages) {
+                    window.__replaceImages(exportB64, name);
+                } else if (window.__addImage) {
+                    window.__addImage(exportB64, name);
+                }
             }
         } finally {
             window.__picgenSuppressSync = false;
-            // One explicit write to the hidden textbox using only 'input' (not
-            // 'change') so Gradio reads the correct value at generate-time but
-            // the .change JS handler (which listens for 'change') never fires.
             const _imgs = window.__picgenImages || [];
             const _container = document.getElementById('hidden-images-b64');
             if (_container) {
@@ -9533,30 +9657,50 @@ window.__openOutpaintPopup = function() {
                 });
             }
         }
+    }
 
-        // 2. Write the exact prompt text into the visible Prompt textarea so
-        // the normal Generate flow reads it from there — no custom pipeline.
-        // Find the Prompt textarea inside col-container: it is the one whose
-        // nearest label text is "Prompt" (not "Negative Prompt").
+    // ── close ─────────────────────────────────────────────────────────────────
+    let _recentlyDragged = false;
+    function _close() { overlay.style.display = 'none'; _recentlyDragged = false; }
+    document.getElementById('ng-op-close').addEventListener('click', _close);
+    overlay.addEventListener('click', (e) => {
+        if (_recentlyDragged) { e.stopImmediatePropagation(); _recentlyDragged = false; }
+    });
+
+    // ── reset ─────────────────────────────────────────────────────────────────
+    document.getElementById('ng-op-reset').addEventListener('click', () => {
+        padTop = padRight = padBottom = padLeft = 0;
+        _render();
+    });
+
+    // ── update input (no generation) ─────────────────────────────────────────
+    document.getElementById('ng-op-update').addEventListener('click', () => {
+        if (!srcB64) { alert('Load an image first.'); return; }
+        _pushToGallery(_exportCanvas(), 'edited_input.jpg');
+        _close();
+    });
+
+    // ── generate ─────────────────────────────────────────────────────────────
+    document.getElementById('ng-op-generate').addEventListener('click', () => {
+        if (!srcB64) { alert('Load an image first.'); return; }
+        _pushToGallery(_exportCanvas(), 'outpaint_input.jpg');
+
+        // Write prompt into the visible Prompt textarea
         const picgenCol = document.getElementById('col-container');
         let promptTA = null;
         if (picgenCol) {
-            const allTA = Array.from(picgenCol.querySelectorAll('textarea'));
-            // Walk each textarea and check its label
-            for (const ta of allTA) {
-                const block = ta.closest('.block') || ta.closest('label') || ta.parentElement;
-                const labelEl = block ? block.querySelector('label span, .label-wrap span') : null;
-                const labelText = labelEl ? labelEl.textContent.trim().toLowerCase() : '';
-                // "Prompt" but not "Negative Prompt"
-                if (labelText === 'prompt') { promptTA = ta; break; }
+            for (const ta of Array.from(picgenCol.querySelectorAll('textarea'))) {
+                const block = ta.closest('.block') || ta.parentElement;
+                const lbl = block ? block.querySelector('label span, .label-wrap span') : null;
+                if (lbl && lbl.textContent.trim().toLowerCase() === 'prompt') { promptTA = ta; break; }
             }
-            // Fallback: first textarea in col-container that isn't the negative prompt
-            if (!promptTA && allTA.length > 0) {
-                promptTA = allTA.find(ta => {
-                    const block = ta.closest('.block') || ta.parentElement;
-                    const lbl = block ? (block.querySelector('label span, .label-wrap span') || {}).textContent || '' : '';
-                    return !lbl.toLowerCase().includes('negative');
-                }) || allTA[0];
+            if (!promptTA) {
+                const all = Array.from(picgenCol.querySelectorAll('textarea'));
+                promptTA = all.find(ta => {
+                    const b = ta.closest('.block') || ta.parentElement;
+                    const l = b ? (b.querySelector('label span, .label-wrap span') || {}).textContent || '' : '';
+                    return !l.toLowerCase().includes('negative');
+                }) || all[0];
             }
         }
         if (promptTA) {
@@ -9568,13 +9712,12 @@ window.__openOutpaintPopup = function() {
             }
         }
 
-        // 3. Set the Number of images slider to 4.
+        // Set Number of images slider to 4
         if (picgenCol) {
-            const sliders = picgenCol.querySelectorAll('input[type="range"]');
-            sliders.forEach(sl => {
-                const block = sl.closest('.block');
-                const lbl = block ? block.querySelector('label span') : null;
-                if (lbl && lbl.textContent.includes('Number of images')) {
+            picgenCol.querySelectorAll('input[type="range"]').forEach(sl => {
+                const b = sl.closest('.block');
+                const l = b ? b.querySelector('label span') : null;
+                if (l && l.textContent.includes('Number of images')) {
                     const ns = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
                     if (ns && ns.set) {
                         ns.set.call(sl, '4');
@@ -9585,11 +9728,7 @@ window.__openOutpaintPopup = function() {
             });
         }
 
-        // 4. Close the popup.
         _close();
-
-        // 5. Click the Generate button. A small delay lets the Gradio component
-        // state settle from the events fired above before generation starts.
         setTimeout(() => {
             const genBtn = Array.from(document.querySelectorAll('button')).find(b =>
                 b.textContent.trim() === 'Generate' &&
@@ -9600,11 +9739,12 @@ window.__openOutpaintPopup = function() {
         }, 150);
     });
 
-    // ── populate from gallery if image already there ──────────────────────────
-    // Always read from the persistent store so we get the current image,
-    // not a stale reference from a previous call.
+    // ── populate from gallery on first open ───────────────────────────────────
     const existing = window.__picgenImages;
     if (existing && existing.length > 0) {
+        _galleryIdx = 0;
+        overlay._galleryIdx = 0;
+        _fromPopupUpload = false;
         _loadSrc(existing[0].b64);
     }
 };
