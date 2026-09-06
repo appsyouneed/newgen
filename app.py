@@ -1803,6 +1803,23 @@ def add_audio_to_video(
     if not _AUDIO_ENGINE_AVAILABLE:
         return video_buf
 
+    # Release Wan VRAM before loading Foley/F5-TTS models.
+    # After video generation the Wan transformer + VAE are still resident in
+    # VRAM. On a single GPU that leaves almost no room for Foley's SigLIP /
+    # HunyuanVideo-Foley weights, causing an OOM inside the subprocess.
+    # PyTorch's allocator only returns pages to CUDA on an explicit cache
+    # flush, so we do that here before spawning either audio engine.
+    # gc.collect() first ensures any Python-side tensor references are dropped
+    # so empty_cache() can actually release the backing memory.
+    try:
+        import gc as _gc
+        _gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
     tmp_dir = Path("/dev/shm/newgen")
     tmp_dir.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex[:8]
@@ -2709,7 +2726,7 @@ def generate_lip_sync_video(
     
     # Step 1: generate base video (with audio=False so we control audio ourselves)
     print(f"[LipSync] Step 1/4: Generating base video...")
-    base_result = generate_video(
+    base_result = _generate_video_blocking(
         ref_image,
         # Append speaking cue to prompt so Wan poses the mouth open
         (prompt or "") + ", subject speaking, mouth moving, talking, lips moving",
@@ -3306,7 +3323,10 @@ def apply_lora_settings(selected_loras_info, user_steps, user_flow_shift, flow_s
 
     final_steps = user_steps
     recommended_steps = merged_settings.get('recommended_steps')
-    if recommended_steps is not None:
+    if recommended_steps is not None and user_steps == 4:
+        # Only apply the LoRA recommendation when the slider is still at the
+        # default value of 4 (meaning the user hasn't deliberately changed it).
+        # If the user moved the slider to any other value, respect that choice.
         final_steps = recommended_steps
         messages.append(f"Steps set to {recommended_steps} (LoRA recommendation)")
 
@@ -5079,6 +5099,24 @@ def generate_video(
             print(f"Segment {seg_index} complete ({actual_seg_duration:.2f}s, "
                   f"{len(seg_frames)} frames @ {seg_fps} fps)")
 
+            # --- STREAMING: yield a growing preview after every segment ------
+            # Concatenate all segments so far into a tmp file and yield it so
+            # Gradio updates the video component immediately.  Only do this when
+            # there are more segments still to generate (is_last_segment will get
+            # the final yield below after audio is added).
+            if not is_last_segment and total_segments > 1:
+                try:
+                    preview_buf = concatenate_videos(segment_bufs)
+                    preview_name = _media_name("vidgen_preview", ".mp4")
+                    preview_path = _write_video_tmp(preview_buf, preview_name)
+                    yield preview_path, preview_path, gr.update(visible=False, value="")
+                    # Clean up the preview tmp file — the browser has already
+                    # received it and the final video will replace it.
+                    _delete_video_tmp(preview_path)
+                except Exception as _prev_e:
+                    print(f"[Streaming] preview yield failed (non-fatal): {_prev_e}")
+            # ------------------------------------------------------------------
+
             remaining -= actual_seg_duration
             if remaining <= 0.01:
                 break
@@ -5113,7 +5151,7 @@ def generate_video(
             progress(1.0, desc="Generation complete")
         _generation_release(_current_input_image_path)
         _generation_release(_end_image_protect_path)
-        return filepath, filepath, gr.update(visible=False, value="")
+        yield filepath, filepath, gr.update(visible=False, value="")
 
     except gr.Error:
         _generation_release(_current_input_image_path)
@@ -5125,6 +5163,20 @@ def generate_video(
         print(f"Generation error: {e}")
         raise gr.Error(f"Generation failed: {e}")
 
+
+def _generate_video_blocking(*args, **kwargs):
+    """Blocking wrapper around generate_video for internal callers that expect
+    a plain (filepath, filepath, status) tuple rather than a generator.
+
+    Consumes every yielded value and returns the last one, which is always the
+    final full video (with audio, all segments concatenated).  Intermediate
+    preview yields are discarded — internal callers (autorun, push-autorun,
+    lipsync) don't have a Gradio component to stream into anyway.
+    """
+    result = None
+    for result in generate_video(*args, **kwargs):
+        pass
+    return result
 
 
 def generate_sequence(
@@ -5601,7 +5653,7 @@ def autorun_generate(
             )
 
         try:
-            video_path, _, _ = generate_video(
+            video_path, _, _ = _generate_video_blocking(
                 reference_image,
                 prompt,
                 MODE_KEEP,        # Autorun always uses Keep (no Qwen edit)
@@ -7014,7 +7066,7 @@ def autorun_push_generate(
         _current_input_image_path = None  # in-memory image, no path to protect
 
         try:
-            video_path, _, _ = generate_video(
+            video_path, _, _ = _generate_video_blocking(
                 img,
                 prompt,
                 MODE_KEEP,
@@ -8257,14 +8309,13 @@ with gr.Blocks(css=css) as demo:
                     )
                     yield result[0], result[1], ""
                 else:
-                    result = generate_video(
+                    yield from generate_video(
                         ref_image, prompt, scene_mode_val,
                         end_img, dur, res, fmul, qual, sd, rsd,
                         audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
                         neg_pt, esteps, eguid, fsa, fs,
                         *lora_args_inner,
                     )
-                    yield result[0], result[1], ""
 
             generate_btn.click(
                 fn=_dispatch_generate,
@@ -8904,11 +8955,11 @@ with gr.Blocks(css=css) as demo:
                             // Skip if gallery already contains exactly these images
                             const cur = (window.__picgenImages || []).map(i => i.b64);
                             if (incoming.length === cur.length && incoming.every((b,i) => b === cur[i])) return;
-                            // Suppress the syncToGradio feedback during this update
+                            // Add the incoming images alongside any that are already there.
+                            // Do NOT clear first — this handler is triggered by "Use as input"
+                            // which should append, not replace.
                             window.__picgenSuppressSync = true;
                             try {
-                                if (window.__picgenImages) window.__picgenImages.length = 0;
-                                if (window.__clearAll) window.__clearAll();
                                 incoming.forEach((b64, idx) => {
                                     window.__addImage(b64, `output_${idx + 1}.png`);
                                 });
@@ -9028,26 +9079,36 @@ with gr.Blocks(css=css) as demo:
     function buildStarterGrid() {
         const grid = document.getElementById('starter-grid');
         if (!grid) { setTimeout(buildStarterGrid, 300); return; }
-        if (grid.children.length > 0) return;  // already built
+        // Clear and rebuild every time so tab re-renders don't leave a stale grid
+        grid.innerHTML = '';
 
         for (let n = 1; n <= 10; n++) {
             const card = document.createElement('div');
             card.className = 'starter-card';
             card.dataset.num = n;
 
-            // Thumbnail: try loading from /starters/<n>
+            // Thumbnail — use the raw original fetch to bypass the /media/ interceptor
             const img = document.createElement('img');
             img.className = 'starter-thumb';
             img.alt = String(n);
             img.loading = 'eager';
-            img.src = '/starters/' + n;
-            img.onerror = function() {
-                // No image found — show a numbered placeholder
-                const ph = document.createElement('div');
-                ph.className = 'starter-thumb-placeholder';
-                ph.textContent = n;
-                card.replaceChild(ph, img);
-            };
+
+            const _rawFetch = window.__ngOrigFetch || window.fetch;
+            _rawFetch('/starters/' + n)
+                .then(r => {
+                    if (!r.ok) throw new Error('not found');
+                    return r.blob();
+                })
+                .then(blob => {
+                    img.src = URL.createObjectURL(blob);
+                })
+                .catch(() => {
+                    const ph = document.createElement('div');
+                    ph.className = 'starter-thumb-placeholder';
+                    ph.textContent = n;
+                    if (img.parentNode) card.replaceChild(ph, img);
+                    else card.insertBefore(ph, card.firstChild);
+                });
 
             const label = document.createElement('div');
             label.className = 'starter-label';
@@ -9058,7 +9119,8 @@ with gr.Blocks(css=css) as demo:
 
             card.addEventListener('click', function() {
                 const num = this.dataset.num;
-                fetch('/starters/' + num)
+                const _fetch = window.__ngOrigFetch || window.fetch;
+                _fetch('/starters/' + num)
                     .then(r => {
                         if (!r.ok) throw new Error('not found');
                         const ct = r.headers.get('Content-Type') || 'image/jpeg';
@@ -9080,7 +9142,15 @@ with gr.Blocks(css=css) as demo:
             grid.appendChild(card);
         }
     }
+
+    // Build immediately and also re-build when the starter-grid appears after
+    // a tab switch (Gradio renders tabs lazily so the element may not exist yet)
     buildStarterGrid();
+    const _sgObs = new MutationObserver(() => {
+        const g = document.getElementById('starter-grid');
+        if (g && g.children.length === 0) buildStarterGrid();
+    });
+    _sgObs.observe(document.body, { childList: true, subtree: true });
 }
 """
     demo.load(fn=None, js=_starter_grid_js)
@@ -9625,21 +9695,31 @@ window.__openOutpaintPopup = function() {
     }
 
     // ── push to gallery (shared by Update Input and Generate) ─────────────────
-    // If the image came from the popup's own upload, ADD it to the existing
-    // gallery without removing other images. If it came from the gallery, REPLACE.
+    // If the image came from the popup's own upload, ADD it alongside existing images.
+    // If it came from the gallery, REPLACE only that specific slot (_galleryIdx)
+    // so all other images are preserved.
     function _pushToGallery(exportB64, name) {
         window.__picgenSuppressSync = true;
         try {
             if (_fromPopupUpload) {
-                // Add alongside existing images
+                // Fresh import — add without disturbing existing images
                 if (window.__addImage) window.__addImage(exportB64, name);
             } else {
-                // Replace: this was a gallery image being edited
-                if (window.__picgenImages) window.__picgenImages.length = 0;
-                if (window.__replaceImages) {
-                    window.__replaceImages(exportB64, name);
-                } else if (window.__addImage) {
-                    window.__addImage(exportB64, name);
+                // Editing an existing gallery slot — swap only that index
+                const imgs = window.__picgenImages;
+                if (imgs && imgs.length > 0) {
+                    const idx = Math.min(_galleryIdx, imgs.length - 1);
+                    // Take a snapshot, replace the target slot, then rebuild gallery
+                    const snapshot = imgs.map((img, i) =>
+                        i === idx ? { id: Date.now() + Math.random(), b64: exportB64, name: name } : img
+                    );
+                    // Rebuild: clear then re-add in order (triggers proper render + sync)
+                    imgs.length = 0;
+                    if (window.__clearAll) window.__clearAll();
+                    snapshot.forEach(img => { if (window.__addImage) window.__addImage(img.b64, img.name); });
+                } else {
+                    // Gallery is empty — just add
+                    if (window.__addImage) window.__addImage(exportB64, name);
                 }
             }
         } finally {
