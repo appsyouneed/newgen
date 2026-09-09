@@ -1003,6 +1003,83 @@ _gpu_count = torch.cuda.device_count()
 if _gpu_count < 1:
     raise RuntimeError("No CUDA device visible  this app requires a GPU.")
 
+# ---------------------------------------------------------------------------
+# GPU PROFILE — detected once at startup, used throughout for adaptive
+# behaviour (VRAM budgets, wheel index selection, offload strategy, etc.)
+#
+# _GPU_VRAM_GB    : total VRAM of the primary WAN device in GiB (float)
+# _GPU_CC         : (major, minor) compute capability tuple, e.g. (12, 0)
+# _GPU_NAME       : human-readable device name string
+# _GPU_HIGH_VRAM  : True when VRAM >= 40 GB  (Blackwell 6000 Pro = 95 GB)
+#                   False for consumer cards  (RTX 5090 = 32 GB)
+# _GPU_SM_STR     : semicolon-separated arch list for TORCH_CUDA_ARCH_LIST
+#                   — includes the actual device arch, capped to what mmcv
+#                   supports at build time (sm_120 / Blackwell is NOT in
+#                   older mmcv sources so we keep it out of that var).
+# ---------------------------------------------------------------------------
+def _detect_gpu_profile(device_idx: int = 0) -> dict:
+    """Return a dict with VRAM, compute capability, name, and derived flags."""
+    try:
+        props = torch.cuda.get_device_properties(device_idx)
+        vram_gb = props.total_memory / (1024 ** 3)
+        cc = (props.major, props.minor)
+        name = props.name
+    except Exception:
+        vram_gb = 0.0
+        cc = (0, 0)
+        name = "unknown"
+
+    high_vram = vram_gb >= 40.0
+
+    # Build a TORCH_CUDA_ARCH_LIST that covers common arches up to and
+    # including this device, but never exceeds what mmcv's cpp_extension.py
+    # knows about (it doesn't recognise sm_120 / Blackwell yet).
+    # RTX 5090  → sm_89  (Ada Lovelace / compute 8.9)
+    # Blackwell → sm_120 (compute 12.0) — excluded from mmcv arch list,
+    #             but included separately where PyTorch itself needs it.
+    _base_arches = ["8.0", "8.6", "8.9", "9.0"]
+    # Cap to arches <= this device's compute capability for the mmcv build,
+    # but never include 12.x (not in mmcv's table).
+    cc_float = cc[0] + cc[1] / 10.0
+    mmcv_arches = [a for a in _base_arches if float(a) <= min(cc_float, 9.0)]
+    if not mmcv_arches:
+        mmcv_arches = ["8.0"]
+    sm_str = ";".join(mmcv_arches)
+
+    # PyTorch wheel index: cu128 for Blackwell (sm_120), cu130 for sm_89
+    # (Ada / RTX 5090) and anything else modern.
+    if cc[0] >= 12:
+        torch_index = "https://download.pytorch.org/whl/cu128"
+    else:
+        torch_index = "https://download.pytorch.org/whl/cu130"
+
+    profile = {
+        "vram_gb": vram_gb,
+        "cc": cc,
+        "name": name,
+        "high_vram": high_vram,
+        "sm_str": sm_str,
+        "torch_index": torch_index,
+    }
+    print(
+        f"[GPUProfile] {name} | VRAM {vram_gb:.1f} GB | "
+        f"sm_{cc[0]}{cc[1]} | high_vram={high_vram} | "
+        f"torch_index={torch_index} | mmcv_arches={sm_str}"
+    )
+    return profile
+
+# Detect using the WAN device (cuda:1 in dual-GPU, cuda:0 otherwise).
+# We haven't set DUAL_GPU yet so we peek at device count directly.
+_wan_device_idx = 1 if (_gpu_count >= 2 and os.environ.get("NEWGEN_FORCE_SINGLE_GPU") != "1") else 0
+GPU_PROFILE = _detect_gpu_profile(_wan_device_idx)
+
+GPU_VRAM_GB   = GPU_PROFILE["vram_gb"]
+GPU_CC        = GPU_PROFILE["cc"]
+GPU_NAME      = GPU_PROFILE["name"]
+GPU_HIGH_VRAM = GPU_PROFILE["high_vram"]   # True = 95 GB Blackwell, False = 32 GB 5090
+GPU_SM_STR    = GPU_PROFILE["sm_str"]      # for TORCH_CUDA_ARCH_LIST in mmcv build
+GPU_TORCH_IDX = GPU_PROFILE["torch_index"] # pip wheel index for MuseTalk venv
+
 DUAL_GPU = _gpu_count >= 2 and os.environ.get("NEWGEN_FORCE_SINGLE_GPU") != "1"
 PIC_DEVICE = "cuda:0"
 WAN_DEVICE = "cuda:1" if DUAL_GPU else "cuda:0"
@@ -2092,12 +2169,15 @@ def _ensure_musetalk():
                 # does NOT affect the system torch 2.8 dev build). This must
                 # happen BEFORE mim install mmcv below, so mim can detect
                 # this venv's torch/CUDA version and fetch a matching wheel.
-                print("[LipSync] Installing torch into MuseTalk venv "
-                      "(cu128 wheel index, needed for Blackwell/sm_120 support) ...")
+                # GPU_TORCH_IDX is set at startup by _detect_gpu_profile():
+                #   sm_120 (Blackwell 6000 Pro) → cu128
+                #   sm_89  (RTX 5090)           → cu130
+                print(f"[LipSync] Installing torch into MuseTalk venv "
+                      f"(wheel index: {GPU_TORCH_IDX}, GPU: {GPU_NAME}) ...")
                 subprocess.run(
                     [str(MUSETALK_VENV_PY), "-m", "pip", "install"] +
                     _MT_PIP_QUIET +
-                    ["--index-url", "https://download.pytorch.org/whl/cu128",
+                    ["--index-url", GPU_TORCH_IDX,
                      "torch", "torchvision", "torchaudio"],
                     check=True, capture_output=True, env=_mt_env,
                 )
@@ -2203,11 +2283,13 @@ def _ensure_musetalk():
             _mmcv_env = {
                 **_mt_env,
                 "MMCV_WITH_OPS": "1",
-                # Restrict CUDA arches to those mmcv's cpp_extension.py knows.
-                # arch 12.0 (Blackwell/sm_120) was added to PyTorch cu128 but
-                # is not yet in mmcv's arch table — including it causes a hard
-                # ValueError crash during wheel build.
-                "TORCH_CUDA_ARCH_LIST": "8.0;8.6;8.9;9.0",
+                # GPU_SM_STR is built at startup by _detect_gpu_profile() and
+                # covers arches up to this device's compute capability, but
+                # never exceeds sm_90 — older mmcv sources don't recognise
+                # sm_120 (Blackwell) and raise ValueError during wheel build.
+                # RTX 5090 (sm_89) → "8.0;8.6;8.9"
+                # Blackwell 6000 Pro (sm_120) → "8.0;8.6;8.9;9.0" (capped at 9.0)
+                "TORCH_CUDA_ARCH_LIST": GPU_SM_STR,
             }
 
             # ------------------------------------------------------------------
@@ -3608,9 +3690,35 @@ def _build_wan_pipeline(target_device="cpu"):
             device_map=None,
             use_safetensors=True
         )
-        pipeline = pipeline.to(target_device)
-        torch.cuda.synchronize(target_device)
-        print(f" WAMU v2 loaded directly to {target_device} - Ready for video generation!")
+
+        # ---------------------------------------------------------------------------
+        # Adaptive VRAM strategy — decided at load time based on detected VRAM.
+        #
+        # HIGH VRAM (>= 40 GB, e.g. Blackwell 6000 Pro 95 GB):
+        #   Load everything directly onto the GPU. Fastest possible inference.
+        #
+        # LOW VRAM (< 40 GB, e.g. RTX 5090 32 GB):
+        #   The full Wan model in BF16 is ~31 GB. A direct .to(device) leaves
+        #   almost no headroom for activations and the VAE decode, causing OOM
+        #   mid-generation. enable_sequential_cpu_offload() keeps weights in
+        #   CPU RAM and streams each sub-module to GPU on demand — it fits
+        #   comfortably in 32 GB at the cost of ~20-30% slower generation.
+        #   enable_vae_slicing/tiling are also critical here to keep the VAE
+        #   decode from spiking VRAM during the frame decode step.
+        # ---------------------------------------------------------------------------
+        if GPU_HIGH_VRAM:
+            pipeline = pipeline.to(target_device)
+            torch.cuda.synchronize(target_device)
+            print(f" WAMU v2 loaded directly to {target_device} ({GPU_VRAM_GB:.0f} GB VRAM) - Ready!")
+        else:
+            # Sequential CPU offload: each transformer block is moved to GPU
+            # for its forward pass then immediately returned to CPU RAM.
+            # No .to(device) call — offload sets up its own hooks.
+            pipeline.enable_sequential_cpu_offload(gpu_id=int(target_device.split(":")[-1]))
+            print(
+                f" WAMU v2 loaded with sequential CPU offload "
+                f"({GPU_VRAM_GB:.0f} GB VRAM, {GPU_NAME}) - Ready (offload mode)."
+            )
 
     _wan_scheduler_config = dict(pipeline.scheduler.config)
     pipeline.vae.enable_slicing()
