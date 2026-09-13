@@ -1,32 +1,47 @@
 #!/usr/bin/env bash
-# Kill any running app.py process, regardless of how it was launched.
-# Also cleans up a stale PID file if the process is already gone.
+# Stop app.py and the Cloudflare tunnel, regardless of how they were launched.
+# Cleans up stale PID files if the processes are already gone.
 
-PID_FILE="$(cd "$(dirname "$0")" && pwd)/app.pid"
+APP_DIR="$(cd "$(dirname "$0")" && pwd)"
+PID_FILE="$APP_DIR/app.pid"
+CLOUDFLARED_PID_FILE="$APP_DIR/cloudflared.pid"
 KILLED=0
 
-# 1. Kill by PID file if it exists
+# ── 1. Stop app.py by PID file ────────────────────────────────────────────
 if [[ -f "$PID_FILE" ]]; then
     PID=$(cat "$PID_FILE")
     if kill -0 "$PID" 2>/dev/null; then
-        echo "[kill] Killing PID $PID (from app.pid)..."
-        kill -9 "$PID" && KILLED=1
+        echo "[stop] Stopping app.py PID $PID..."
+        kill "$PID" && KILLED=1
     else
-        echo "[kill] PID $PID in app.pid is already gone — removing stale file."
+        echo "[stop] PID $PID in app.pid is already gone — removing stale file."
     fi
     rm -f "$PID_FILE"
 fi
 
-# 2. Kill any remaining python processes running app.py (catches nohup/setsid
-#    children that have a different parent PID than what app.pid recorded, or
-#    instances started without autorun.sh).
+# ── 2. Catch any remaining app.py processes not tracked by PID file ───────
 while IFS= read -r PID; do
-    echo "[kill] Killing PID $PID (app.py process)..."
-    kill -9 "$PID" 2>/dev/null && KILLED=1
+    echo "[stop] Stopping app.py PID $PID..."
+    kill "$PID" 2>/dev/null && KILLED=1
 done < <(pgrep -f "python.*app\.py" 2>/dev/null)
 
+# ── 3. Stop Cloudflare tunnel by PID file ─────────────────────────────────
+if [[ -f "$CLOUDFLARED_PID_FILE" ]]; then
+    CF_PID=$(cat "$CLOUDFLARED_PID_FILE")
+    if kill -0 "$CF_PID" 2>/dev/null; then
+        echo "[stop] Stopping Cloudflare tunnel PID $CF_PID..."
+        kill "$CF_PID" 2>/dev/null && KILLED=1
+    else
+        echo "[stop] Cloudflare tunnel PID $CF_PID already gone — removing stale file."
+    fi
+    rm -f "$CLOUDFLARED_PID_FILE"
+fi
+
+# ── 4. Catch any remaining cloudflared processes for port 7860 ────────────
+pkill -f "cloudflared.*7860" 2>/dev/null && KILLED=1 || true
+
 if [[ $KILLED -eq 1 ]]; then
-    echo "[kill] Done."
+    echo "[stop] Done."
 else
-    echo "[kill] No running app.py found."
+    echo "[stop] Nothing was running."
 fi
