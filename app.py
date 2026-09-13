@@ -1367,6 +1367,41 @@ def _ensure_audio_engines():
                 print("[AudioEngine] Failed to pin transformers in Foley venv: "
                       f"{_foley_tf_result.stderr[-500:]}")
 
+    # --- Ensure `huggingface_hub` in the Foley venv is compatible with -------
+    # the pinned transformers==4.46.3 above. transformers 4.46.3 requires
+    # huggingface-hub>=0.23.2,<1.0. Nothing in the bootstrap above pins
+    # huggingface_hub (the repo requirements.txt install and the transformers
+    # pin above both leave it to pip's resolver), so a fresh venv created
+    # after huggingface_hub 1.0 was released on PyPI ends up with a >=1.0
+    # version that transformers refuses to import against, crashing every
+    # Foley run with "ImportError: huggingface-hub>=0.23.2,<1.0 is required
+    # ... but found huggingface-hub==1.x.x" even though the venv otherwise
+    # looks fully set up. This check runs on every startup (cheap when
+    # already satisfied) so it also repairs venvs created before this fix
+    # existed, without needing to delete/recreate them.
+    _foley_hub_check = subprocess.run(
+        [str(FOLEY_VENV_PY), "-c",
+         "from huggingface_hub.utils import get_session; "
+         "import huggingface_hub as _h; "
+         "import sys; "
+         "v = tuple(int(p) for p in _h.__version__.split('.')[:2]); "
+         "sys.exit(0 if v < (1, 0) else 1)"],
+        capture_output=True,
+    )
+    if _foley_hub_check.returncode != 0:
+        print("[AudioEngine] Foley venv's huggingface_hub is incompatible with "
+              "transformers==4.46.3 (needs <1.0) — pinning a compatible version ...")
+        _foley_hub_result = subprocess.run(
+            [str(FOLEY_VENV_PY), "-m", "pip", "install"] + _FOLEY_PIP_QUIET +
+            ["huggingface-hub>=0.23.2,<1.0"],
+            capture_output=True,
+        )
+        if _foley_hub_result.returncode == 0:
+            print("[AudioEngine] huggingface-hub pinned to <1.0 in Foley venv.")
+        else:
+            print("[AudioEngine] Failed to pin huggingface-hub in Foley venv: "
+                  f"{_foley_hub_result.stderr[-500:]}")
+
     # --- F5-TTS (isolated venv) -----------------------------------------
     # F5-TTS's dependency chain (via cached_path -> google-cloud-storage ->
     # google-api-core) needs protobuf>=6.33.5, while HunyuanVideo-Foley's
@@ -3607,6 +3642,13 @@ def _is_protected(item_path) -> bool:
 
 _current_input_image_path = None
 
+# Tracks the _media_store key for the video currently loaded in the player.
+# This key uses the "vidgen_player_" prefix which _do_clear_storage deliberately
+# does NOT release, so the video stays playable in the player across auto-clears.
+# Reset to None when a new generation starts (which calls _do_clear_storage as
+# a pre-clear) or when the user explicitly clicks Clear Storage.
+_current_player_media_key = None
+
 _current_merge_output_path = None
 _merge_output_lock = threading.Lock()
 
@@ -5259,7 +5301,19 @@ def generate_video(
             progress(1.0, desc="Generation complete")
         _generation_release(_current_input_image_path)
         _generation_release(_end_image_protect_path)
-        yield filepath, filepath, gr.update(visible=False, value="")
+
+        # Store video bytes in RAM under a dedicated "vidgen_player_" prefix so
+        # the player can stream from memory immediately. This prefix is NOT wiped
+        # by _do_clear_storage (which only releases "vidgen_", "vidgen_sequence_",
+        # etc.) so the video stays playable even after the tmp file is deleted and
+        # even after auto-clear fires. The key is held in _current_player_media_key
+        # and released on the next generation start or explicit Clear Storage.
+        global _current_player_media_key
+        player_filename = filename.replace("vidgen_", "vidgen_player_", 1)
+        player_url = _media_store_put(final_buf, player_filename)
+        _current_player_media_key = player_url.split("/")[2]  # extract key from /media/{key}/{filename}
+
+        yield player_url, filepath, gr.update(visible=False, value="")
 
     except gr.Error:
         _generation_release(_current_input_image_path)
@@ -6392,6 +6446,12 @@ def _do_clear_storage():
     _media_store_release_prefix("vidgen_custom_seq_")
     _media_store_release_prefix("picgen_")
     _media_store_release_prefix("extracted_frame_")
+    # Also release the current player copy (explicit clear — user wants everything gone)
+    global _current_player_media_key
+    if _current_player_media_key:
+        with _media_store_lock:
+            _media_store.pop(_current_player_media_key, None)
+        _current_player_media_key = None
 
     for gradio_dir in [
         Path(SCRIPT_DIR) / "tmp" / "gradio",
@@ -6971,6 +7031,10 @@ body.hide-media #picgen-result-gallery video { visibility: hidden !important; }
 #top-bar-row button { min-width: 140px !important; }
 #show-media-row { justify-content: center !important; }
 #show-media-row > * { flex: 0 0 auto !important; }
+/* Auto-Download checkbox: top-right of the Video Generator tab */
+#vidgen-autodownload-row { align-items: center !important; margin-bottom: 4px !important; }
+#vidgen-autodownload-row > * { flex: 0 0 auto !important; }
+#auto-download-cb { min-width: 220px !important; }
 /* Tab bar: full width, two equal tabs, Photo Editor left, Video Generator right */
 .gradio-container .tab-nav { display: flex !important; width: 100% !important; }
 .gradio-container .tab-nav button { flex: 1 1 50% !important; text-align: center !important; justify-content: center !important; }
@@ -6990,6 +7054,14 @@ body.hide-media #picgen-result-gallery video { visibility: hidden !important; }
 .gradio-container .label-wrap { display: flex !important; align-items: center !important; justify-content: center !important; width: 100% !important; position: relative !important; }
 .gradio-container .label-wrap > span { flex: 1 1 auto !important; text-align: center !important; }
 .gradio-container .label-wrap svg { flex: 0 0 auto !important; margin-left: auto !important; position: relative !important; right: 0 !important; }
+/* Hide all Gradio notifications and toasts (fullscreen, download, etc.) */
+.alertbox, .notification, [role="alert"], .toast, .gr-notification, 
+[class*="notification"], [class*="alert"], [class*="toast"],
+.svelte-1syraq6, .svelte-1ucemt5, 
+/* Target notification container and all its children */
+div[style*="position"][style*="fixed"][style*="top"], 
+/* Catch floating notification boxes at top of screen */
+.fixed.top-0 { display: none !important; }
 """
 
 
@@ -7292,6 +7364,12 @@ with gr.Blocks(css=css) as demo:
         _media_store_release_prefix("vidgen_custom_seq_")
         _media_store_release_prefix("picgen_")
         _media_store_release_prefix("extracted_frame_")
+        # Release the current player copy too — explicit clear means everything
+        global _current_player_media_key
+        if _current_player_media_key:
+            with _media_store_lock:
+                _media_store.pop(_current_player_media_key, None)
+            _current_player_media_key = None
 
         cleaned = 0
         for gradio_dir in [
@@ -7335,6 +7413,20 @@ with gr.Blocks(css=css) as demo:
 
         with gr.Tab(" Video Generator", id="vidgen"):
             gr.Markdown(model_title())
+
+            with gr.Row(elem_id="vidgen-autodownload-row"):
+                gr.HTML("<div style='flex:1'></div>")  # spacer pushes checkbox right
+                auto_download_cb = gr.Checkbox(
+                    label="Auto-Download Videos",
+                    value=True,
+                    info=(
+                        "When checked, each generated video is automatically downloaded "
+                        "to your browser. When unchecked, the video stays playable here "
+                        "but is not downloaded — storage is still cleared automatically."
+                    ),
+                    elem_id="auto-download-cb",
+                    scale=0,
+                )
 
             with gr.Row():
                 with gr.Column(scale=1):
@@ -8281,8 +8373,11 @@ with gr.Blocks(css=css) as demo:
             vid_preset_dropdown7.change(fn=update_vid_prompt7, inputs=[vid_preset_dropdown7], outputs=[vid_prompt], scroll_to_output=False)
             vid_preset_dropdown8.change(fn=update_vid_prompt8, inputs=[vid_preset_dropdown8], outputs=[vid_prompt], scroll_to_output=False)
 
-            def _noop_download(f):
-                """Pass-through function for download chain."""
+            def _noop_download(f, auto_download):
+                """Pass-through function for download chain. The actual download
+                trigger happens client-side in _VID_DOWNLOAD_JS, which checks
+                auto_download itself; this server-side fn just needs to accept
+                the extra input Gradio passes alongside video_file."""
                 return f
 
             def _delete_video_after_download(video_file_val):
@@ -8300,8 +8395,8 @@ with gr.Blocks(css=css) as demo:
                 return gr.update(visible=True, value="Storage cleared.")
 
             _VID_DOWNLOAD_JS = """
-            (videoFile) => {
-                if (!videoFile || !videoFile.url) return videoFile;
+            (videoFile, autoDownload) => {
+                if (!autoDownload || !videoFile || !videoFile.url) return videoFile;
                 const a = document.createElement('a');
                 a.href = videoFile.url;
                 a.download = videoFile.url.split('/').pop();
@@ -8363,6 +8458,13 @@ with gr.Blocks(css=css) as demo:
                                    lipsync_steps, lipsync_cfg,
                                    *rest_args):
                 """Route to normal generate_video, folder-Autorun, Sequence, Custom Edit Sequence, or Lip-Synced Speaking."""
+                # Release the previous player media key before clearing storage,
+                # so we don't try to keep a stale entry while clearing everything else.
+                global _current_player_media_key
+                if _current_player_media_key:
+                    with _media_store_lock:
+                        _media_store.pop(_current_player_media_key, None)
+                    _current_player_media_key = None
                 _do_clear_storage()
                 n = SEQUENCE_MAX_SLOTS
                 c = CUSTOM_SEQ_MAX_SLOTS
@@ -8446,7 +8548,7 @@ with gr.Blocks(css=css) as demo:
                 outputs=[],
             ).then(
                 fn=_noop_download,
-                inputs=[video_file],
+                inputs=[video_file, auto_download_cb],
                 outputs=[video_file],
                 js=_VID_DOWNLOAD_JS,
             ).then(
@@ -8480,7 +8582,7 @@ with gr.Blocks(css=css) as demo:
                 outputs=[],
             ).then(
                 fn=_noop_download,
-                inputs=[video_file],
+                inputs=[video_file, auto_download_cb],
                 outputs=[video_file],
                 js=_VID_DOWNLOAD_JS,
             ).then(
@@ -8503,7 +8605,7 @@ with gr.Blocks(css=css) as demo:
                 outputs=[],
             ).then(
                 fn=_noop_download,
-                inputs=[video_file],
+                inputs=[video_file, auto_download_cb],
                 outputs=[video_file],
                 js=_VID_DOWNLOAD_JS,
             ).then(
@@ -8688,23 +8790,10 @@ with gr.Blocks(css=css) as demo:
         with gr.Tab("Photo Editor", id="picgen"):
             with gr.Column(elem_id="col-container"):
 
-                gr.HTML("""
-                <div id="starter-grid" style="display:grid;grid-template-columns:repeat(10,1fr);gap:6px;margin-bottom:8px;width:100%;">
-                </div>
-                <style>
-                .starter-card{display:flex;flex-direction:column;align-items:center;gap:3px;cursor:pointer;
-                  border:1px solid var(--border-color-primary);border-radius:6px;padding:4px 2px;
-                  background:var(--background-fill-secondary);transition:border-color .15s;}
-                .starter-card:hover{border-color:var(--color-accent);}
-                .starter-thumb{width:100%;aspect-ratio:1;object-fit:cover;border-radius:4px;
-                  background:var(--background-fill-primary);display:block;}
-                .starter-thumb-placeholder{width:100%;aspect-ratio:1;border-radius:4px;
-                  background:var(--background-fill-primary);display:flex;align-items:center;
-                  justify-content:center;font-size:11px;color:var(--body-text-color-subdued);}
-                .starter-label{font-size:11px;font-weight:600;text-align:center;
-                  color:var(--body-text-color);line-height:1;}
-                </style>
-                """)
+                starter_grid_html = gr.HTML(
+                    value="<div id='starter-grid'></div>",
+                    elem_id="starter-grid-container",
+                )
                 starter_b64_output = gr.Textbox(value="", visible=False, elem_id="starter-b64-output")
 
                 with gr.Row():
@@ -9182,86 +9271,66 @@ with gr.Blocks(css=css) as demo:
 }
 """
     demo.load(fn=None, js=_picgen_dl_intercept_js)
-    _starter_grid_js = """
-() => {
-    function buildStarterGrid() {
-        const grid = document.getElementById('starter-grid');
-        if (!grid) { setTimeout(buildStarterGrid, 300); return; }
-        // Clear and rebuild every time so tab re-renders don't leave a stale grid
-        grid.innerHTML = '';
 
-        for (let n = 1; n <= 10; n++) {
-            const card = document.createElement('div');
-            card.className = 'starter-card';
-            card.dataset.num = n;
+    def _build_starter_grid_html():
+        """Read starters/start1.jpg .. start10.jpg from disk, base64-encode each,
+        and return a self-contained HTML string with thumbnails + click buttons.
+        Called on every demo.load so new files appear on page refresh with no restart."""
+        starters_dir = Path(SCRIPT_DIR) / "starters"
+        cards = []
+        for n in range(1, 11):
+            p = starters_dir / f"start{n}.jpg"
+            if p.exists():
+                data = p.read_bytes()
+                b64 = base64.b64encode(data).decode()
+                img_tag = (
+                    f'<img class="starter-thumb" '
+                    f'src="data:image/jpeg;base64,{b64}" '
+                    f'alt="{n}" />'
+                )
+            else:
+                img_tag = f'<div class="starter-thumb-placeholder">{n}</div>'
+            # Button onclick: inline JS reads the pre-embedded b64 from the img src
+            # and passes it straight to __addImage — no fetch, no route, no async.
+            if p.exists():
+                onclick = (
+                    f"(function(){{"
+                    f"var img=this.closest('.starter-card').querySelector('img');"
+                    f"if(img&&window.__addImage)window.__addImage(img.src,'starter{n}.jpg');"
+                    f"}}).call(this)"
+                )
+            else:
+                onclick = ""
+            btn_attrs = f'class="starter-btn" onclick="{onclick}"' if onclick else 'class="starter-btn" disabled style="opacity:.35;cursor:default;"'
+            cards.append(
+                f'<div class="starter-card">'
+                f'{img_tag}'
+                f'<button {btn_attrs}>{n}</button>'
+                f'</div>'
+            )
+        grid_items = "".join(cards)
+        return f"""
+        <style>
+        .starter-card{{display:flex;flex-direction:column;align-items:center;gap:0;
+          border:1px solid var(--border-color-primary);border-radius:6px;overflow:hidden;
+          background:var(--background-fill-secondary);transition:border-color .15s;min-width:0;}}
+        .starter-card:hover{{border-color:var(--color-accent);}}
+        .starter-thumb{{width:100%;aspect-ratio:1;object-fit:cover;display:block;}}
+        .starter-thumb-placeholder{{width:100%;aspect-ratio:1;display:flex;align-items:center;
+          justify-content:center;font-size:13px;font-weight:600;
+          color:var(--body-text-color-subdued);background:var(--background-fill-primary);}}
+        .starter-btn{{width:100%;border:none;border-top:1px solid var(--border-color-primary);
+          background:var(--background-fill-secondary);color:var(--body-text-color);
+          font-size:12px;font-weight:700;padding:4px 0;cursor:pointer;text-align:center;
+          line-height:1.4;}}
+        .starter-btn:hover:not([disabled]){{background:var(--color-accent);color:#fff;}}
+        #starter-grid-container .prose{{margin:0!important;padding:0!important;}}
+        #starter-grid{{display:grid;grid-template-columns:repeat(10,1fr);gap:4px;width:100%;margin-bottom:8px;}}
+        </style>
+        <div id="starter-grid">{grid_items}</div>
+        """
 
-            // Thumbnail — use the raw original fetch to bypass the /media/ interceptor
-            const img = document.createElement('img');
-            img.className = 'starter-thumb';
-            img.alt = String(n);
-            img.loading = 'eager';
-
-            const _rawFetch = window.__ngOrigFetch || window.fetch;
-            _rawFetch('/starters/' + n)
-                .then(r => {
-                    if (!r.ok) throw new Error('not found');
-                    return r.blob();
-                })
-                .then(blob => {
-                    img.src = URL.createObjectURL(blob);
-                })
-                .catch(() => {
-                    const ph = document.createElement('div');
-                    ph.className = 'starter-thumb-placeholder';
-                    ph.textContent = n;
-                    if (img.parentNode) card.replaceChild(ph, img);
-                    else card.insertBefore(ph, card.firstChild);
-                });
-
-            const label = document.createElement('div');
-            label.className = 'starter-label';
-            label.textContent = String(n);
-
-            card.appendChild(img);
-            card.appendChild(label);
-
-            card.addEventListener('click', function() {
-                const num = this.dataset.num;
-                const _fetch = window.__ngOrigFetch || window.fetch;
-                _fetch('/starters/' + num)
-                    .then(r => {
-                        if (!r.ok) throw new Error('not found');
-                        const ct = r.headers.get('Content-Type') || 'image/jpeg';
-                        return r.blob().then(blob => ({ blob, ct }));
-                    })
-                    .then(({ blob, ct }) => {
-                        const reader = new FileReader();
-                        reader.onload = function(e) {
-                            const b64 = e.target.result;
-                            if (window.__addImage) {
-                                window.__addImage(b64, 'starter' + num + '.jpg');
-                            }
-                        };
-                        reader.readAsDataURL(blob);
-                    })
-                    .catch(e => console.warn('[Starters] could not load starter', num, e));
-            });
-
-            grid.appendChild(card);
-        }
-    }
-
-    // Build immediately and also re-build when the starter-grid appears after
-    // a tab switch (Gradio renders tabs lazily so the element may not exist yet)
-    buildStarterGrid();
-    const _sgObs = new MutationObserver(() => {
-        const g = document.getElementById('starter-grid');
-        if (g && g.children.length === 0) buildStarterGrid();
-    });
-    _sgObs.observe(document.body, { childList: true, subtree: true });
-}
-"""
-    demo.load(fn=None, js=_starter_grid_js)
+    demo.load(fn=_build_starter_grid_html, inputs=[], outputs=[starter_grid_html])
 
 
     video_time_sync_js = """
