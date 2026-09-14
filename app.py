@@ -6353,6 +6353,71 @@ def add_starter_image(starter_num):
     return f"data:{mime};base64,{b64}"
 
 
+def _build_starter_grid_html():
+    """Read starters/start1.jpg .. start10.jpg from disk, base64-encode each,
+    and return a self-contained HTML string with thumbnails + click buttons.
+
+    Called ONCE at UI build time and used as the initial value of the starter
+    gr.HTML component. It is intentionally NOT wired to demo.load: a queued
+    Python demo.load handler interferes with gr.Progress(track_tqdm=True)
+    progress streaming on subsequent picgen generations. Building the grid
+    inline at startup keeps the queue clean while still showing the thumbnails
+    immediately when the app loads."""
+    starters_dir = Path(SCRIPT_DIR) / "starters"
+    cards = []
+    for n in range(1, 11):
+        p = starters_dir / f"start{n}.jpg"
+        if p.exists():
+            data = p.read_bytes()
+            b64 = base64.b64encode(data).decode()
+            img_tag = (
+                f'<img class="starter-thumb" '
+                f'src="data:image/jpeg;base64,{b64}" '
+                f'alt="{n}" />'
+            )
+        else:
+            img_tag = f'<div class="starter-thumb-placeholder">{n}</div>'
+        # Button onclick: inline JS reads the pre-embedded b64 from the img src
+        # and passes it straight to __addImage — no fetch, no route, no async.
+        if p.exists():
+            onclick = (
+                f"(function(){{"
+                f"var img=this.closest('.starter-card').querySelector('img');"
+                f"if(img&&window.__addImage)window.__addImage(img.src,'starter{n}.jpg');"
+                f"}}).call(this)"
+            )
+        else:
+            onclick = ""
+        btn_attrs = f'class="starter-btn" onclick="{onclick}"' if onclick else 'class="starter-btn" disabled style="opacity:.35;cursor:default;"'
+        cards.append(
+            f'<div class="starter-card">'
+            f'{img_tag}'
+            f'<button {btn_attrs}>{n}</button>'
+            f'</div>'
+        )
+    grid_items = "".join(cards)
+    return f"""
+    <style>
+    .starter-card{{display:flex;flex-direction:column;align-items:center;gap:0;
+      border:1px solid var(--border-color-primary);border-radius:6px;overflow:hidden;
+      background:var(--background-fill-secondary);transition:border-color .15s;min-width:0;}}
+    .starter-card:hover{{border-color:var(--color-accent);}}
+    .starter-thumb{{width:100%;aspect-ratio:1;object-fit:cover;display:block;}}
+    .starter-thumb-placeholder{{width:100%;aspect-ratio:1;display:flex;align-items:center;
+      justify-content:center;font-size:13px;font-weight:600;
+      color:var(--body-text-color-subdued);background:var(--background-fill-primary);}}
+    .starter-btn{{width:100%;border:none;border-top:1px solid var(--border-color-primary);
+      background:var(--background-fill-secondary);color:var(--body-text-color);
+      font-size:12px;font-weight:700;padding:4px 0;cursor:pointer;text-align:center;
+      line-height:1.4;}}
+    .starter-btn:hover:not([disabled]){{background:var(--color-accent);color:#fff;}}
+    #starter-grid-container .prose{{margin:0!important;padding:0!important;}}
+    #starter-grid{{display:grid;grid-template-columns:repeat(10,1fr);gap:4px;width:100%;margin-bottom:8px;}}
+    </style>
+    <div id="starter-grid">{grid_items}</div>
+    """
+
+
 def _decode_single_b64(b64_str):
     """Decode a single base64 image string to PIL (used by thread pool)."""
     if not b64_str or not isinstance(b64_str, str):
@@ -6489,14 +6554,32 @@ def infer_with_preclear(
     progress=gr.Progress(track_tqdm=True),
 ):
     """
-    Generator wrapper around infer() that:
-    1. Yields a gallery reset first so Gradio enters streaming/progress mode on
-       EVERY run (not just the first).
-    2. Clears old storage before generation.
-    3. Yields the final result once infer() completes.
+    Wrapper around infer() that clears old storage before generating.
+
+    IMPORTANT: This is deliberately a PLAIN function, not a generator.
+
+    It used to `yield gr.update(value=None), ...` first, with the intent of
+    resetting the gallery so Gradio "entered progress mode". That was
+    backwards and was the reason the per-step progress never displayed:
+
+      * `gr.update(value=None)` does not actually clear a gr.Gallery, so the
+        previous images stayed on screen anyway.
+      * Yielding pulls the output components OUT of Gradio's "pending" state
+        and into generator/streaming mode. In streaming mode Gradio renders a
+        plain spinner for the component instead of the gr.Progress tracker, so
+        the `desc` text ("Step 2/4") is never painted — which matches exactly
+        what was observed: a spinner, behind the old images, with no text.
+
+    As a normal function the components stay pending for the whole call, which
+    is the state where gr.Progress renders its bar and desc text.
     """
-    # Reset gallery -> Gradio enters streaming mode and shows progress bar
-    yield gr.update(value=None), gr.update(), gr.update(value="")
+    # Drive the progress object immediately so the overlay appears right away,
+    # before denoising starts (model activation + image decode take a moment).
+    if callable(progress):
+        try:
+            progress(0.0, desc="Preparing")
+        except Exception:
+            pass
 
     try:
         n = _do_clear_storage()
@@ -6510,7 +6593,7 @@ def infer_with_preclear(
             true_guidance_scale, num_inference_steps, height, width,
             num_images_per_prompt, progress,
         )
-        yield filepaths, seed_out, urls_json
+        return filepaths, seed_out, urls_json
     except gr.Error:
         # Re-raise gr.Error cleanly — Gradio shows the message in the UI.
         # The exception is intentional (e.g. "no images uploaded") so we
@@ -6588,21 +6671,55 @@ def infer(
     
     pic_pipe.encode_prompt = cached_encode_prompt
     pic_pipe.prepare_latents = cached_prepare_latents
-    
+
+    # Per-step progress: drive the gr.Progress object EXPLICITLY from a
+    # pipeline step callback (same pattern as vidgen's animate_frame _step_cb).
+    # Relying on gr.Progress(track_tqdm=True) to auto-hook the pipeline's
+    # internal tqdm is unreliable through this nested blocking-generator call
+    # shape and does NOT stream the per-step overlay to the output gallery.
+    # Driving progress(...) directly each step pushes updates to the queue
+    # during the blocking pipeline call, which is what actually renders the
+    # "Step x/N" overlay in real time. Works for 1 or many input/output images
+    # (num_inference_steps is the same denoising loop regardless).
+    _pic_total_steps = max(1, int(num_inference_steps))
+
+    def _pic_step_cb(_pipe, step_index, _timestep, cb_kwargs):
+        if callable(progress):
+            try:
+                progress(
+                    (step_index + 1) / _pic_total_steps,
+                    desc=f"Step {step_index + 1}/{_pic_total_steps}",
+                )
+            except Exception:
+                pass
+        return cb_kwargs
+
+    _pic_call_kwargs = dict(
+        image=pil_images if pil_images else None,
+        prompt=prompt,
+        height=height,
+        width=width,
+        negative_prompt=negative_prompt,
+        num_inference_steps=num_inference_steps,
+        generator=generator,
+        true_cfg_scale=true_guidance_scale,
+        num_images_per_prompt=num_images_per_prompt,
+        callback_on_step_end=_pic_step_cb,
+    )
+
     try:
         with torch.cuda.device(PIC_DEVICE):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                image = pic_pipe(
-                    image=pil_images if pil_images else None,
-                    prompt=prompt,
-                    height=height,
-                    width=width,
-                    negative_prompt=negative_prompt,
-                    num_inference_steps=num_inference_steps,
-                    generator=generator,
-                    true_cfg_scale=true_guidance_scale,
-                    num_images_per_prompt=num_images_per_prompt,
-                ).images
+                try:
+                    image = pic_pipe(**_pic_call_kwargs).images
+                except TypeError as _cb_e:
+                    # Older pipeline without callback_on_step_end support:
+                    # retry without the callback rather than failing.
+                    if "callback_on_step_end" in str(_cb_e):
+                        _pic_call_kwargs.pop("callback_on_step_end", None)
+                        image = pic_pipe(**_pic_call_kwargs).images
+                    else:
+                        raise
     finally:
         pic_pipe.encode_prompt = original_encode_prompt
         pic_pipe.prepare_latents = original_prepare_latents
@@ -7054,14 +7171,46 @@ body.hide-media #picgen-result-gallery video { visibility: hidden !important; }
 .gradio-container .label-wrap { display: flex !important; align-items: center !important; justify-content: center !important; width: 100% !important; position: relative !important; }
 .gradio-container .label-wrap > span { flex: 1 1 auto !important; text-align: center !important; }
 .gradio-container .label-wrap svg { flex: 0 0 auto !important; margin-left: auto !important; position: relative !important; right: 0 !important; }
-/* Hide all Gradio notifications and toasts (fullscreen, download, etc.) */
-.alertbox, .notification, [role="alert"], .toast, .gr-notification, 
-[class*="notification"], [class*="alert"], [class*="toast"],
-.svelte-1syraq6, .svelte-1ucemt5, 
-/* Target notification container and all its children */
-div[style*="position"][style*="fixed"][style*="top"], 
-/* Catch floating notification boxes at top of screen */
-.fixed.top-0 { display: none !important; }
+/* Generation progress overlay on the picgen result gallery.
+   Observed problem: during generation the spinner/progress rendered BEHIND the
+   previously generated images, so any progress text was obscured. Gradio draws
+   its status tracker as `.wrap` inside the component; the gallery's image grid
+   could paint over it. Force the tracker to the front with an opaque backdrop
+   and make the progress text/bar explicitly visible and legible. */
+#picgen-result-gallery { position: relative !important; }
+#picgen-result-gallery .wrap {
+    z-index: 300 !important;
+    position: absolute !important;
+    inset: 0 !important;
+    background: var(--background-fill-primary) !important;
+    opacity: 1 !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 8px !important;
+}
+#picgen-result-gallery .progress-text,
+#picgen-result-gallery .progress-level,
+#picgen-result-gallery .progress-level-inner,
+#picgen-result-gallery .loading-text,
+#picgen-result-gallery .wrap > span {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    z-index: 301 !important;
+    color: var(--body-text-color) !important;
+    font-size: 15px !important;
+    font-weight: 600 !important;
+    text-align: center !important;
+}
+
+/* NOTE: No toast/notification hiding rules here on purpose.
+   Attempts to hide Gradio's "press ESC to exit full screen" and download
+   toasts required selectors broad enough to also match Gradio's loading /
+   progress status element, which silently hid the per-step generation
+   progress overlay on the output components. Those toasts are accepted as
+   visible so the generation progress display is never at risk. */
 """
 
 
@@ -8791,7 +8940,7 @@ with gr.Blocks(css=css) as demo:
             with gr.Column(elem_id="col-container"):
 
                 starter_grid_html = gr.HTML(
-                    value="<div id='starter-grid'></div>",
+                    value=_build_starter_grid_html(),
                     elem_id="starter-grid-container",
                 )
                 starter_b64_output = gr.Textbox(value="", visible=False, elem_id="starter-b64-output")
@@ -8935,20 +9084,28 @@ with gr.Blocks(css=css) as demo:
                     pic_seed, pic_randomize_seed, pic_guidance, pic_steps,
                     pic_height, pic_width, pic_num_images,
                 ]
-                # No js= on the click handlers — we rely on hidden_images_b64
-                # being kept in sync by syncToGradio() (called by the gallery JS
-                # on every image add/remove).  The old js= approach that mutated
-                # args[0] broke in Gradio 4.x: the JS pre-hook must return
-                # exactly as many elements as there are inputs, but Gradio 4.x
-                # passes component values differently from 3.x, so any mismatch
-                # results in "needed: 10, got: 0".  The hidden textbox is the
-                # correct channel — Gradio reads it as a normal input.
+                # JS pre-hook: pull the current images from window.__uploadedImages
+                # into args[0], then return the FULL args array unchanged.
+                # Returning all inputs is the correct Gradio 4.x contract (the
+                # earlier "needed: 10, got: 0" error came from a prehook that
+                # returned the wrong number of elements — this one returns all).
+                # This prehook is REQUIRED: on a generator event it is what makes
+                # Gradio establish the streaming connection with gr.Progress
+                # (track_tqdm) attached, so the per-step progress overlay renders
+                # on the output gallery in real time. Without it, generation still
+                # works but the step progress does not stream.
+                _pic_infer_js = "(...args) => { const imgs = window.__uploadedImages || []; const b64 = JSON.stringify(imgs.map(i => i.b64)); args[0] = b64; return args; }"
 
                 def _wire_picgen_btn(trigger):
                     trigger(
                         fn=infer_with_preclear,
                         inputs=_pic_infer_inputs,
+                        js=_pic_infer_js,
                         outputs=[pic_result, pic_seed, picgen_urls],
+                        # Explicit "full" so the per-step progress overlay always
+                        # renders on the output gallery (this is the default, but
+                        # stating it removes any ambiguity).
+                        show_progress="full",
                     ).then(
                         fn=lambda: __import__('time').sleep(2),
                         inputs=[],
@@ -8973,7 +9130,7 @@ with gr.Blocks(css=css) as demo:
                 # clicking Generate). No special pipeline.
                 PICGEN_TOOL_PRESETS = {
                     "complete_body": (
-                        "outpaint to only fill in what is missing in the white part of the photo so their full body is fully visible and also add tiny background space above their head and beneath their feet. everything else is unchanged."
+                        "outpaint to only fill in what is missing only in the white part of the photo."
                     ),
                     "add_l2r": (
                         "Perfectly crop the person alone from image 1 to image 2 to add them naturally into only the scene of the second image without editing or regenerating it at all. "
@@ -9006,6 +9163,7 @@ with gr.Blocks(css=css) as demo:
                         fn=infer_with_preclear,
                         inputs=_pic_infer_inputs,
                         outputs=[pic_result, pic_seed, picgen_urls],
+                        show_progress="full",
                     ).then(
                         fn=lambda: __import__('time').sleep(2),
                         inputs=[],
@@ -9271,66 +9429,12 @@ with gr.Blocks(css=css) as demo:
 }
 """
     demo.load(fn=None, js=_picgen_dl_intercept_js)
-
-    def _build_starter_grid_html():
-        """Read starters/start1.jpg .. start10.jpg from disk, base64-encode each,
-        and return a self-contained HTML string with thumbnails + click buttons.
-        Called on every demo.load so new files appear on page refresh with no restart."""
-        starters_dir = Path(SCRIPT_DIR) / "starters"
-        cards = []
-        for n in range(1, 11):
-            p = starters_dir / f"start{n}.jpg"
-            if p.exists():
-                data = p.read_bytes()
-                b64 = base64.b64encode(data).decode()
-                img_tag = (
-                    f'<img class="starter-thumb" '
-                    f'src="data:image/jpeg;base64,{b64}" '
-                    f'alt="{n}" />'
-                )
-            else:
-                img_tag = f'<div class="starter-thumb-placeholder">{n}</div>'
-            # Button onclick: inline JS reads the pre-embedded b64 from the img src
-            # and passes it straight to __addImage — no fetch, no route, no async.
-            if p.exists():
-                onclick = (
-                    f"(function(){{"
-                    f"var img=this.closest('.starter-card').querySelector('img');"
-                    f"if(img&&window.__addImage)window.__addImage(img.src,'starter{n}.jpg');"
-                    f"}}).call(this)"
-                )
-            else:
-                onclick = ""
-            btn_attrs = f'class="starter-btn" onclick="{onclick}"' if onclick else 'class="starter-btn" disabled style="opacity:.35;cursor:default;"'
-            cards.append(
-                f'<div class="starter-card">'
-                f'{img_tag}'
-                f'<button {btn_attrs}>{n}</button>'
-                f'</div>'
-            )
-        grid_items = "".join(cards)
-        return f"""
-        <style>
-        .starter-card{{display:flex;flex-direction:column;align-items:center;gap:0;
-          border:1px solid var(--border-color-primary);border-radius:6px;overflow:hidden;
-          background:var(--background-fill-secondary);transition:border-color .15s;min-width:0;}}
-        .starter-card:hover{{border-color:var(--color-accent);}}
-        .starter-thumb{{width:100%;aspect-ratio:1;object-fit:cover;display:block;}}
-        .starter-thumb-placeholder{{width:100%;aspect-ratio:1;display:flex;align-items:center;
-          justify-content:center;font-size:13px;font-weight:600;
-          color:var(--body-text-color-subdued);background:var(--background-fill-primary);}}
-        .starter-btn{{width:100%;border:none;border-top:1px solid var(--border-color-primary);
-          background:var(--background-fill-secondary);color:var(--body-text-color);
-          font-size:12px;font-weight:700;padding:4px 0;cursor:pointer;text-align:center;
-          line-height:1.4;}}
-        .starter-btn:hover:not([disabled]){{background:var(--color-accent);color:#fff;}}
-        #starter-grid-container .prose{{margin:0!important;padding:0!important;}}
-        #starter-grid{{display:grid;grid-template-columns:repeat(10,1fr);gap:4px;width:100%;margin-bottom:8px;}}
-        </style>
-        <div id="starter-grid">{grid_items}</div>
-        """
-
-    demo.load(fn=_build_starter_grid_html, inputs=[], outputs=[starter_grid_html])
+    # NOTE: The starter grid is built ONCE at UI construction time via
+    # _build_starter_grid_html() as the initial value of starter_grid_html.
+    # It is deliberately NOT wired to demo.load here — a queued Python
+    # demo.load handler disrupts gr.Progress(track_tqdm=True) progress
+    # streaming on subsequent picgen generations. Building it inline keeps the
+    # event queue clean while still showing thumbnails at startup.
 
 
     video_time_sync_js = """
@@ -9539,7 +9643,7 @@ with gr.Blocks(css=css) as demo:
 () => {
 window.__openOutpaintPopup = function() {
     // ── constants ────────────────────────────────────────────────────────────
-    const PROMPT = 'outpaint to only fill in what is missing in the white part of the photo so their full body is fully visible and also add tiny background space above their head and beneath their feet. everything else is unchanged.';
+    const PROMPT = 'outpaint to only fill in what is missing only in the white part of the photo.';
     const HANDLE_SIZE = 28;   // px — draggable edge strip width
     const MIN_PAD = -4000;    // negative = crop inward
     const MAX_PAD = 1200;     // positive = add white space outward
