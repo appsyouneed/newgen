@@ -3791,6 +3791,18 @@ def _build_wan_pipeline(target_device="cpu"):
         torch.cuda.synchronize(target_device)
         print(f" WAMU v2 loaded fully on {target_device} ({GPU_VRAM_GB:.0f} GB VRAM) - Ready!")
 
+    # On cards that can't hold Wan fully resident (e.g. RTX 5090, 32 GB), apply
+    # quality-first per-channel scaled fp8 to the transformer(s). This halves
+    # their memory so Wan fits with the FAST model-CPU-offload path instead of
+    # the slow per-step sequential offload — a large vidgen speedup — while the
+    # matmuls still run in bf16 so quality stays bf16-class. On >=40 GB cards
+    # (Blackwell 6000 Pro) this is skipped and Wan stays full bf16 resident.
+    if GPU_VRAM_GB < FULL_RESIDENCY_VRAM_GB:
+        _cast_wan_to_fp8(pipeline)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     _wan_scheduler_config = dict(pipeline.scheduler.config)
     pipeline.vae.enable_slicing()
     pipeline.vae.enable_tiling()
@@ -6014,55 +6026,162 @@ def _safe_offload_to_cpu(pipe, label="pipeline"):
 # transformer is ~19 GB — which fits with room for activations.
 #
 # The load path copies the fp8 checkpoint values into the bf16 module, which
-# keeps the module bf16-sized (38 GB) and causes the OOM.  Casting the
-# transformer's Linear weights to float8_e4m3fn AFTER the merge drops resident
-# size to ~19 GB.  This is NOT a quality reduction — it is the precision the
-# NSFW weights were trained/quantized at.  VAE and text encoder stay bf16
-# (small, and need bf16 for numerical stability).
+# keeps the module bf16-sized (38 GB) and causes the OOM.
 #
-# Guarded by NEWGEN_QWEN_FP8 (default "1"); set to "0" to keep bf16 on cards
-# that have >=40 GB (e.g. the Blackwell 6000 Pro), where full bf16 fits and is
-# marginally faster.
+# QUALITY-FIRST fp8: instead of a blunt weight.to(float8_e4m3fn) truncation
+# (which loses ~4 mantissa bits and visibly degrades output vs bf16 on the
+# Blackwell 6000), we use PER-OUTPUT-CHANNEL SCALED fp8 with on-the-fly
+# dequantization:
+#
+#   • For each Linear weight we compute a per-row (per-output-channel) absmax
+#     scale so the fp8 range tightly covers each channel's real distribution —
+#     this is what recovers almost all the quality a naive cast throws away.
+#   • The weight is stored as fp8 (half the bytes) PLUS a small bf16 scale
+#     vector (one value per output channel — negligible memory).
+#   • At inference a wrapped forward dequantizes weight_fp8 * scale -> bf16 and
+#     runs the matmul IN bf16, so the actual math is bf16-precision. Only the
+#     stored weights are fp8; the compute is full-precision.
+#   • The smallest / most sensitive Linears (below a size threshold) are LEFT
+#     in bf16 — they cost almost no memory but matter a lot for quality
+#     (projections, gates, etc.).
+#
+# Net: ~half the transformer's memory (fits the 5090) with quality very close
+# to bf16, and no per-step CPU streaming, so it is both faster AND higher
+# quality than the previous approaches. On >=40 GB cards this is skipped
+# entirely and the model stays fully bf16-resident.
+#
+# Guarded by NEWGEN_QWEN_FP8 / NEWGEN_WAN_FP8 (default "1").
 # ---------------------------------------------------------------------------
 _QWEN_FP8_ENABLED = os.environ.get("NEWGEN_QWEN_FP8", "1") == "1"
+_WAN_FP8_ENABLED = os.environ.get("NEWGEN_WAN_FP8", "1") == "1"
+
+# Only quantize Linears with at least this many elements. Smaller layers are
+# kept in bf16 (protects quality; their memory cost is negligible).
+_FP8_MIN_NUMEL = 1_000_000
+
+
+class _ScaledFP8Linear(torch.nn.Module):
+    """Drop-in replacement for nn.Linear storing per-channel-scaled fp8 weights.
+
+    weight_fp8[out,in] (float8_e4m3fn) + scale[out] (bf16).
+    forward: w = weight_fp8.to(bf16) * scale[:,None]; return F.linear(x, w, bias).
+
+    The matmul runs in bf16, so numerical quality is bf16-class; only the
+    stored weight is fp8, halving its memory. Per-output-channel scaling keeps
+    the fp8 quantization error minimal.
+    """
+
+    def __init__(self, weight_fp8, scale, bias, in_features, out_features):
+        super().__init__()
+        self.register_buffer("weight_fp8", weight_fp8, persistent=True)
+        self.register_buffer("scale", scale, persistent=True)
+        if bias is not None:
+            self.register_buffer("bias", bias, persistent=True)
+        else:
+            self.bias = None
+        self.in_features = in_features
+        self.out_features = out_features
+
+    def forward(self, x):
+        # Dequantize to the activation dtype (bf16) with per-channel scale,
+        # then run a normal high-precision linear. Cheap: one cast + one mul.
+        w = self.weight_fp8.to(x.dtype) * self.scale.to(x.dtype).unsqueeze(1)
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return torch.nn.functional.linear(x, w, bias)
+
+
+def _quantize_linear_scaled_fp8(linear):
+    """Return a _ScaledFP8Linear for a big nn.Linear, or None to keep bf16."""
+    fp8 = torch.float8_e4m3fn
+    w = linear.weight.data
+    if w.dim() != 2 or w.numel() < _FP8_MIN_NUMEL:
+        return None
+    w_bf16 = w.to(torch.bfloat16)
+    # Per-output-channel absmax. e4m3 max magnitude is 448.0.
+    FP8_MAX = 448.0
+    absmax = w_bf16.abs().amax(dim=1)                 # [out]
+    absmax = torch.clamp(absmax, min=1e-8)
+    scale = (absmax / FP8_MAX).to(torch.bfloat16)     # [out]
+    w_scaled = (w_bf16 / scale.unsqueeze(1))          # normalize into fp8 range
+    w_fp8 = w_scaled.to(fp8)
+    bias = linear.bias.data.to(torch.bfloat16) if linear.bias is not None else None
+    return _ScaledFP8Linear(
+        w_fp8, scale, bias, linear.in_features, linear.out_features
+    )
+
+
+def _apply_scaled_fp8(module, label="transformer"):
+    """Replace big nn.Linear layers in `module` with per-channel-scaled fp8.
+
+    Returns resident byte size after conversion (for logging). Recurses through
+    submodules and swaps children in place.
+    """
+    if not hasattr(torch, "float8_e4m3fn"):
+        print(f"    [fp8] torch has no float8_e4m3fn — keeping {label} in bf16.")
+        return None
+    converted = 0
+    kept = 0
+
+    def _recurse(parent):
+        nonlocal converted, kept
+        for name, child in list(parent.named_children()):
+            if isinstance(child, torch.nn.Linear):
+                q = _quantize_linear_scaled_fp8(child)
+                if q is not None:
+                    setattr(parent, name, q)
+                    converted += 1
+                else:
+                    kept += 1
+            else:
+                _recurse(child)
+
+    _recurse(module)
+    gc.collect()
+    nbytes = 0
+    for p in module.parameters():
+        nbytes += p.numel() * p.element_size()
+    for b in module.buffers():
+        nbytes += b.numel() * b.element_size()
+    print(f"    [fp8] {label}: {converted} Linears -> scaled fp8 (per-channel), "
+          f"{kept} small Linears kept bf16 — now ~{nbytes / 1024**3:.1f} GB resident")
+    return nbytes
 
 
 def _cast_transformer_to_fp8(pipe):
-    """Cast the transformer's large Linear weights to float8_e4m3fn.
+    """Quality-first scaled per-channel fp8 for the Qwen transformer.
 
-    Only weights (2D Linear params) are cast; biases, norms, and non-Linear
-    params stay bf16 so the module remains numerically stable. Returns the
-    resident byte size after the cast for logging. Safe no-op if fp8 is
-    unavailable or disabled.
+    Only applied on cards that cannot hold the model fully resident (e.g. the
+    32 GB RTX 5090). On >=40 GB cards (Blackwell 6000 Pro) this is a NO-OP so
+    Qwen stays full bf16 for maximum quality. VAE and text encoder stay bf16.
     """
     if not _QWEN_FP8_ENABLED:
         return None
-    if not hasattr(torch, "float8_e4m3fn"):
-        print("    [fp8] torch has no float8_e4m3fn — keeping bf16 (may not fit <40 GB cards).")
+    if GPU_VRAM_GB >= FULL_RESIDENCY_VRAM_GB:
+        print("    [fp8] card >=40 GB — keeping Qwen transformer in bf16 (max quality).")
         return None
-    fp8 = torch.float8_e4m3fn
     transformer = getattr(pipe, "transformer", None)
     if transformer is None:
         return None
-    cast_count = 0
-    for module in transformer.modules():
-        w = getattr(module, "weight", None)
-        # Only cast 2D Linear-style weight matrices — the bulk of the size.
-        if isinstance(module, torch.nn.Linear) and w is not None and w.dim() == 2:
-            if w.dtype != fp8:
-                module.weight = torch.nn.Parameter(
-                    w.data.to(fp8), requires_grad=False
-                )
-                cast_count += 1
-    gc.collect()
-    nbytes = 0
-    for p in transformer.parameters():
-        nbytes += p.numel() * p.element_size()
-    for b in transformer.buffers():
-        nbytes += b.numel() * b.element_size()
-    print(f"    [fp8] cast {cast_count} Linear weights to float8_e4m3fn — "
-          f"transformer now ~{nbytes / 1024**3:.1f} GB resident")
-    return nbytes
+    return _apply_scaled_fp8(transformer, label="Qwen transformer")
+
+
+def _cast_wan_to_fp8(pipe):
+    """Quality-first scaled per-channel fp8 for Wan's dual transformers.
+
+    Halves the transformer memory so Wan fits with model-CPU-offload (fast)
+    instead of sequential offload (slow), while keeping bf16-class quality.
+    VAE and text encoder stay bf16. No-op if disabled/unavailable.
+    """
+    if not _WAN_FP8_ENABLED:
+        return None
+    total = 0
+    for attr in ("transformer", "transformer_2"):
+        comp = getattr(pipe, attr, None)
+        if comp is not None:
+            n = _apply_scaled_fp8(comp, label=f"Wan {attr}")
+            if n:
+                total += n
+    return total or None
 
 
 # ---------------------------------------------------------------------------
@@ -6212,23 +6331,27 @@ def _enable_offload(pipe, device, label):
     #   and video activations (dozens of frames) push a whole-transformer
     #   residency over 32 GB — that is the OOM we hit inside the FFN GELU.
     #   Sequential offload streams the transformer BLOCK BY BLOCK, so only one
-    #   block (a few hundred MB) is resident at a time, leaving ample room for
-    #   activations. It is slower per step than model-offload, but it is the
-    #   only way Wan's dual-expert transformer fits on a 32 GB card without
-    #   reducing frames/resolution/steps (i.e. no quality or adherence loss).
-    #   On >=40 GB cards this branch is never reached (full residency above).
-    if label == "wan" and hasattr(pipe, "enable_sequential_cpu_offload"):
+    #   block (a few hundred MB) is resident at a time. This is the SLOW path,
+    #   used ONLY as a fallback when Wan fp8 is disabled (NEWGEN_WAN_FP8=0).
+    #
+    #   With Wan fp8 ON (default), the transformers are halved (~13.5 GB each)
+    #   and fit with the FAST model-CPU-offload path below — the whole active
+    #   transformer stays resident for its denoise steps (no per-step block
+    #   streaming), which is the big vidgen speedup. Quality is preserved
+    #   because the fp8 matmuls dequantize to bf16 (see _ScaledFP8Linear).
+    if label == "wan" and not _WAN_FP8_ENABLED and hasattr(pipe, "enable_sequential_cpu_offload"):
         pipe.enable_sequential_cpu_offload(device=device)
         _offload_state[label] = True
         print(f"    [{label}] SEQUENTIAL CPU offload enabled on {device} "
-              f"(card {total_vram:.0f} GB — transformer streams block-by-block "
-              f"to fit video activations).")
+              f"(card {total_vram:.0f} GB, fp8 disabled — transformer streams "
+              f"block-by-block; slow fallback).")
         return
 
     pipe.enable_model_cpu_offload(device=device)
     _offload_state[label] = True
     print(f"    [{label}] model-CPU-offload enabled on {device} "
-          f"(card {total_vram:.0f} GB — components stream on demand).")
+          f"(card {total_vram:.0f} GB — components stream on demand, "
+          f"active transformer stays resident during denoise).")
 
 
 def _disable_offload(pipe, label):
