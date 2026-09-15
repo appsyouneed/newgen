@@ -6554,25 +6554,29 @@ def infer_with_preclear(
     progress=gr.Progress(track_tqdm=True),
 ):
     """
-    Wrapper around infer() that clears old storage before generating.
+    Generator wrapper around infer(), structured exactly like vidgen's
+    _dispatch_generate / generate_video (both of which are generators that yield
+    output updates and show step progress correctly).
 
-    IMPORTANT: This is deliberately a PLAIN function, not a generator.
+    1. Yields an immediate output update that CLEARS the result gallery, so the
+       previously generated photos are removed and cannot paint over the
+       progress overlay.
+    2. Clears old storage before generation.
+    3. Yields the final result once infer() completes.
 
-    It used to `yield gr.update(value=None), ...` first, with the intent of
-    resetting the gallery so Gradio "entered progress mode". That was
-    backwards and was the reason the per-step progress never displayed:
+    The gallery clear MUST yield `[]` (empty list) for pic_result. The earlier
+    `gr.update(value=None)` did NOT clear a gr.Gallery, which is why the old
+    images stayed on screen and hid the progress.
 
-      * `gr.update(value=None)` does not actually clear a gr.Gallery, so the
-        previous images stayed on screen anyway.
-      * Yielding pulls the output components OUT of Gradio's "pending" state
-        and into generator/streaming mode. In streaming mode Gradio renders a
-        plain spinner for the component instead of the gr.Progress tracker, so
-        the `desc` text ("Step 2/4") is never painted — which matches exactly
-        what was observed: a spinner, behind the old images, with no text.
-
-    As a normal function the components stay pending for the whole call, which
-    is the state where gr.Progress renders its bar and desc text.
+    Progress does not depend on this function being a plain function: the
+    per-step display is driven by the explicit callback_on_step_end installed in
+    infer(), mirroring vidgen's animate_frame _step_cb. vidgen proves generators
+    display progress fine.
     """
+    # Clear the result gallery immediately: [] empties pic_result, gr.update()
+    # leaves the seed slider untouched, "" drops stale download URLs.
+    yield [], gr.update(), ""
+
     # Drive the progress object immediately so the overlay appears right away,
     # before denoising starts (model activation + image decode take a moment).
     if callable(progress):
@@ -6593,7 +6597,7 @@ def infer_with_preclear(
             true_guidance_scale, num_inference_steps, height, width,
             num_images_per_prompt, progress,
         )
-        return filepaths, seed_out, urls_json
+        yield filepaths, seed_out, urls_json
     except gr.Error:
         # Re-raise gr.Error cleanly — Gradio shows the message in the UI.
         # The exception is intentional (e.g. "no images uploaded") so we
@@ -7171,39 +7175,14 @@ body.hide-media #picgen-result-gallery video { visibility: hidden !important; }
 .gradio-container .label-wrap { display: flex !important; align-items: center !important; justify-content: center !important; width: 100% !important; position: relative !important; }
 .gradio-container .label-wrap > span { flex: 1 1 auto !important; text-align: center !important; }
 .gradio-container .label-wrap svg { flex: 0 0 auto !important; margin-left: auto !important; position: relative !important; right: 0 !important; }
-/* Generation progress overlay on the picgen result gallery.
-   Observed problem: during generation the spinner/progress rendered BEHIND the
-   previously generated images, so any progress text was obscured. Gradio draws
-   its status tracker as `.wrap` inside the component; the gallery's image grid
-   could paint over it. Force the tracker to the front with an opaque backdrop
-   and make the progress text/bar explicitly visible and legible. */
-#picgen-result-gallery { position: relative !important; }
-#picgen-result-gallery .wrap {
-    z-index: 300 !important;
-    position: absolute !important;
-    inset: 0 !important;
-    background: var(--background-fill-primary) !important;
-    opacity: 1 !important;
-    display: flex !important;
-    flex-direction: column !important;
-    align-items: center !important;
-    justify-content: center !important;
-    gap: 8px !important;
-}
-#picgen-result-gallery .progress-text,
-#picgen-result-gallery .progress-level,
-#picgen-result-gallery .progress-level-inner,
-#picgen-result-gallery .loading-text,
-#picgen-result-gallery .wrap > span {
-    display: block !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-    z-index: 301 !important;
-    color: var(--body-text-color) !important;
-    font-size: 15px !important;
-    font-weight: 600 !important;
-    text-align: center !important;
-}
+/* NOTE: Deliberately NO custom CSS targeting the picgen result gallery's
+   progress/status overlay. An earlier attempt styled
+   `#picgen-result-gallery .wrap`, but in a gr.Gallery `.wrap` is ALSO the
+   gallery's own content wrapper — forcing it to position:absolute/inset:0 with
+   an opaque background turned the image container into a solid overlay and the
+   generated photos stopped showing, while also overriding Gradio's native
+   centered progress layout with badly aligned text. Gradio's default status
+   tracker styling is correct on its own; leave it alone. */
 
 /* NOTE: No toast/notification hiding rules here on purpose.
    Attempts to hide Gradio's "press ESC to exit full screen" and download
@@ -9094,18 +9073,63 @@ with gr.Blocks(css=css) as demo:
                 # (track_tqdm) attached, so the per-step progress overlay renders
                 # on the output gallery in real time. Without it, generation still
                 # works but the step progress does not stream.
-                _pic_infer_js = "(...args) => { const imgs = window.__uploadedImages || []; const b64 = JSON.stringify(imgs.map(i => i.b64)); args[0] = b64; return args; }"
+                # JS pre-hook. Besides collecting the uploaded input images, it
+                # ALSO clicks the result gallery's built-in clear/close ("X")
+                # button so any previously generated photos are wiped from the
+                # output box the instant Generate is pressed. Yielding [] from
+                # the server did NOT visually clear the gr.Gallery in this Gradio
+                # build (old thumbnails stayed painted and hid the progress
+                # overlay), so we clear it client-side here, exactly like the
+                # user clicking the X themselves.
+                _pic_infer_js = """
+(...args) => {
+    try {
+        const gal = document.getElementById('picgen-result-gallery');
+        if (gal) {
+            // Gradio renders the clear control as a button with aria-label
+            // "Clear" or "Close" (an X icon) in the gallery toolbar. Click
+            // whichever exists to empty the output box before generating.
+            let btn = gal.querySelector('button[aria-label="Clear"]')
+                   || gal.querySelector('button[aria-label="Close"]')
+                   || gal.querySelector('button[title="Clear"]')
+                   || gal.querySelector('button[title="Close"]');
+            if (btn) { btn.click(); }
+        }
+    } catch (e) { console.warn('picgen clear-on-generate failed', e); }
+    const imgs = window.__uploadedImages || [];
+    const b64 = JSON.stringify(imgs.map(i => i.b64));
+    args[0] = b64;
+    return args;
+}
+"""
 
                 def _wire_picgen_btn(trigger):
+                    # IMPORTANT: point the event at the PLAIN `infer` function,
+                    # NOT the `infer_with_preclear` generator. Wrapping infer in
+                    # a generator (which yields [] first) put the gr.Gallery into
+                    # generator-streaming mode, which replaced the real-time
+                    # "Step x/N" overlay with the generic Gradio loading spinner.
+                    # A plain function + gr.Progress(track_tqdm=True) is what lets
+                    # Gradio hook the diffusion pipeline's internal tqdm and paint
+                    # the per-step progress overlay INSIDE the output gallery, the
+                    # way the working backup (backups/1) did it.
+                    #
+                    # Clearing of previously generated images is handled entirely
+                    # client-side by the JS pre-hook (_pic_infer_js), which clicks
+                    # the gallery's X/clear button the instant Generate is pressed,
+                    # so we no longer need the server-side yield [] to clear.
+                    #
+                    # concurrency_id / concurrency_limit restore the dedicated
+                    # picgen queue the backup used, which track_tqdm streaming
+                    # relies on.
                     trigger(
-                        fn=infer_with_preclear,
+                        fn=infer,
                         inputs=_pic_infer_inputs,
                         js=_pic_infer_js,
                         outputs=[pic_result, pic_seed, picgen_urls],
-                        # Explicit "full" so the per-step progress overlay always
-                        # renders on the output gallery (this is the default, but
-                        # stating it removes any ambiguity).
                         show_progress="full",
+                        concurrency_id=PIC_QUEUE_ID,
+                        concurrency_limit=10,
                     ).then(
                         fn=lambda: __import__('time').sleep(2),
                         inputs=[],
@@ -9160,10 +9184,13 @@ with gr.Blocks(css=css) as demo:
                         inputs=[],
                         outputs=[pic_prompt],
                     ).then(
-                        fn=infer_with_preclear,
+                        fn=infer,
                         inputs=_pic_infer_inputs,
+                        js=_pic_infer_js,
                         outputs=[pic_result, pic_seed, picgen_urls],
                         show_progress="full",
+                        concurrency_id=PIC_QUEUE_ID,
+                        concurrency_limit=10,
                     ).then(
                         fn=lambda: __import__('time').sleep(2),
                         inputs=[],
