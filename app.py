@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import os
 import shutil
 import subprocess
@@ -16,6 +16,7 @@ import json
 import base64
 import hashlib
 import contextlib
+import functools
 import queue as _queue
 import os
 from pathlib import Path
@@ -103,13 +104,32 @@ threading.Thread(target=_selfheal_musetalk_weights, daemon=True).start()
 # ---------------------------------------------------------------------------
 
 
-STARTUP_MODE = "vidgen"
-for _arg in sys.argv[1:]:
-    _flag = _arg.lstrip("-").lower()
-    if _flag == "vidgen":
-        STARTUP_MODE = "vidgen"
-    elif _flag == "picgen":
-        STARTUP_MODE = "picgen"
+def _parse_startup_mode(argv):
+    """Select one explicit app mode without consuming unrelated runtime flags."""
+    modes = {
+        arg.lstrip("-").lower()
+        for arg in argv[1:]
+        if arg.lstrip("-").lower() in {"vidgen", "picgen"}
+    }
+    if len(modes) > 1:
+        raise SystemExit("Choose exactly one startup mode: vidgen or picgen")
+    return next(iter(modes), "vidgen")
+
+
+STARTUP_MODE = _parse_startup_mode(sys.argv)
+
+# One process-wide lock owns model residency, pipeline mutation, inference, RIFE,
+# and CUDA cleanup.  RLock permits helpers to compose without deadlocking.
+_gpu_op_lock = threading.RLock()
+
+
+def _gpu_serialized(fn):
+    """Serialize a complete GPU operation, including activation and cleanup."""
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with _gpu_op_lock:
+            return fn(*args, **kwargs)
+    return wrapped
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -342,7 +362,7 @@ def _self_heal_gradio_version():
                 f"  The app will attempt to continue but may crash due to API mismatches."
             )
         else:
-            print(f"[VersionCheck] gradio {_cur_gradio} ✓")
+            print(f"[VersionCheck] gradio {_cur_gradio} ?")
         # Always reapply file patches — they are idempotent and touch only
         # the gradio/gradio_client source files inside the venv, not packages.
         _self_heal_patch_gradio_oauth()
@@ -384,7 +404,7 @@ def _self_heal_transformers_version():
                 f"  Run setup.sh to rebuild the app venv with the correct versions."
             )
         else:
-            print(f"[VersionCheck] transformers {_cur} ✓")
+            print(f"[VersionCheck] transformers {_cur} ?")
     except Exception as _e:
         print(f"[VersionCheck] transformers version check failed (non-fatal): {_e}")
 
@@ -403,7 +423,7 @@ def _self_heal_torch():
             capture_output=True, text=True,
         )
         if _check.returncode == 0:
-            print(f"[VersionCheck] torch ✓")
+            print(f"[VersionCheck] torch ?")
             return
         raise RuntimeError(
             f"torch sanity check failed: {_check.stderr.strip()[:300]}\n"
@@ -447,7 +467,7 @@ def _self_heal_diffusers_version():
                 f"  Run setup.sh to rebuild the app venv with the correct versions."
             )
         else:
-            print(f"[VersionCheck] diffusers {_cur} ✓")
+            print(f"[VersionCheck] diffusers {_cur} ?")
     except Exception as _e:
         print(f"[VersionCheck] diffusers version check failed (non-fatal): {_e}")
 
@@ -1034,8 +1054,8 @@ def _detect_gpu_profile(device_idx: int = 0) -> dict:
     # Build a TORCH_CUDA_ARCH_LIST that covers common arches up to and
     # including this device, but never exceeds what mmcv's cpp_extension.py
     # knows about (it doesn't recognise sm_120 / Blackwell yet).
-    # RTX 5090  → sm_89  (Ada Lovelace / compute 8.9)
-    # Blackwell → sm_120 (compute 12.0) — excluded from mmcv arch list,
+    # RTX 5090  ? sm_89  (Ada Lovelace / compute 8.9)
+    # Blackwell ? sm_120 (compute 12.0) — excluded from mmcv arch list,
     #             but included separately where PyTorch itself needs it.
     _base_arches = ["8.0", "8.6", "8.9", "9.0"]
     # Cap to arches <= this device's compute capability for the mmcv build,
@@ -1092,12 +1112,34 @@ WAN_QUEUE_ID = "wan-gpu" if DUAL_GPU else "gpu"
 
 device = torch.device(PIC_DEVICE)
 
-rife_model = Model()
-rife_model.load_model("train_log", -1)
-rife_model.eval()
-rife_model.device()
+rife_model = None
 
-rife_model.flownet = rife_model.flownet.float()
+
+def _release_rife():
+    """Drop every RIFE reference so it never competes with a diffusion model."""
+    global rife_model
+    if rife_model is not None:
+        try:
+            rife_model.flownet.to("cpu")
+        except Exception:
+            pass
+        rife_model = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _ensure_rife_loaded():
+    """Load FP32 RIFE lazily; caller must hold _gpu_op_lock."""
+    global rife_model
+    if rife_model is None:
+        model = Model()
+        model.load_model("train_log", -1)
+        model.eval()
+        model.device()
+        model.flownet = model.flownet.float()
+        rife_model = model
+    return rife_model
 
 
 @torch.no_grad()
@@ -1109,64 +1151,73 @@ def interpolate_bits(frames_np, multiplier=2, scale=1.0):
         T, H, W, C = frames_np.shape
 
     if multiplier < 2:
-        if isinstance(frames_np, np.ndarray):
-            return list(frames_np)
-        return frames_np
+        return list(frames_np) if isinstance(frames_np, np.ndarray) else frames_np
 
-    n_interp = multiplier - 1
-    tmp = max(128, int(128 / scale))
-    ph = ((H - 1) // tmp + 1) * tmp
-    pw = ((W - 1) // tmp + 1) * tmp
-    padding = (0, pw - W, 0, ph - H)
+    with _gpu_op_lock:
+        global _active_model
+        # RIFE is mutually exclusive with both diffusion pipelines on one GPU.
+        # Offloading a pipeline for RIFE MUST also invalidate _active_model,
+        # otherwise the next activate_wan()/activate_pic() sees the stale marker,
+        # returns early, and runs inference on a pipeline that is now on CPU.
+        if not DUAL_GPU:
+            # Free whichever diffusion model owns the GPU so RIFE has room.
+            # _disable_offload handles both the offload-hook case and the
+            # full-residency case, and invalidates _active_model so the next
+            # activate_*() genuinely reloads the model onto the GPU.
+            if pic_pipe is not None and _active_model == "pic":
+                _disable_offload(pic_pipe, "pic")
+                _active_model = None
+            if wan_pipe is not None and _active_model == "wan":
+                _disable_offload(wan_pipe, "wan")
+                _active_model = None
+        model = _ensure_rife_loaded()
+        I0 = I1 = mid_tensors = None
+        try:
+            n_interp = multiplier - 1
+            tmp = max(128, int(128 / scale))
+            ph = ((H - 1) // tmp + 1) * tmp
+            pw = ((W - 1) // tmp + 1) * tmp
+            padding = (0, pw - W, 0, ph - H)
 
-    def to_tensor(frame_np):
-        t = torch.from_numpy(frame_np).to(device)
-        if t.dtype != torch.float32:
-            t = t.float()
-        t = t.permute(2, 0, 1).unsqueeze(0)
-        return F.pad(t, padding)
+            def to_tensor(frame_np):
+                t = torch.from_numpy(frame_np).to(device)
+                if t.dtype != torch.float32:
+                    t = t.float()
+                return F.pad(t.permute(2, 0, 1).unsqueeze(0), padding)
 
-    def from_tensor(tensor):
-        t = tensor[0, :, :H, :W]
-        t = t.permute(1, 2, 0)
-        return t.float().cpu().numpy()
+            def from_tensor(tensor):
+                return tensor[0, :, :H, :W].permute(1, 2, 0).float().cpu().numpy()
 
-    def make_inference(I0, I1, n):
-        if rife_model.version >= 3.9:
-            res = []
-            for i in range(n):
-                res.append(rife_model.inference(I0, I1, (i + 1) * 1. / (n + 1), scale))
-            return res
-        else:
-            middle = rife_model.inference(I0, I1, scale)
-            if n == 1:
-                return [middle]
-            first_half = make_inference(I0, middle, n=n // 2)
-            second_half = make_inference(middle, I1, n=n // 2)
-            if n % 2:
-                return [*first_half, middle, *second_half]
-            else:
-                return [*first_half, *second_half]
+            def make_inference(a, b, n):
+                if model.version >= 3.9:
+                    return [model.inference(a, b, (i + 1) / (n + 1), scale) for i in range(n)]
+                middle = model.inference(a, b, scale)
+                if n == 1:
+                    return [middle]
+                first = make_inference(a, middle, n // 2)
+                second = make_inference(middle, b, n // 2)
+                return [*first, middle, *second] if n % 2 else [*first, *second]
 
-    output_frames = []
-    I1 = to_tensor(frames_np[0])
-    total_steps = T - 1
-
-    with tqdm(total=total_steps, desc="Interpolating", unit="frame") as pbar:
-        for i in range(total_steps):
-            I0 = I1
-            output_frames.append(from_tensor(I0))
-            I1 = to_tensor(frames_np[i + 1])
-            mid_tensors = make_inference(I0, I1, n_interp)
-            for mid in mid_tensors:
-                output_frames.append(from_tensor(mid))
-            if (i + 1) % 50 == 0:
-                pbar.update(50)
-        pbar.update(total_steps % 50)
-        output_frames.append(from_tensor(I1))
-
-    del I0, I1, mid_tensors
-    return output_frames
+            output_frames = []
+            I1 = to_tensor(frames_np[0])
+            total_steps = T - 1
+            with tqdm(total=total_steps, desc="Interpolating", unit="frame") as pbar:
+                for i in range(total_steps):
+                    I0 = I1
+                    output_frames.append(from_tensor(I0))
+                    I1 = to_tensor(frames_np[i + 1])
+                    mid_tensors = make_inference(I0, I1, n_interp)
+                    output_frames.extend(from_tensor(mid) for mid in mid_tensors)
+                    if (i + 1) % 50 == 0:
+                        pbar.update(50)
+                pbar.update(total_steps % 50)
+                output_frames.append(from_tensor(I1))
+            return output_frames
+        finally:
+            del I0, I1, mid_tensors
+            _release_rife()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
 
 
@@ -1174,7 +1225,7 @@ def encode_frames_to_bytes(frames: list, fps: int, quality: int = 8) -> bytes:
     """Encode a list of frames (PIL Images or numpy HxWx3 float/uint8) to MP4 in memory.
 
     Returns raw MP4 bytes — nothing is written to disk.
-    `quality` maps to libx264's CRF (1=best, 51=worst; default 8 ≈ high quality).
+    `quality` maps to libx264's CRF (1=best, 51=worst; default 8 ˜ high quality).
     animate_frame() returns numpy float32 arrays in [0,1]; this function handles both.
     """
     import av as _av
@@ -1410,7 +1461,7 @@ def _ensure_audio_engines():
     # site-packages: installing whichever runs second just uninstalls the
     # other's protobuf on disk. Worse, even if that install "worked", the
     # main app process would still have the OLD protobuf module cached in
-    # sys.modules from whatever imported it first at startup � a pip install
+    # sys.modules from whatever imported it first at startup ? a pip install
     # after import never takes effect in the same process. So F5-TTS gets
     # its own venv (like HunyuanVideo-Foley gets its own subprocess/cwd) and
     # is invoked as a subprocess via _run_f5tts(), never imported in-process.
@@ -1686,22 +1737,22 @@ def _run_f5tts(ref_file: str, gen_text: str, out_wav: str, speed: float = 1.0) -
 
     Returns True if out_wav was produced with nonzero size.
     """
-    print(f"[LipSync→F5-TTS] Starting voice generation...")
-    print(f"[LipSync→F5-TTS]   ref_file: {ref_file}")
-    print(f"[LipSync→F5-TTS]   gen_text: {gen_text[:100]}{'...' if len(gen_text) > 100 else ''}")
-    print(f"[LipSync→F5-TTS]   out_wav: {out_wav}")
-    print(f"[LipSync→F5-TTS]   speed: {speed}")
+    print(f"[LipSync?F5-TTS] Starting voice generation...")
+    print(f"[LipSync?F5-TTS]   ref_file: {ref_file}")
+    print(f"[LipSync?F5-TTS]   gen_text: {gen_text[:100]}{'...' if len(gen_text) > 100 else ''}")
+    print(f"[LipSync?F5-TTS]   out_wav: {out_wav}")
+    print(f"[LipSync?F5-TTS]   speed: {speed}")
     
     if not F5_VENV_PY.exists():
-        print(f"[LipSync→F5-TTS] ERROR: F5-TTS venv missing at {F5_VENV_PY}")
+        print(f"[LipSync?F5-TTS] ERROR: F5-TTS venv missing at {F5_VENV_PY}")
         return False
     
     if not os.path.exists(ref_file):
-        print(f"[LipSync→F5-TTS] ERROR: Reference audio file not found: {ref_file}")
+        print(f"[LipSync?F5-TTS] ERROR: Reference audio file not found: {ref_file}")
         return False
     
     ref_size = os.path.getsize(ref_file)
-    print(f"[LipSync→F5-TTS] Reference audio size: {ref_size / 1024:.1f} KB")
+    print(f"[LipSync?F5-TTS] Reference audio size: {ref_size / 1024:.1f} KB")
     
     # Always rewrite the worker script so fixes take effect without a server restart
     F5_INFER_SCRIPT.write_text(_F5_INFER_WORKER_SOURCE)
@@ -1713,55 +1764,55 @@ def _run_f5tts(ref_file: str, gen_text: str, out_wav: str, speed: float = 1.0) -
         json.dump(payload, tf)
         payload_path = tf.name
     
-    print(f"[LipSync→F5-TTS] Payload written to: {payload_path}")
+    print(f"[LipSync?F5-TTS] Payload written to: {payload_path}")
 
     try:
         cmd = [str(F5_VENV_PY), str(F5_INFER_SCRIPT), payload_path]
-        print(f"[LipSync→F5-TTS] Running command: {' '.join(cmd)}")
-        print(f"[LipSync→F5-TTS] Starting inference (timeout: 300s)...")
+        print(f"[LipSync?F5-TTS] Running command: {' '.join(cmd)}")
+        print(f"[LipSync?F5-TTS] Starting inference (timeout: 300s)...")
         
         start_time = time.time()
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         elapsed = time.time() - start_time
         
-        print(f"[LipSync→F5-TTS] Process completed in {elapsed:.1f}s with return code {result.returncode}")
+        print(f"[LipSync?F5-TTS] Process completed in {elapsed:.1f}s with return code {result.returncode}")
         
         if result.stdout.strip():
-            print(f"[LipSync→F5-TTS] STDOUT: {result.stdout[-1000:]}")
+            print(f"[LipSync?F5-TTS] STDOUT: {result.stdout[-1000:]}")
         
         if result.returncode != 0:
-            print(f"[LipSync→F5-TTS] ERROR: Process failed with return code {result.returncode}")
-            print(f"[LipSync→F5-TTS] STDERR: {result.stderr[-2000:]}")
+            print(f"[LipSync?F5-TTS] ERROR: Process failed with return code {result.returncode}")
+            print(f"[LipSync?F5-TTS] STDERR: {result.stderr[-2000:]}")
             return False
         
         if not os.path.exists(out_wav):
-            print(f"[LipSync→F5-TTS] ERROR: Output WAV file was not created: {out_wav}")
+            print(f"[LipSync?F5-TTS] ERROR: Output WAV file was not created: {out_wav}")
             return False
         
         out_size = os.path.getsize(out_wav)
-        print(f"[LipSync→F5-TTS] Output WAV size: {out_size / 1024:.1f} KB")
+        print(f"[LipSync?F5-TTS] Output WAV size: {out_size / 1024:.1f} KB")
         
         if out_size == 0:
-            print(f"[LipSync→F5-TTS] ERROR: Output WAV file is empty")
+            print(f"[LipSync?F5-TTS] ERROR: Output WAV file is empty")
             return False
         
-        print(f"[LipSync→F5-TTS] ✓ SUCCESS - Voice generation complete")
+        print(f"[LipSync?F5-TTS] ? SUCCESS - Voice generation complete")
         return True
         
     except subprocess.TimeoutExpired:
-        print("[LipSync→F5-TTS] ERROR: Process timed out after 300s")
+        print("[LipSync?F5-TTS] ERROR: Process timed out after 300s")
         return False
     except Exception as e:
-        print(f"[LipSync→F5-TTS] ERROR: Exception occurred: {e}")
+        print(f"[LipSync?F5-TTS] ERROR: Exception occurred: {e}")
         import traceback
-        print(f"[LipSync→F5-TTS] Traceback:\n{traceback.format_exc()}")
+        print(f"[LipSync?F5-TTS] Traceback:\n{traceback.format_exc()}")
         return False
     finally:
         try:
             os.unlink(payload_path)
-            print(f"[LipSync→F5-TTS] Cleaned up payload file")
+            print(f"[LipSync?F5-TTS] Cleaned up payload file")
         except Exception as e:
-            print(f"[LipSync→F5-TTS] Failed to cleanup payload (non-fatal): {e}")
+            print(f"[LipSync?F5-TTS] Failed to cleanup payload (non-fatal): {e}")
 
 
 def _run_foley(video_path: str, sfx_prompt: str, output_wav: str) -> bool:
@@ -2090,7 +2141,7 @@ def add_audio_to_video(
 _ensure_audio_engines()
 
 
-# ── MuseTalk (lip-sync post-processor) ───────────────────────────────────────
+# -- MuseTalk (lip-sync post-processor) ---------------------------------------
 # Replaces the old LatentSync integration. Same task (video + audio -> lip
 # synced video), same isolated-venv/subprocess architecture, but MuseTalk's
 # real-time latent-inpainting UNet produces sharper mouth/teeth detail than
@@ -2205,8 +2256,8 @@ def _ensure_musetalk():
                 # happen BEFORE mim install mmcv below, so mim can detect
                 # this venv's torch/CUDA version and fetch a matching wheel.
                 # GPU_TORCH_IDX is set at startup by _detect_gpu_profile():
-                #   sm_120 (Blackwell 6000 Pro) → cu128
-                #   sm_89  (RTX 5090)           → cu130
+                #   sm_120 (Blackwell 6000 Pro) ? cu128
+                #   sm_89  (RTX 5090)           ? cu130
                 print(f"[LipSync] Installing torch into MuseTalk venv "
                       f"(wheel index: {GPU_TORCH_IDX}, GPU: {GPU_NAME}) ...")
                 subprocess.run(
@@ -2322,8 +2373,8 @@ def _ensure_musetalk():
                 # covers arches up to this device's compute capability, but
                 # never exceeds sm_90 — older mmcv sources don't recognise
                 # sm_120 (Blackwell) and raise ValueError during wheel build.
-                # RTX 5090 (sm_89) → "8.0;8.6;8.9"
-                # Blackwell 6000 Pro (sm_120) → "8.0;8.6;8.9;9.0" (capped at 9.0)
+                # RTX 5090 (sm_89) ? "8.0;8.6;8.9"
+                # Blackwell 6000 Pro (sm_120) ? "8.0;8.6;8.9;9.0" (capped at 9.0)
                 "TORCH_CUDA_ARCH_LIST": GPU_SM_STR,
             }
 
@@ -2588,7 +2639,7 @@ def _ensure_musetalk():
 def _run_musetalk(video_path: str, audio_path: str, output_path: str,
                    bbox_shift: int = 0, batch_size: int = 4) -> bool:
     """
-    Run MuseTalk on (video_path + audio_path) → output_path.
+    Run MuseTalk on (video_path + audio_path) ? output_path.
     Returns True on success.
 
     bbox_shift: controls mouth openness (positive = more open). Same
@@ -2601,31 +2652,31 @@ def _run_musetalk(video_path: str, audio_path: str, output_path: str,
     when the first call happens before the background download thread
     finishes — previously the race caused silent fallback to no-lip-sync.
     """
-    print(f"[LipSync→MuseTalk] Called with:")
-    print(f"[LipSync→MuseTalk]   video_path: {video_path}")
-    print(f"[LipSync→MuseTalk]   audio_path: {audio_path}")
-    print(f"[LipSync→MuseTalk]   output_path: {output_path}")
-    print(f"[LipSync→MuseTalk]   bbox_shift: {bbox_shift} (mouth openness)")
-    print(f"[LipSync→MuseTalk]   batch_size: {batch_size}")
+    print(f"[LipSync?MuseTalk] Called with:")
+    print(f"[LipSync?MuseTalk]   video_path: {video_path}")
+    print(f"[LipSync?MuseTalk]   audio_path: {audio_path}")
+    print(f"[LipSync?MuseTalk]   output_path: {output_path}")
+    print(f"[LipSync?MuseTalk]   bbox_shift: {bbox_shift} (mouth openness)")
+    print(f"[LipSync?MuseTalk]   batch_size: {batch_size}")
     
     # Verify input files exist and are not empty
     if not os.path.exists(video_path):
-        print(f"[LipSync→MuseTalk] ERROR: Video file does not exist: {video_path}")
+        print(f"[LipSync?MuseTalk] ERROR: Video file does not exist: {video_path}")
         return False
     if not os.path.exists(audio_path):
-        print(f"[LipSync→MuseTalk] ERROR: Audio file does not exist: {audio_path}")
+        print(f"[LipSync?MuseTalk] ERROR: Audio file does not exist: {audio_path}")
         return False
     
     video_size = os.path.getsize(video_path)
     audio_size = os.path.getsize(audio_path)
-    print(f"[LipSync→MuseTalk] Video size: {video_size / 1024:.1f} KB")
-    print(f"[LipSync→MuseTalk] Audio size: {audio_size / 1024:.1f} KB")
+    print(f"[LipSync?MuseTalk] Video size: {video_size / 1024:.1f} KB")
+    print(f"[LipSync?MuseTalk] Audio size: {audio_size / 1024:.1f} KB")
     
     if video_size == 0:
-        print(f"[LipSync→MuseTalk] ERROR: Video file is empty")
+        print(f"[LipSync?MuseTalk] ERROR: Video file is empty")
         return False
     if audio_size == 0:
-        print(f"[LipSync→MuseTalk] ERROR: Audio file is empty")
+        print(f"[LipSync?MuseTalk] ERROR: Audio file is empty")
         return False
     
     # If MuseTalk isn't ready yet, wait for it (it may still be downloading
@@ -2647,7 +2698,7 @@ def _run_musetalk(video_path: str, audio_path: str, output_path: str,
         print(f"[LipSync] MuseTalk is now ready — proceeding with lip sync.")
 
     if not _ensure_musetalk():
-        print("[LipSync→MuseTalk] MuseTalk not available — skipping lip sync.")
+        print("[LipSync?MuseTalk] MuseTalk not available — skipping lip sync.")
         return False
 
     # --- Vendor correct numpy/diffusers for MuseTalk runtime ---------------
@@ -2684,7 +2735,7 @@ def _run_musetalk(video_path: str, audio_path: str, output_path: str,
             capture_output=True, timeout=120,
         )
 
-    print(f"[LipSync→MuseTalk] Setting up job directory...")
+    print(f"[LipSync?MuseTalk] Setting up job directory...")
     job_dir = Path(SCRIPT_DIR) / "tmp" / f"musetalk_job_{uuid.uuid4().hex}"
     job_dir.mkdir(parents=True, exist_ok=True)
     cfg_path = job_dir / "task.yaml"
@@ -2699,8 +2750,8 @@ def _run_musetalk(video_path: str, audio_path: str, output_path: str,
         f"  audio_path: {os.path.abspath(audio_path)}\n"
     )
     cfg_path.write_text(yaml_content, encoding="utf-8")
-    print(f"[LipSync→MuseTalk] Config written to {cfg_path}:")
-    print(f"[LipSync→MuseTalk] {yaml_content}")
+    print(f"[LipSync?MuseTalk] Config written to {cfg_path}:")
+    print(f"[LipSync?MuseTalk] {yaml_content}")
 
     _start_time = time.time()
 
@@ -2744,82 +2795,82 @@ runpy.run_module("scripts.inference", run_name="__main__")
         "--batch_size", str(batch_size),
     ]
     
-    print(f"[LipSync→MuseTalk] Running MuseTalk command:")
-    print(f"[LipSync→MuseTalk] {' '.join(_base_cmd)}")
-    print(f"[LipSync→MuseTalk] Working directory: {MUSETALK_DIR}")
+    print(f"[LipSync?MuseTalk] Running MuseTalk command:")
+    print(f"[LipSync?MuseTalk] {' '.join(_base_cmd)}")
+    print(f"[LipSync?MuseTalk] Working directory: {MUSETALK_DIR}")
 
     def _invoke(cmd):
-        print(f"[LipSync→MuseTalk] Executing: {' '.join(cmd)}")
+        print(f"[LipSync?MuseTalk] Executing: {' '.join(cmd)}")
         return subprocess.run(
             cmd, cwd=str(MUSETALK_DIR), capture_output=True, text=True, timeout=900,
         )
 
     try:
-        print(f"[LipSync→MuseTalk] Starting MuseTalk inference (timeout: 900s)...")
+        print(f"[LipSync?MuseTalk] Starting MuseTalk inference (timeout: 900s)...")
         result = _invoke(_base_cmd + ["--result_dir", str(result_dir)])
         
         elapsed = time.time() - _start_time
-        print(f"[LipSync→MuseTalk] Process completed in {elapsed:.1f}s with return code {result.returncode}")
+        print(f"[LipSync?MuseTalk] Process completed in {elapsed:.1f}s with return code {result.returncode}")
         
         if result.returncode != 0 and "unrecognized arguments" in (result.stderr or "").lower() \
                 and "result_dir" in (result.stderr or "").lower():
-            print("[LipSync→MuseTalk] This MuseTalk revision doesn't accept --result_dir — retrying without it.")
+            print("[LipSync?MuseTalk] This MuseTalk revision doesn't accept --result_dir — retrying without it.")
             result = _invoke(_base_cmd)
             elapsed = time.time() - _start_time
-            print(f"[LipSync→MuseTalk] Retry completed in {elapsed:.1f}s with return code {result.returncode}")
+            print(f"[LipSync?MuseTalk] Retry completed in {elapsed:.1f}s with return code {result.returncode}")
 
         if result.stdout.strip():
-            print(f"[LipSync→MuseTalk] ===== STDOUT START =====")
+            print(f"[LipSync?MuseTalk] ===== STDOUT START =====")
             print(f"{result.stdout[-3000:]}")
-            print(f"[LipSync→MuseTalk] ===== STDOUT END =====")
+            print(f"[LipSync?MuseTalk] ===== STDOUT END =====")
         if result.returncode != 0:
-            print(f"[LipSync→MuseTalk] ===== STDERR START (return code {result.returncode}) =====")
+            print(f"[LipSync?MuseTalk] ===== STDERR START (return code {result.returncode}) =====")
             print(f"{result.stderr[-2000:]}")
-            print(f"[LipSync→MuseTalk] ===== STDERR END =====")
+            print(f"[LipSync?MuseTalk] ===== STDERR END =====")
             return False
 
         # Find the newest .mp4 produced by this run, searching our dedicated
         # result_dir first, then falling back to the repo's default
         # results/ tree in case this revision ignores --result_dir entirely.
-        print(f"[LipSync→MuseTalk] Searching for output video...")
-        print(f"[LipSync→MuseTalk] Checking result_dir: {result_dir}")
+        print(f"[LipSync?MuseTalk] Searching for output video...")
+        print(f"[LipSync?MuseTalk] Checking result_dir: {result_dir}")
         candidates = list(result_dir.rglob("*.mp4"))
-        print(f"[LipSync→MuseTalk] Found {len(candidates)} .mp4 files in result_dir")
+        print(f"[LipSync?MuseTalk] Found {len(candidates)} .mp4 files in result_dir")
         
         if not candidates:
             default_results = MUSETALK_DIR / "results"
-            print(f"[LipSync→MuseTalk] Checking default results: {default_results}")
+            print(f"[LipSync?MuseTalk] Checking default results: {default_results}")
             if default_results.exists():
                 all_mp4s = list(default_results.rglob("*.mp4"))
                 candidates = [
                     p for p in all_mp4s
                     if p.stat().st_mtime >= _start_time - 1
                 ]
-                print(f"[LipSync→MuseTalk] Found {len(candidates)} recent .mp4 files (out of {len(all_mp4s)} total)")
+                print(f"[LipSync?MuseTalk] Found {len(candidates)} recent .mp4 files (out of {len(all_mp4s)} total)")
         
         if not candidates:
-            print("[LipSync→MuseTalk] ERROR: MuseTalk ran but no output .mp4 was found.")
+            print("[LipSync?MuseTalk] ERROR: MuseTalk ran but no output .mp4 was found.")
             return False
             
         newest = max(candidates, key=lambda p: p.stat().st_mtime)
-        print(f"[LipSync→MuseTalk] Selected output: {newest}")
-        print(f"[LipSync→MuseTalk] Output size: {newest.stat().st_size / 1024:.1f} KB")
+        print(f"[LipSync?MuseTalk] Selected output: {newest}")
+        print(f"[LipSync?MuseTalk] Output size: {newest.stat().st_size / 1024:.1f} KB")
 
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(str(newest), output_path)
-        print(f"[LipSync→MuseTalk] ✓ Copied to final output: {output_path}")
-        print(f"[LipSync→MuseTalk] ✓ SUCCESS - Lip-sync processing complete")
+        print(f"[LipSync?MuseTalk] ? Copied to final output: {output_path}")
+        print(f"[LipSync?MuseTalk] ? SUCCESS - Lip-sync processing complete")
         return True
     except subprocess.TimeoutExpired:
-        print("[LipSync→MuseTalk] ERROR: Process timed out after 900s")
+        print("[LipSync?MuseTalk] ERROR: Process timed out after 900s")
         return False
     except Exception as _e:
-        print(f"[LipSync→MuseTalk] ERROR: Subprocess exception: {_e}")
+        print(f"[LipSync?MuseTalk] ERROR: Subprocess exception: {_e}")
         import traceback
-        print(f"[LipSync→MuseTalk] Traceback:\n{traceback.format_exc()}")
+        print(f"[LipSync?MuseTalk] Traceback:\n{traceback.format_exc()}")
         return False
     finally:
-        print(f"[LipSync→MuseTalk] Cleaning up job directory: {job_dir}")
+        print(f"[LipSync?MuseTalk] Cleaning up job directory: {job_dir}")
         shutil.rmtree(str(job_dir), ignore_errors=True)
 
 
@@ -2886,7 +2937,7 @@ def generate_lip_sync_video(
         print(f"[LipSync] Reference audio path resolved to: {_ref_path}")
         
         if _ref_path and os.path.exists(str(_ref_path)):
-            print(f"[LipSync] ✓ Reference audio file exists")
+            print(f"[LipSync] ? Reference audio file exists")
             print(f"[LipSync] Generating F5-TTS voice WAV for dialogue:")
             print(f"[LipSync]   Full text: {dlg_txt.strip()}")
             print(f"[LipSync]   Text length: {len(dlg_txt.strip())} characters")
@@ -2897,15 +2948,15 @@ def generate_lip_sync_video(
             if ok and Path(_voice_wav_path).exists() and Path(_voice_wav_path).stat().st_size > 0:
                 voice_wav = _voice_wav_path
                 wav_size_kb = Path(voice_wav).stat().st_size // 1024
-                print(f"[LipSync] ✓ F5-TTS voice WAV ready: {wav_size_kb} KB")
-                print(f"[LipSync] ✓ Voice WAV will be used for lip-sync: {voice_wav}")
+                print(f"[LipSync] ? F5-TTS voice WAV ready: {wav_size_kb} KB")
+                print(f"[LipSync] ? Voice WAV will be used for lip-sync: {voice_wav}")
             else:
-                print("[LipSync] ✗ F5-TTS produced no output — will do lip sync without voice WAV.")
+                print("[LipSync] ? F5-TTS produced no output — will do lip sync without voice WAV.")
         else:
-            print(f"[LipSync] ✗ Voice reference path not found or doesn't exist: {_ref_path!r}")
+            print(f"[LipSync] ? Voice reference path not found or doesn't exist: {_ref_path!r}")
             print(f"[LipSync]   Skipping F5-TTS voice generation")
     else:
-        print("[LipSync] ✗ Missing requirements for voice generation:")
+        print("[LipSync] ? Missing requirements for voice generation:")
         if not ref_aud:
             print("[LipSync]   - No voice reference audio provided")
         if not dlg_txt or not dlg_txt.strip():
@@ -2994,7 +3045,7 @@ def generate_lip_sync_video(
         except Exception as e:
             print(f"[LipSync] Failed to clean up WAV (non-fatal): {e}")
 
-    status = "✅ Lip-sync complete." if ls_ok else "⚠️ MuseTalk failed — dialogue voice + Foley mixed without lip sync."
+    status = "? Lip-sync complete." if ls_ok else "?? MuseTalk failed — dialogue voice + Foley mixed without lip sync."
     print(f"[LipSync] COMPLETE: {status}")
     print(f"[LipSync] Output file: {out_path}")
     return out_path, out_path, status
@@ -3171,16 +3222,16 @@ def _wan_flat_key_to_module_path(flat_key: str) -> str | None:  # unused — kep
 
     Wan LoRA files encode the full module path in a flat underscore-separated
     prefix.  For example:
-        lora_unet_blocks_0_self_attn_q   →   blocks.0.self_attn.q
-        lora_unet_blocks_27_ffn_0        →   blocks.27.ffn.0
-        lora_unet_blocks_3_cross_attn_k  →   blocks.3.cross_attn.k
+        lora_unet_blocks_0_self_attn_q   ?   blocks.0.self_attn.q
+        lora_unet_blocks_27_ffn_0        ?   blocks.27.ffn.0
+        lora_unet_blocks_3_cross_attn_k  ?   blocks.3.cross_attn.k
 
     The mapping rules:
       - Strip leading "lora_unet_" (or "lora_" alone if no "unet_").
       - Replace "_blocks_N_" with ".blocks.N." (N is an integer).
       - The remainder maps component names: self_attn, cross_attn, ffn stay as-is
         but use dots; the trailing single-letter (q/k/v/o) stays as-is.
-      - ffn layers: ffn_0 → ffn.0, ffn_2 → ffn.2
+      - ffn layers: ffn_0 ? ffn.0, ffn_2 ? ffn.2
 
     Returns a dotted path string, or None if the key cannot be decoded.
     """
@@ -3733,34 +3784,12 @@ def _build_wan_pipeline(target_device="cpu"):
             use_safetensors=True
         )
 
-        # ---------------------------------------------------------------------------
-        # Adaptive VRAM strategy — decided at load time based on detected VRAM.
-        #
-        # HIGH VRAM (>= 40 GB, e.g. Blackwell 6000 Pro 95 GB):
-        #   Load everything directly onto the GPU. Fastest possible inference.
-        #
-        # LOW VRAM (< 40 GB, e.g. RTX 5090 32 GB):
-        #   The full Wan model in BF16 is ~31 GB. A direct .to(device) leaves
-        #   almost no headroom for activations and the VAE decode, causing OOM
-        #   mid-generation. enable_sequential_cpu_offload() keeps weights in
-        #   CPU RAM and streams each sub-module to GPU on demand — it fits
-        #   comfortably in 32 GB at the cost of ~20-30% slower generation.
-        #   enable_vae_slicing/tiling are also critical here to keep the VAE
-        #   decode from spiking VRAM during the frame decode step.
-        # ---------------------------------------------------------------------------
-        if GPU_HIGH_VRAM:
-            pipeline = pipeline.to(target_device)
-            torch.cuda.synchronize(target_device)
-            print(f" WAMU v2 loaded directly to {target_device} ({GPU_VRAM_GB:.0f} GB VRAM) - Ready!")
-        else:
-            # Sequential CPU offload: each transformer block is moved to GPU
-            # for its forward pass then immediately returned to CPU RAM.
-            # No .to(device) call — offload sets up its own hooks.
-            pipeline.enable_sequential_cpu_offload(gpu_id=int(target_device.split(":")[-1]))
-            print(
-                f" WAMU v2 loaded with sequential CPU offload "
-                f"({GPU_VRAM_GB:.0f} GB VRAM, {GPU_NAME}) - Ready (offload mode)."
-            )
+        # The active pipeline is always fully GPU resident.  Component-wise
+        # movement controls peak allocation without changing BF16 precision or
+        # steady-state execution speed; activation rollback handles failure.
+        _safe_move_to_device(pipeline, target_device)
+        torch.cuda.synchronize(target_device)
+        print(f" WAMU v2 loaded fully on {target_device} ({GPU_VRAM_GB:.0f} GB VRAM) - Ready!")
 
     _wan_scheduler_config = dict(pipeline.scheduler.config)
     pipeline.vae.enable_slicing()
@@ -3802,10 +3831,10 @@ def _ensure_pil(image):
     Normalize a Gradio image value to a PIL Image (or None).
 
     Handles:
-      - None / "" / falsy  → None
-      - /media/<key>/...  → resolve from _media_store, open as PIL
-      - file path string   → Image.open()
-      - PIL Image          → returned as-is
+      - None / "" / falsy  ? None
+      - /media/<key>/...  ? resolve from _media_store, open as PIL
+      - file path string   ? Image.open()
+      - PIL Image          ? returned as-is
     """
     if not image:
         return None
@@ -4005,7 +4034,7 @@ def _complete_body_safe(rgba: Image.Image) -> Image.Image:
       generated alpha bleed into and mangle the visible body.
 
     Returns an RGBA image (trimmed to its bbox). If nothing is clipped, the
-    input is returned untouched (no diffusion call → fast).
+    input is returned untouched (no diffusion call ? fast).
     """
     if rgba is None:
         return rgba
@@ -4229,7 +4258,7 @@ def _complete_body_on_photo(photo: Image.Image) -> Image.Image:
     is used ONLY in the added padding rows.
 
     If the person is not clipped at top/bottom, the photo is returned untouched
-    (no diffusion call → fast).
+    (no diffusion call ? fast).
     """
     if photo is None:
         return photo
@@ -4326,15 +4355,15 @@ def _merge_into_person_photo(
     6. Composite the other person's crop into the filled strip at the correct
        position and height — bottom-aligned to the base person's feet.
 
-    add_side = "right" → base photo on the LEFT,  other person on the RIGHT
-    add_side = "left"  → base photo on the RIGHT, other person on the LEFT
+    add_side = "right" ? base photo on the LEFT,  other person on the RIGHT
+    add_side = "left"  ? base photo on the RIGHT, other person on the LEFT
     """
-    # ── Constants ──────────────────────────────────────────────────────────────
+    # -- Constants --------------------------------------------------------------
     OUT_H = 720          # fixed output height
     PADDING_FACTOR = 1.25  # 25 % extra space so the other person isn't crammed
     MARGIN_PX = 24       # minimum extra pixels on each side of the pasted person
 
-    # ── Step 1: scale base photo to output height ──────────────────────────────
+    # -- Step 1: scale base photo to output height ------------------------------
     base_rgb = base_photo.convert("RGB")
     base_scale = OUT_H / base_rgb.height
     base_w = max(1, int(base_rgb.width  * base_scale))
@@ -4342,7 +4371,7 @@ def _merge_into_person_photo(
     base_fit = base_rgb.resize((base_w, base_h), Image.LANCZOS)
     print(f"[merge] base photo scaled to {base_w}×{base_h}")
 
-    # ── Step 2: body-complete + scale other person to match base height ────────
+    # -- Step 2: body-complete + scale other person to match base height --------
     # Target: the other person should appear roughly the same height as the base
     # person (who fills the full OUT_H).  We scale the other person so their
     # body height equals OUT_H * 0.92 (slightly shorter so the composition feels
@@ -4365,12 +4394,12 @@ def _merge_into_person_photo(
     other_scaled.putalpha(Image.fromarray(other_alpha_arr, "L"))
     print(f"[merge] other person scaled to {other_w}×{other_h} (target h={other_target_h})")
 
-    # ── Step 3: compute strip width and total canvas width ────────────────────
+    # -- Step 3: compute strip width and total canvas width --------------------
     strip_w = max(MARGIN_PX * 2 + other_w, int(other_w * PADDING_FACTOR))
     OUT_W   = base_w + strip_w
     print(f"[merge] strip_w={strip_w}, total canvas={OUT_W}×{OUT_H}")
 
-    # ── Step 4: build the canvas — base photo on the anchored side, white strip ─
+    # -- Step 4: build the canvas — base photo on the anchored side, white strip -
     canvas = Image.new("RGB", (OUT_W, OUT_H), (255, 255, 255))
     if add_side == "right":
         base_x = 0
@@ -4378,7 +4407,7 @@ def _merge_into_person_photo(
         base_x = strip_w
     canvas.paste(base_fit, (base_x, 0))
 
-    # ── Step 5: gender preservation clause ────────────────────────────────────
+    # -- Step 5: gender preservation clause ------------------------------------
     _gender_notes = []
     if gender_base and gender_base.lower() == "man":
         _gender_notes.append("the man's penis remains the same in every way, completely unchanged and still fully visible")
@@ -4386,7 +4415,7 @@ def _merge_into_person_photo(
         _gender_notes.append("the man's penis remains the same in every way, completely unchanged and still fully visible")
     _gender_clause = (". " + "; ".join(_gender_notes)) if _gender_notes else ""
 
-    # ── Step 6: Qwen outpaint — fill the white strip to match the background ──
+    # -- Step 6: Qwen outpaint — fill the white strip to match the background --
     extend_dir = "to the right" if add_side == "right" else "to the left"
     outpaint_instruction = (
         f"Extend and continue this photo's background and environment {extend_dir} "
@@ -4422,16 +4451,16 @@ def _merge_into_person_photo(
         print(f"[merge] outpaint failed ({e}); using plain canvas")
         extended_bg = canvas.copy()
 
-    # ── Step 7: hard-restore the EXACT original base photo pixels ─────────────
+    # -- Step 7: hard-restore the EXACT original base photo pixels -------------
     # The outpaint must not alter anything already in the photo.  Re-paste the
     # exact scaled base photo over its region so nothing changes there.
     final = extended_bg.copy()
     final.paste(base_fit, (base_x, 0))
 
-    # ── Step 8: composite the other person into the strip ─────────────────────
+    # -- Step 8: composite the other person into the strip ---------------------
     # Position: horizontally centred in the strip, vertically bottom-aligned
     # to the base person's feet (both people share the same floor line).
-    base_baseline = OUT_H   # base person fills full height → feet at bottom
+    base_baseline = OUT_H   # base person fills full height ? feet at bottom
 
     if add_side == "right":
         strip_left = base_w
@@ -4652,6 +4681,7 @@ def _cache_resized(image, resolution, resized):
         cache[key] = resized
 
 
+@_gpu_serialized
 def edit_reference_frame(
     image: Image.Image,
     mode: str,
@@ -4700,6 +4730,7 @@ def edit_reference_frame(
     return edited
 
 
+@_gpu_serialized
 def animate_frame(
     frame: Image.Image,
     last_frame,
@@ -5303,17 +5334,25 @@ def generate_video(
         _generation_release(_end_image_protect_path)
 
         # Store video bytes in RAM under a dedicated "vidgen_player_" prefix so
-        # the player can stream from memory immediately. This prefix is NOT wiped
-        # by _do_clear_storage (which only releases "vidgen_", "vidgen_sequence_",
-        # etc.) so the video stays playable even after the tmp file is deleted and
-        # even after auto-clear fires. The key is held in _current_player_media_key
-        # and released on the next generation start or explicit Clear Storage.
+        # the player streams from memory immediately and keeps playing even
+        # after the tmp file is deleted post-download. This prefix is NOT wiped
+        # by _do_clear_storage. The /media/ route serves it encrypted over HTTPS
+        # (secure context) and PLAIN over HTTP (insecure context, where
+        # crypto.subtle is unavailable) — the client interceptor detects which
+        # and handles both, so the player works on HTTP and HTTPS alike.
         global _current_player_media_key
         player_filename = filename.replace("vidgen_", "vidgen_player_", 1)
         player_url = _media_store_put(final_buf, player_filename)
-        _current_player_media_key = player_url.split("/")[2]  # extract key from /media/{key}/{filename}
+        _current_player_media_key = player_url.split("/")[2]
 
-        yield player_url, filepath, gr.update(visible=False, value="")
+        # Player and download BOTH use the plain tmp filepath, served by
+        # Gradio's built-in /file= route (filepath is in allowed_paths). This
+        # works over HTTP and HTTPS with no dependency on crypto.subtle / the
+        # encrypted /media/ route (which 403'd over plain HTTP and was the cause
+        # of the player showing nothing). The browser buffers the small MP4 on
+        # load, so the post-download tmp cleanup (~30s later) does not interrupt
+        # playback of the already-loaded video.
+        yield filepath, filepath, gr.update(visible=False, value="")
 
     except gr.Error:
         _generation_release(_current_input_image_path)
@@ -5878,6 +5917,372 @@ PICGEN_MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 BASE_MODEL_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "Qwen-Image-Edit-2511")
 NSFW_WEIGHTS_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "rapid-aio", "v23", "Qwen-Rapid-AIO-NSFW-v23.safetensors")
 
+# ---------------------------------------------------------------------------
+# OOM-safe pipeline move helpers
+#
+# Moving a 16-18 GB transformer to GPU in one shot while the CUDA caching
+# allocator still holds fragmented pages from the NSFW weight merge causes
+# OOM on 32 GB cards (RTX 5090).  Moving one component at a time with a
+# full GC + empty_cache + synchronize between each component keeps the peak
+# allocation at one component at a time, eliminating the spike.
+#
+# These helpers are used at startup (picgen mode) AND during every
+# activate_pic() / activate_wan() swap so the swap path is equally safe.
+# ---------------------------------------------------------------------------
+def _safe_move_to_device(pipe, target_device):
+    """Move a pipeline to target_device one component at a time.
+
+    Each component move is followed by gc.collect() + empty_cache() +
+    synchronize() so the CUDA caching allocator never sees a spike larger
+    than the single largest component.  This prevents OOM on 32 GB cards
+    (RTX 5090) where the transformer alone is ~16-18 GB and leftover
+    allocator fragmentation can push the peak over the limit.
+    """
+    components = []
+    if hasattr(pipe, 'transformer'):
+        components.append(('transformer', pipe.transformer))
+    if hasattr(pipe, 'text_encoder'):
+        components.append(('text_encoder', pipe.text_encoder))
+    if hasattr(pipe, 'vae'):
+        components.append(('vae', pipe.vae))
+    # Any additional sub-models (transformer_2, image_encoder, etc.)
+    for attr in ('transformer_2', 'image_encoder', 'image_projection'):
+        if hasattr(pipe, attr) and getattr(pipe, attr) is not None:
+            components.append((attr, getattr(pipe, attr)))
+
+    for name, component in components:
+        # Preflight admission: before moving a component to GPU, verify the
+        # device has enough free VRAM for its parameter+buffer bytes plus a
+        # safety headroom for the transfer, activations, and allocator
+        # fragmentation. Raising here (BEFORE the .to() call) turns an
+        # unavoidable low-level torch.OutOfMemoryError deep inside the move
+        # into a deterministic, actionable error while the previous pipeline
+        # can still be rolled back by the caller (_activate_model).
+        if target_device != "cpu":
+            try:
+                comp_bytes = 0
+                for p in component.parameters():
+                    comp_bytes += p.numel() * p.element_size()
+                for b in component.buffers():
+                    comp_bytes += b.numel() * b.element_size()
+            except Exception:
+                comp_bytes = 0
+            # Headroom: transfer needs the source copy briefly resident too,
+            # plus activation/workspace + allocator slack. 1.5x the component
+            # plus a 1 GB floor is a conservative, quality-neutral guard.
+            required = int(comp_bytes * 1.5) + (1024 ** 3)
+            try:
+                free_bytes = torch.cuda.mem_get_info()[0]
+            except Exception:
+                free_bytes = None
+            if free_bytes is not None and free_bytes < required:
+                raise torch.cuda.OutOfMemoryError(
+                    f"Insufficient VRAM on {target_device} to move '{name}': "
+                    f"need ~{required / 1024**3:.1f} GB "
+                    f"(component ~{comp_bytes / 1024**3:.1f} GB + headroom), "
+                    f"only {free_bytes / 1024**3:.1f} GB free. "
+                    f"Aborting move before OOM so the previous model can be restored."
+                )
+        print(f"    [{target_device}] moving {name}...")
+        component.to(target_device)
+        gc.collect()
+        torch.cuda.empty_cache()
+        if target_device != "cpu":
+            torch.cuda.synchronize()
+            free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+            print(f"    [{target_device}] {name} moved — {free_gb:.1f} GB free")
+
+
+def _safe_offload_to_cpu(pipe, label="pipeline"):
+    """Move a pipeline to CPU and fully reclaim VRAM."""
+    print(f"    Offloading {label} to CPU...")
+    pipe.to("cpu")
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+    print(f"    {label} offloaded — {free_gb:.1f} GB VRAM free")
+
+
+# ---------------------------------------------------------------------------
+# fp8 transformer materialization
+#
+# The Qwen-Image-Edit-2511 transformer is ~38 GB in bf16 — it does NOT fit on
+# a 32 GB card (RTX 5090).  But the NSFW checkpoint that is merged into it
+# (Qwen-Rapid-AIO-NSFW-v23) stores the transformer weights in fp8 (F8_E4M3):
+# that is the model author's intended runtime precision, and at fp8 the
+# transformer is ~19 GB — which fits with room for activations.
+#
+# The load path copies the fp8 checkpoint values into the bf16 module, which
+# keeps the module bf16-sized (38 GB) and causes the OOM.  Casting the
+# transformer's Linear weights to float8_e4m3fn AFTER the merge drops resident
+# size to ~19 GB.  This is NOT a quality reduction — it is the precision the
+# NSFW weights were trained/quantized at.  VAE and text encoder stay bf16
+# (small, and need bf16 for numerical stability).
+#
+# Guarded by NEWGEN_QWEN_FP8 (default "1"); set to "0" to keep bf16 on cards
+# that have >=40 GB (e.g. the Blackwell 6000 Pro), where full bf16 fits and is
+# marginally faster.
+# ---------------------------------------------------------------------------
+_QWEN_FP8_ENABLED = os.environ.get("NEWGEN_QWEN_FP8", "1") == "1"
+
+
+def _cast_transformer_to_fp8(pipe):
+    """Cast the transformer's large Linear weights to float8_e4m3fn.
+
+    Only weights (2D Linear params) are cast; biases, norms, and non-Linear
+    params stay bf16 so the module remains numerically stable. Returns the
+    resident byte size after the cast for logging. Safe no-op if fp8 is
+    unavailable or disabled.
+    """
+    if not _QWEN_FP8_ENABLED:
+        return None
+    if not hasattr(torch, "float8_e4m3fn"):
+        print("    [fp8] torch has no float8_e4m3fn — keeping bf16 (may not fit <40 GB cards).")
+        return None
+    fp8 = torch.float8_e4m3fn
+    transformer = getattr(pipe, "transformer", None)
+    if transformer is None:
+        return None
+    cast_count = 0
+    for module in transformer.modules():
+        w = getattr(module, "weight", None)
+        # Only cast 2D Linear-style weight matrices — the bulk of the size.
+        if isinstance(module, torch.nn.Linear) and w is not None and w.dim() == 2:
+            if w.dtype != fp8:
+                module.weight = torch.nn.Parameter(
+                    w.data.to(fp8), requires_grad=False
+                )
+                cast_count += 1
+    gc.collect()
+    nbytes = 0
+    for p in transformer.parameters():
+        nbytes += p.numel() * p.element_size()
+    for b in transformer.buffers():
+        nbytes += b.numel() * b.element_size()
+    print(f"    [fp8] cast {cast_count} Linear weights to float8_e4m3fn — "
+          f"transformer now ~{nbytes / 1024**3:.1f} GB resident")
+    return nbytes
+
+
+# ---------------------------------------------------------------------------
+# TEMPORARY VRAM PROBE  (enable with NEWGEN_VRAM_PROBE=1)
+#
+# Reports the exact resident byte size of every pipeline component WITHOUT
+# moving anything to the GPU, so it can never OOM. For each component it prints:
+#   - the component's own size (params + buffers), by dtype
+#   - the running cumulative total if all components so far were co-resident
+# Then it prints the card's total VRAM and a verdict on what fits.
+#
+# This is a diagnostic aid — it does not change how the app loads models.
+# Remove the probe block (and this helper) once sizing is understood.
+# ---------------------------------------------------------------------------
+def _probe_pipeline_vram(pipe, label="pipeline", exit_after=True):
+    """Print exact per-component + cumulative sizes; optionally exit."""
+    def _bytes_and_dtypes(module):
+        total = 0
+        dtypes = {}
+        for p in module.parameters():
+            n = p.numel() * p.element_size()
+            total += n
+            k = str(p.dtype)
+            dtypes[k] = dtypes.get(k, 0) + n
+        for b in module.buffers():
+            n = b.numel() * b.element_size()
+            total += n
+            k = str(b.dtype)
+            dtypes[k] = dtypes.get(k, 0) + n
+        return total, dtypes
+
+    order = []
+    for attr in ("transformer", "transformer_2", "text_encoder",
+                 "text_encoder_2", "vae", "image_encoder", "image_projection"):
+        comp = getattr(pipe, attr, None)
+        if comp is not None and hasattr(comp, "parameters"):
+            order.append((attr, comp))
+
+    try:
+        total_vram = torch.cuda.get_device_properties(0).total_memory
+    except Exception:
+        total_vram = 0
+
+    print("=" * 70)
+    print(f"[VRAM PROBE] {label} — measured resident sizes (no GPU load):")
+    print("=" * 70)
+    cumulative = 0
+    for name, comp in order:
+        nbytes, dtypes = _bytes_and_dtypes(comp)
+        cumulative += nbytes
+        dt_str = ", ".join(f"{k.replace('torch.','')}: {v/1024**3:.2f}GB"
+                            for k, v in sorted(dtypes.items()))
+        print(f"  {name:16s} = {nbytes/1024**3:7.2f} GB   [{dt_str}]")
+        print(f"  {'':16s}   cumulative if co-resident: {cumulative/1024**3:7.2f} GB")
+    print("-" * 70)
+    print(f"  ALL COMPONENTS CO-RESIDENT: {cumulative/1024**3:.2f} GB")
+    if total_vram:
+        print(f"  CARD TOTAL VRAM:            {total_vram/1024**3:.2f} GB")
+        headroom = (total_vram - cumulative) / 1024**3
+        if headroom >= 4:
+            print(f"  VERDICT: fits fully resident with {headroom:.1f} GB free for activations.")
+        elif headroom >= 0:
+            print(f"  VERDICT: barely fits ({headroom:.1f} GB free) — likely OOM under activations.")
+        else:
+            print(f"  VERDICT: does NOT fit fully resident (short by {-headroom:.1f} GB). "
+                  f"Needs per-component offload; largest single component must fit alone.")
+        # Largest single component (the minimum peak for offload-based execution)
+        if order:
+            biggest = max(order, key=lambda x: _bytes_and_dtypes(x[1])[0])
+            bname, bcomp = biggest
+            bbytes = _bytes_and_dtypes(bcomp)[0]
+            print(f"  Largest single component: {bname} = {bbytes/1024**3:.2f} GB "
+                  f"({'fits alone' if bbytes < total_vram else 'too big even alone'}).")
+    print("=" * 70)
+    if exit_after:
+        print("[VRAM PROBE] exit_after=True — stopping before any GPU load. "
+              "Set NEWGEN_VRAM_PROBE=0 to run normally.")
+        os._exit(0)
+
+
+_VRAM_PROBE = os.environ.get("NEWGEN_VRAM_PROBE", "0") == "1"
+
+
+# ---------------------------------------------------------------------------
+# model-CPU-offload management (shared by picgen AND vidgen)
+#
+# Measured on the RTX 5090 (31.4 GB usable):
+#   Qwen picgen fully resident = 34.7 GB  -> does NOT fit
+#   Wan vidgen  fully resident > 32 GB    -> does NOT fit (transformer 26.7 GB
+#                                            + transformer_2 + VAE + text enc)
+#
+# diffusers' enable_model_cpu_offload() keeps every component on CPU and moves
+# each to GPU ONLY while it executes, then back. Peak VRAM = the largest single
+# component + activations, not the co-resident total. Crucially, the active
+# denoising transformer stays resident for the WHOLE denoise loop, so there is
+# no per-step transfer penalty — steady-state speed is unchanged. Precision is
+# unchanged (fp8 transformer for Qwen, bf16 elsewhere), so no quality/prompt
+# adherence loss.
+#
+# On a >=40 GB card (Blackwell 6000 Pro, etc.) everything fits, so we skip
+# offload entirely and keep the pipeline FULLY resident for maximum speed.
+#
+# _offload_state[label] records whether hooks are installed for that pipeline
+# so we can cleanly tear them down before the OTHER model takes the GPU.
+# ---------------------------------------------------------------------------
+_offload_state = {"pic": False, "wan": False}
+FULL_RESIDENCY_VRAM_GB = 40.0   # cards >= this hold everything; below use offload
+
+
+def _device_total_vram_gb(dev):
+    try:
+        idx = torch.device(dev).index or 0
+        return torch.cuda.get_device_properties(idx).total_memory / 1024**3
+    except Exception:
+        return 0.0
+
+
+def _enable_offload(pipe, device, label):
+    """Place a pipeline on GPU: full residency on big cards, else model-CPU-offload.
+
+    label is 'pic' or 'wan'. Returns nothing; records state in _offload_state.
+    """
+    total_vram = _device_total_vram_gb(device)
+    # Big card: keep everything resident, fastest path, no hooks.
+    if total_vram >= FULL_RESIDENCY_VRAM_GB:
+        _safe_move_to_device(pipe, device)
+        _offload_state[label] = False
+        print(f"    [{label}] full residency on {device} (card {total_vram:.0f} GB).")
+        return
+    # Small card: stream components on demand.
+    try:
+        pipe.to("cpu")
+    except Exception:
+        pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Choose the offload granularity per model:
+    #
+    # picgen (Qwen): model-CPU-offload. Its largest component (fp8 transformer,
+    #   ~19 GB) plus its image-edit activations fit in 32 GB, so whole-component
+    #   offload is enough and keeps the transformer resident for the full
+    #   denoise loop (fast, no per-step penalty).
+    #
+    # vidgen (Wan): SEQUENTIAL CPU offload. Wan's transformer alone is ~26.7 GB
+    #   and video activations (dozens of frames) push a whole-transformer
+    #   residency over 32 GB — that is the OOM we hit inside the FFN GELU.
+    #   Sequential offload streams the transformer BLOCK BY BLOCK, so only one
+    #   block (a few hundred MB) is resident at a time, leaving ample room for
+    #   activations. It is slower per step than model-offload, but it is the
+    #   only way Wan's dual-expert transformer fits on a 32 GB card without
+    #   reducing frames/resolution/steps (i.e. no quality or adherence loss).
+    #   On >=40 GB cards this branch is never reached (full residency above).
+    if label == "wan" and hasattr(pipe, "enable_sequential_cpu_offload"):
+        pipe.enable_sequential_cpu_offload(device=device)
+        _offload_state[label] = True
+        print(f"    [{label}] SEQUENTIAL CPU offload enabled on {device} "
+              f"(card {total_vram:.0f} GB — transformer streams block-by-block "
+              f"to fit video activations).")
+        return
+
+    pipe.enable_model_cpu_offload(device=device)
+    _offload_state[label] = True
+    print(f"    [{label}] model-CPU-offload enabled on {device} "
+          f"(card {total_vram:.0f} GB — components stream on demand).")
+
+
+def _disable_offload(pipe, label):
+    """Remove model-CPU-offload hooks (if any) and return the pipeline to CPU.
+
+    Must run before the other model takes the GPU, so stale hooks can't fire.
+    """
+    if not _offload_state.get(label):
+        # No hooks installed (big card / full residency) — plain CPU move.
+        _safe_offload_to_cpu(pipe, label.title())
+        return
+    try:
+        from accelerate.hooks import remove_hook_from_module
+        for attr in ("transformer", "transformer_2", "text_encoder",
+                     "text_encoder_2", "vae", "image_encoder"):
+            comp = getattr(pipe, attr, None)
+            if comp is not None and hasattr(comp, "parameters"):
+                try:
+                    remove_hook_from_module(comp, recurse=True)
+                except Exception:
+                    pass
+    except Exception as exc:
+        print(f"    [{label}] hook removal fallback ({exc})")
+    for _attr in ("_all_hooks", "_offload_gpu_id", "_offload_device"):
+        if hasattr(pipe, _attr):
+            try:
+                setattr(pipe, _attr, [] if _attr == "_all_hooks" else None)
+            except Exception:
+                pass
+    try:
+        pipe.to("cpu")
+    except Exception:
+        pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    _offload_state[label] = False
+    print(f"    [{label}] model-CPU-offload disabled — pipeline returned to CPU.")
+
+
+# Backwards-compatible thin wrappers used by the picgen startup path.
+def _enable_pic_offload(pipe, device=None):
+    _enable_offload(pipe, device or PIC_DEVICE, "pic")
+
+
+def _disable_pic_offload(pipe):
+    _disable_offload(pipe, "pic")
+
+
+# Kept for any lingering references to the old flag name.
+_pic_offload_enabled = False
+
+
 if DUAL_GPU:
     print(f" DUAL GPU: Loading Wan -> {WAN_DEVICE} and Qwen -> {PIC_DEVICE} simultaneously...")
     
@@ -5885,7 +6290,11 @@ if DUAL_GPU:
         global wan_pipe_primary
         t = time.time()
         torch.cuda.set_device(WAN_DEVICE)
-        wan_pipe_primary = _load_wan(WAN_DEVICE)
+        # Load to CPU then place via shared offload logic: full residency on
+        # a big dedicated card, model-CPU-offload if WAN_DEVICE is a 32 GB card
+        # (Wan's dual experts exceed 32 GB fully resident).
+        wan_pipe_primary = _load_wan("cpu")
+        _enable_offload(wan_pipe_primary, WAN_DEVICE, "wan")
         print(f" WAN ready on {WAN_DEVICE} in {time.time()-t:.1f}s")
     
     def _load_qwen_thread():
@@ -5945,6 +6354,10 @@ if DUAL_GPU:
         if text_encoder_weights:
             pipe.text_encoder.load_state_dict(text_encoder_weights, strict=False)
         del state_dict, transformer_weights, vae_weights, text_encoder_weights
+        gc.collect()
+        # Cast transformer to fp8 (checkpoint's native precision) so it is
+        # ~19 GB resident instead of ~38 GB bf16 and fits on a 32 GB card.
+        _cast_transformer_to_fp8(pipe)
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
         pipe.to(PIC_DEVICE)
@@ -5961,13 +6374,18 @@ if DUAL_GPU:
     print(f" DUAL GPU READY  Vidgen on {WAN_DEVICE}, Picgen on {PIC_DEVICE}")
 
 elif STARTUP_MODE == "vidgen":
-    print(" VIDGEN DEFAULT: Loading Wan to GPU first for immediate use...")
+    print(" VIDGEN DEFAULT: Loading Wan for immediate use...")
     start_primary = time.time()
-    
-    wan_pipe_primary = _load_wan(WAN_DEVICE)
+
+    # Load to CPU first, then place on GPU via the shared offload logic:
+    # full residency on >=40 GB cards, model-CPU-offload on the 32 GB 5090
+    # (Wan fully resident exceeds 32 GB). This keeps vidgen working on the
+    # 5090 while staying fully resident + fast on big cards.
+    wan_pipe_primary = _load_wan("cpu")
+    _enable_offload(wan_pipe_primary, WAN_DEVICE, "wan")
     _active_model = "wan"
     primary_load_time = time.time() - start_primary
-    print(f" WAN READY ON GPU in {primary_load_time:.1f}s - Vidgen functional!")
+    print(f" WAN READY in {primary_load_time:.1f}s - Vidgen functional!")
     
     pic_pipe = None
     def _bg_qwen_load():
@@ -6033,6 +6451,12 @@ elif STARTUP_MODE == "vidgen":
                 pipe.text_encoder.load_state_dict(text_encoder_weights, strict=False)
 
             del state_dict, transformer_weights, vae_weights, text_encoder_weights
+            gc.collect()
+
+            # Cast transformer to fp8 while still on CPU so the later GPU swap
+            # moves ~19 GB, not ~38 GB, and fits on a 32 GB card.
+            _cast_transformer_to_fp8(pipe)
+            gc.collect()
 
             pipe.vae.enable_tiling()
             pipe.vae.enable_slicing()
@@ -6112,20 +6536,40 @@ else:
         pic_pipe.text_encoder.load_state_dict(text_encoder_weights, strict=False)
 
     del state_dict, transformer_weights, vae_weights, text_encoder_weights
+    # Full reclaim: Python GC + CUDA allocator flush + sync before the large move.
+    gc.collect()
     torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    # Cast transformer to fp8 (checkpoint's native precision) so it is ~19 GB
+    # resident instead of ~38 GB bf16 — this is what makes it fit on the 32 GB
+    # RTX 5090. VAE / text encoder stay bf16.
+    _cast_transformer_to_fp8(pic_pipe)
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
 
     pic_pipe.vae.enable_tiling()
     pic_pipe.vae.enable_slicing()
 
-    pic_pipe.transformer.to(PIC_DEVICE)
-    pic_pipe.text_encoder.to(PIC_DEVICE) 
-    pic_pipe.vae.to(PIC_DEVICE)
-    
+    # TEMPORARY: measure exact per-component VRAM needs without loading to GPU.
+    if _VRAM_PROBE:
+        _probe_pipeline_vram(pic_pipe, label="Qwen picgen pipeline", exit_after=True)
+
+    # Measured sizes: transformer 19.0 GB (fp8) + text_encoder 15.5 GB (bf16)
+    # + vae 0.24 GB = 34.7 GB co-resident, which does NOT fit the 32 GB card.
+    # So picgen uses diffusers model-CPU-offload: each component is moved to
+    # GPU only while it runs, then back to CPU. The transformer stays resident
+    # for the entire denoise loop (peak ~19 GB + activations, fits with ~12 GB
+    # to spare), and the 15.5 GB text encoder only occupies GPU during the
+    # one-time prompt encode. No precision change, no per-step penalty.
+    _enable_pic_offload(pic_pipe)
+
     qwen_time = time.time() - start_qwen
-    print(f" QWEN READY ON GPU in {qwen_time:.1f}s - Picgen functional!")
+    print(f" QWEN READY (model-CPU-offload) in {qwen_time:.1f}s - Picgen functional!")
     _active_model = "pic"
 
-_swap_lock = threading.Lock()
+_swap_lock = _gpu_op_lock
 
 
 def _concurrent_component_load(component_loader_fn, device, component_name):
@@ -6202,78 +6646,76 @@ def _aggressive_pipeline_load(repo_id, device, pipeline_name):
     return pipeline
 
 
-def activate_wan():
-    """Ensure Wan is on WAN_DEVICE and ready."""
+def _activate_model(target):
+    """Transactionally establish exclusive single-GPU residency."""
     global _active_model
-
-    if DUAL_GPU:
-        if not _wan_loaded or wan_pipe is None:
-            _load_wan(WAN_DEVICE)
-        return
-
-    if _active_model == "wan":
-        return
-
-    print(" Fast swap to Wan...")
-    start_time = time.time()
-
-    with _swap_lock:
-        if _active_model == "wan":
+    target_device = WAN_DEVICE if target == "wan" else PIC_DEVICE
+    with _gpu_op_lock:
+        if DUAL_GPU:
+            if target == "wan" and (not _wan_loaded or wan_pipe is None):
+                _load_wan("cpu")
+                _enable_offload(wan_pipe, target_device, "wan")
+            if target == "pic" and pic_pipe is None:
+                raise RuntimeError("Qwen pipeline is not loaded")
             return
+        if _active_model == target:
+            return
+        previous = _active_model
+        previous_pipe = wan_pipe if previous == "wan" else pic_pipe if previous == "pic" else None
+        target_pipe = wan_pipe if target == "wan" else pic_pipe
+        if target == "wan" and target_pipe is None:
+            target_pipe = _load_wan("cpu")
+        if target == "pic" and target_pipe is None:
+            raise RuntimeError("Qwen pipeline has not finished loading")
+        def _place_on_gpu(model_name, pipe):
+            # Both picgen and vidgen use model-CPU-offload on cards that can't
+            # hold the whole pipeline (RTX 5090). On >=40 GB cards _enable_offload
+            # falls back to full residency automatically, so big cards keep
+            # everything resident and fast. Either way, only one model occupies
+            # the GPU at a time.
+            dev = PIC_DEVICE if model_name == "pic" else WAN_DEVICE
+            _enable_offload(pipe, dev, model_name)
 
-        if _active_model == "pic" and pic_pipe is not None:
-            pic_pipe.to("cpu")
+        def _take_off_gpu(model_name, pipe):
+            _disable_offload(pipe, model_name)
 
-        torch.cuda.empty_cache()
+        _active_model = "transitioning"
+        try:
+            _release_rife()
+            if previous_pipe is not None:
+                _take_off_gpu(previous, previous_pipe)
+            _place_on_gpu(target, target_pipe)
+            _active_model = target
+        except Exception:
+            try:
+                _take_off_gpu(target, target_pipe)
+            except Exception:
+                pass
+            if previous_pipe is not None:
+                try:
+                    _place_on_gpu(previous, previous_pipe)
+                    _active_model = previous
+                except Exception:
+                    _active_model = None
+            else:
+                _active_model = None
+            raise
 
-        if _wan_loaded and wan_pipe is not None:
-            wan_pipe.to(WAN_DEVICE)
-        else:
-            _load_wan(WAN_DEVICE)
 
-        _active_model = "wan"
-        swap_time = time.time() - start_time
-        print(f" Wan active in {swap_time:.1f}s")
+def activate_wan():
+    """Ensure Wan alone is fully resident and ready."""
+    started = time.time()
+    _activate_model("wan")
+    if time.time() - started > 3:
+        print(f" Wan active in {time.time() - started:.1f}s")
 
 
 def activate_pic():
-    """Ensure Qwen is on PIC_DEVICE and ready."""
-    global _active_model
-
-    if DUAL_GPU:
-        if pic_pipe is None:
-            raise RuntimeError("Qwen pipeline not loaded  dual GPU startup failed.")
-        return
-
-    if _active_model == "pic":
-        return
-
-    if pic_pipe is None:
-        print("Waiting for Qwen to finish loading in background...")
-        wait_start = time.time()
-        while pic_pipe is None:
-            time.sleep(0.5)
-            if time.time() - wait_start > 120:
-                raise RuntimeError("Qwen failed to load within 120 seconds")
-        print(f" Qwen background load complete, proceeding with swap")
-
-    print(" Fast swap to Qwen...")
-    start_time = time.time()
-
-    with _swap_lock:
-        if _active_model == "pic":
-            return
-
-        if _active_model == "wan" and _wan_loaded and wan_pipe is not None:
-            wan_pipe.to("cpu")
-
-        torch.cuda.empty_cache()
-
-        pic_pipe.to(PIC_DEVICE)
-
-        _active_model = "pic"
-        swap_time = time.time() - start_time
-        print(f" Qwen active in {swap_time:.1f}s")
+    """Ensure Qwen alone is fully resident and ready."""
+    started = time.time()
+    _activate_model("pic")
+    if time.time() - started > 3:
+        print(f" Qwen active in {time.time() - started:.1f}s")
 
 PICGEN_MAX_SEED = np.iinfo(np.int32).max
 
@@ -6297,40 +6739,69 @@ def _hash_images(images):
     return hasher.hexdigest()
 
 
+def _cpu_detach_tree(value):
+    if torch.is_tensor(value):
+        return value.detach().to("cpu")
+    if isinstance(value, dict):
+        return {k: _cpu_detach_tree(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_cpu_detach_tree(v) for v in value)
+    if isinstance(value, list):
+        return [_cpu_detach_tree(v) for v in value]
+    return value
+
+
+def _device_tree(value, target):
+    if torch.is_tensor(value):
+        return value.to(target)
+    if isinstance(value, dict):
+        return {k: _device_tree(v, target) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_device_tree(v, target) for v in value)
+    if isinstance(value, list):
+        return [_device_tree(v, target) for v in value]
+    return value
+
+
+def _clear_picgen_cache():
+    with _picgen_cache_lock:
+        for cache in _picgen_cache.values():
+            cache.clear()
+
+
 def _get_cached_vae_latents(images):
-    """Get cached VAE latents for images if available."""
+    """Return a device copy while retaining cache data on CPU only."""
     img_hash = _hash_images(images)
     with _picgen_cache_lock:
-        return _picgen_cache["vae_latents"].get(img_hash)
+        value = _picgen_cache["vae_latents"].get(img_hash)
+    return _device_tree(value, PIC_DEVICE) if value is not None else None
 
 
 def _cache_vae_latents(images, latents):
-    """Cache VAE latents for images."""
     img_hash = _hash_images(images)
     with _picgen_cache_lock:
         cache = _picgen_cache["vae_latents"]
         if len(cache) >= MAX_CACHE_ENTRIES:
             cache.pop(next(iter(cache)))
-        cache[img_hash] = latents
+        cache[img_hash] = _cpu_detach_tree(latents)
 
 
 def _get_cached_prompt_embeds(prompt, negative_prompt, images, num_images_per_prompt):
-    """Get cached prompt embeddings if available."""
     img_hash = _hash_images(images)
     key = (prompt, negative_prompt or "", img_hash, num_images_per_prompt)
     with _picgen_cache_lock:
-        return _picgen_cache["prompt_embeds"].get(key)
+        value = _picgen_cache["prompt_embeds"].get(key)
+    return _device_tree(value, PIC_DEVICE) if value is not None else None
 
 
 def _cache_prompt_embeds(prompt, negative_prompt, images, num_images_per_prompt, embeds_data):
-    """Cache prompt embeddings."""
     img_hash = _hash_images(images)
     key = (prompt, negative_prompt or "", img_hash, num_images_per_prompt)
     with _picgen_cache_lock:
         cache = _picgen_cache["prompt_embeds"]
         if len(cache) >= MAX_CACHE_ENTRIES:
             cache.pop(next(iter(cache)))
-        cache[key] = embeds_data
+        cache[key] = _cpu_detach_tree(embeds_data)
 
 
 def _find_starter_path(starter_num: int):
@@ -6465,6 +6936,35 @@ def b64_to_pil_list(b64_json_str):
             if img is not None:
                 pil_images.append(img)
         return pil_images
+
+
+def _full_gpu_cleanup(offload_pipelines=True):
+    """Release caches, transient RIFE state, and optionally all pipeline VRAM."""
+    global _active_model
+    with _gpu_op_lock:
+        _clear_picgen_cache()
+        _release_rife()
+        if offload_pipelines:
+            # Either pipeline may have model-CPU-offload hooks installed — tear
+            # those down properly (not a plain .to("cpu"), which would leave
+            # stale hooks that fire on the next call).
+            if pic_pipe is not None:
+                try:
+                    _disable_offload(pic_pipe, "pic")
+                except Exception as exc:
+                    print(f"Cleanup warning (Qwen): {exc}")
+            if wan_pipe is not None:
+                try:
+                    _disable_offload(wan_pipe, "wan")
+                except Exception as exc:
+                    print(f"Cleanup warning (Wan): {exc}")
+            _active_model = None if not DUAL_GPU else "both"
+        gc.collect()
+        if torch.cuda.is_available():
+            for index in range(torch.cuda.device_count()):
+                with torch.cuda.device(index):
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
 
 
 def _do_clear_storage():
@@ -6607,6 +7107,7 @@ def infer_with_preclear(
         raise gr.Error(f"Generation failed: {_infer_e}") from None
 
 
+@_gpu_serialized
 def infer(
     images_b64_json,
     prompt,
@@ -6641,7 +7142,7 @@ def infer(
     print(f"  input images: {[im.size for im in pil_images]}")
     
     cached_embeds = _get_cached_prompt_embeds(prompt, negative_prompt, pil_images, num_images_per_prompt)
-    cache_status = "cached" if cached_embeds else "computing"
+    cache_status = "cached" if cached_embeds is not None else "computing"
     
     print(f"  timing: activate {_t_active - _t_enter:.2f}s, "
           f"decode {_t_decoded - _t_active:.2f}s, embeds: {cache_status} "
@@ -6908,7 +7409,7 @@ function init() {
         });
     }
 
-    // ── Quality selector buttons ──────────────────────────────────────────────
+    // -- Quality selector buttons ----------------------------------------------
     if (!window.__picgenMaxSize) window.__picgenMaxSize = 512;
     document.querySelectorAll('.tb-quality').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -6922,7 +7423,7 @@ function init() {
     if (uploadClick) uploadClick.addEventListener('click', () => fileInput.click());
     if (btnUpload)   btnUpload.addEventListener('click',   () => fileInput.click());
 
-    // ── Single capture-phase delegated listener on the grid ──────────────────
+    // -- Single capture-phase delegated listener on the grid ------------------
     // Fires before any bubble-phase handlers on children. Handles X remove,
     // Add card, and thumb selection. Using capture ensures the dropZone's
     // bubble-phase click handler (which opens the file picker) never receives
@@ -6966,7 +7467,7 @@ function init() {
         fileInput.click();
     });
 
-    // ── Drag-to-reorder (bubble phase — separate from click capture above) ────
+    // -- Drag-to-reorder (bubble phase — separate from click capture above) ----
     let _dragSrcIdx = -1;
     galleryGrid.addEventListener('dragstart', (e) => {
         const thumb = e.target.closest('.gallery-thumb');
@@ -7484,48 +7985,21 @@ with gr.Blocks(css=css) as demo:
         return None
 
     def clear_storage():
-        """Release in-memory media store entries and clean Gradio's RAM upload dir."""
-        import shutil as _shutil
+        """Release stored media without disturbing warm model residency."""
+        cleaned = _do_clear_storage()
+        return gr.update(visible=True, value=f"? Cleared {cleaned} upload(s).")
 
-        _media_store_release_prefix("vidgen_")
-        _media_store_release_prefix("vidgen_sequence_")
-        _media_store_release_prefix("vidgen_custom_seq_")
-        _media_store_release_prefix("picgen_")
-        _media_store_release_prefix("extracted_frame_")
-        # Release the current player copy too — explicit clear means everything
-        global _current_player_media_key
-        if _current_player_media_key:
-            with _media_store_lock:
-                _media_store.pop(_current_player_media_key, None)
-            _current_player_media_key = None
-
-        cleaned = 0
-        for gradio_dir in [
-            Path(SCRIPT_DIR) / "tmp" / "gradio",
-        ]:
-            if gradio_dir.exists():
-                for item in gradio_dir.iterdir():
-                    if item.name == "vibe_edit_history":
-                        continue
-                    if _is_protected(item):
-                        continue
-                    try:
-                        if item.is_dir():
-                            _shutil.rmtree(item, ignore_errors=True)
-                        else:
-                            item.unlink(missing_ok=True)
-                        cleaned += 1
-                    except Exception:
-                        pass
-                break
-
-        return gr.update(visible=True, value=f"✓ Cleared {cleaned} upload(s).")
+    def clear_storage_full():
+        """Explicit user cleanup also releases every GPU resident object."""
+        cleaned = _do_clear_storage()
+        _full_gpu_cleanup(offload_pipelines=True)
+        return gr.update(visible=True, value=f"? Cleared {cleaned} upload(s) and GPU caches.")
 
 
 
 
     clear_storage_btn.click(
-        fn=clear_storage,
+        fn=clear_storage_full,
         inputs=[],
         outputs=[clear_storage_status],
     )
@@ -7677,6 +8151,16 @@ with gr.Blocks(css=css) as demo:
                         autoplay=True,
                         interactive=True,
                     )
+                    # Hidden carrier for the in-memory player URL (/media/<key>/...).
+                    # A JS step reads this and sets the <video> element's src
+                    # directly, bypassing Gradio's /file= wrapping (which turned
+                    # /media/... into /file=/media/... and 403'd). The native
+                    # <video> request hits our /media/ route with no secret
+                    # header, so the server returns PLAIN bytes — playable over
+                    # HTTP as well as HTTPS, straight from the in-memory copy.
+                    player_media_url = gr.Textbox(
+                        value="", visible=False, elem_id="player-media-url",
+                    )
                     
                     generate_btn = gr.Button(
                         "Generate Video", variant="primary", size="lg", elem_id="generate-btn"
@@ -7774,8 +8258,8 @@ with gr.Blocks(css=css) as demo:
                         )
 
             with gr.Group():
-                add_audio_cb = gr.Checkbox(label="Add Audio (F5-TTS + HunyuanVideo-Foley)", value=True)
-                # ── Top row: all four panels side-by-side ──────────────────────
+                add_audio_cb = gr.Checkbox(label="Add Audio (F5-TTS + HunyuanVideo-Foley)", value=False)
+                # -- Top row: all four panels side-by-side ----------------------
                 with gr.Row():
                     audio_prompt_tb = gr.Textbox(
                         label="Sound Effects / Foley Prompt", value="quiet ambience, soft room tone",
@@ -7798,7 +8282,7 @@ with gr.Blocks(css=css) as demo:
                         placeholder="Leave blank to skip voice cloning",
                         lines=4, scale=1,
                     )
-                # ── Voice Speed ────────────────────────────────────────────────
+                # -- Voice Speed ------------------------------------------------
                 gr.Markdown("**Voice Speed** — controls how fast the cloned voice speaks. 1.0 is natural; try 0.75–0.85 if she sounds rushed.")
                 with gr.Row():
                     voice_speed_slider = gr.Slider(
@@ -7810,18 +8294,18 @@ with gr.Blocks(css=css) as demo:
                         scale=3,
                     )
                 with gr.Row():
-                    voice_speed_very_slow_btn = gr.Button("🐢 Very Slow (0.6)", size="sm", scale=1)
-                    voice_speed_slow_btn      = gr.Button("🐌 Slow (0.75)",     size="sm", scale=1)
-                    voice_speed_normal_btn    = gr.Button("🎙️ Normal (1.0)",    size="sm", scale=1)
-                    voice_speed_fast_btn      = gr.Button("⚡ Fast (1.2)",       size="sm", scale=1)
+                    voice_speed_very_slow_btn = gr.Button("?? Very Slow (0.6)", size="sm", scale=1)
+                    voice_speed_slow_btn      = gr.Button("?? Slow (0.75)",     size="sm", scale=1)
+                    voice_speed_normal_btn    = gr.Button("??? Normal (1.0)",    size="sm", scale=1)
+                    voice_speed_fast_btn      = gr.Button("? Fast (1.2)",       size="sm", scale=1)
                 voice_speed_very_slow_btn.click(fn=lambda: 0.6,  outputs=[voice_speed_slider])
                 voice_speed_slow_btn.click(     fn=lambda: 0.75, outputs=[voice_speed_slider])
                 voice_speed_normal_btn.click(   fn=lambda: 1.0,  outputs=[voice_speed_slider])
                 voice_speed_fast_btn.click(     fn=lambda: 1.2,  outputs=[voice_speed_slider])
 
-                # ── F5-TTS voice control quick-insert buttons ──────────────────
+                # -- F5-TTS voice control quick-insert buttons ------------------
                 gr.Markdown(
-                    "### 🎙️ F5-TTS Voice Controls — click any button to insert into Dialogue Script"
+                    "### ??? F5-TTS Voice Controls — click any button to insert into Dialogue Script"
                 )
                 gr.Markdown("**Punctuation for pacing & breath:**")
                 with gr.Row():
@@ -7860,8 +8344,8 @@ with gr.Blocks(css=css) as demo:
                     "phonetically — `Anth-ro-pic` instead of `Anthropic`, `eye-kon` instead of `icon`. "
                     "Hyphens help segment syllables.\n\n"
                     "**Whispered / breathy tone:** F5 clones the reference voice's character — so the "
-                    "clearest lever is your reference clip itself. A breathy 5-second clip → breathy output. "
-                    "An excited clip → excited clone. Record different reference clips for different moods."
+                    "clearest lever is your reference clip itself. A breathy 5-second clip ? breathy output. "
+                    "An excited clip ? excited clone. Record different reference clips for different moods."
                 )
 
             with gr.Group(visible=False) as sequence_group:
@@ -7948,8 +8432,8 @@ with gr.Blocks(css=css) as demo:
                     "with audio-driven synthesis locked to your Dialogue Script. "
                     "Requires a Voice Reference Clip + Dialogue Script in the Sound section above. "
                     "MuseTalk downloads automatically (several GB) on first use.\n\n"
-                    "Pipeline: Wan generates video → F5-TTS generates voice WAV → "
-                    "MuseTalk drives mouth → Foley SFX mixed on top."
+                    "Pipeline: Wan generates video ? F5-TTS generates voice WAV ? "
+                    "MuseTalk drives mouth ? Foley SFX mixed on top."
                 )
                 with gr.Row():
                     lipsync_steps_sl = gr.Slider(
@@ -8502,11 +8986,16 @@ with gr.Blocks(css=css) as demo:
             vid_preset_dropdown8.change(fn=update_vid_prompt8, inputs=[vid_preset_dropdown8], outputs=[vid_prompt], scroll_to_output=False)
 
             def _noop_download(f, auto_download):
-                """Pass-through function for download chain. The actual download
-                trigger happens client-side in _VID_DOWNLOAD_JS, which checks
-                auto_download itself; this server-side fn just needs to accept
-                the extra input Gradio passes alongside video_file."""
-                return f
+                """Pass-through step for the download chain. The actual download
+                trigger happens client-side in _VID_DOWNLOAD_JS.
+
+                Returns gr.update() (a no-op) rather than the FileData value:
+                feeding the FileData object back into the gr.File output caused
+                Gradio 4.43 to re-postprocess it and raise
+                "Parameter `path` is not a valid keyword argument" after the
+                video had already been produced. A no-op update leaves the
+                component untouched and avoids that reprocessing entirely."""
+                return gr.update()
 
             def _delete_video_after_download(video_file_val):
                 """Delete the tmp video file and clear storage after browser downloads it.
@@ -8522,16 +9011,55 @@ with gr.Blocks(css=css) as demo:
                 _do_clear_storage()
                 return gr.update(visible=True, value="Storage cleared.")
 
+            def _current_player_url():
+                """Return the in-memory player /media/ URL for the last video."""
+                if _current_player_media_key:
+                    return f"/media/{_current_player_media_key}/player.mp4"
+                return ""
+
+            # Sets the <video> element's src directly to the /media/ URL so the
+            # player streams the in-memory copy. Done in JS (not via gr.Video's
+            # value) because gr.Video wraps a /media/ path into /file=/media/...
+            # which Gradio's file route rejects with 403. The native <video>
+            # request goes straight to our /media/ endpoint; with no secret
+            # header the server returns PLAIN bytes, so it plays over HTTP too.
+            _VID_SET_PLAYER_SRC_JS = """
+            (mediaUrl) => {
+                try {
+                    if (!mediaUrl) return;
+                    const wrap = document.getElementById('generated-video');
+                    if (!wrap) return;
+                    const v = wrap.querySelector('video');
+                    if (!v) return;
+                    // Only override if Gradio produced a broken /file=/media path
+                    // or an empty source; otherwise leave its own source alone.
+                    if (v.src !== mediaUrl) {
+                        v.src = mediaUrl;
+                        v.load();
+                        const p = v.play();
+                        if (p && p.catch) p.catch(() => {});
+                    }
+                } catch (e) { console.warn('set player src failed', e); }
+            }
+            """
+
+            # NOTE: this JS is a pure client-side side effect (it triggers the
+            # browser download). It must NOT return the FileData object, and the
+            # Python step it is attached to uses outputs=[] — feeding a FileData
+            # back into the gr.File output caused Gradio 4.43 to re-postprocess
+            # it and raise "Parameter `path` is not a valid keyword argument".
             _VID_DOWNLOAD_JS = """
             (videoFile, autoDownload) => {
-                if (!autoDownload || !videoFile || !videoFile.url) return videoFile;
-                const a = document.createElement('a');
-                a.href = videoFile.url;
-                a.download = videoFile.url.split('/').pop();
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                return videoFile;
+                try {
+                    if (autoDownload && videoFile && videoFile.url) {
+                        const a = document.createElement('a');
+                        a.href = videoFile.url;
+                        a.download = videoFile.url.split('/').pop();
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                    }
+                } catch (e) { console.warn('auto-download failed', e); }
             }
             """
 
@@ -8677,7 +9205,7 @@ with gr.Blocks(css=css) as demo:
             ).then(
                 fn=_noop_download,
                 inputs=[video_file, auto_download_cb],
-                outputs=[video_file],
+                outputs=[],
                 js=_VID_DOWNLOAD_JS,
             ).then(
                 fn=protect_current_inputs,
@@ -8711,7 +9239,7 @@ with gr.Blocks(css=css) as demo:
             ).then(
                 fn=_noop_download,
                 inputs=[video_file, auto_download_cb],
-                outputs=[video_file],
+                outputs=[],
                 js=_VID_DOWNLOAD_JS,
             ).then(
                 fn=protect_current_inputs,
@@ -8734,7 +9262,7 @@ with gr.Blocks(css=css) as demo:
             ).then(
                 fn=_noop_download,
                 inputs=[video_file, auto_download_cb],
-                outputs=[video_file],
+                outputs=[],
                 js=_VID_DOWNLOAD_JS,
             ).then(
                 fn=protect_current_inputs,
@@ -8938,11 +9466,11 @@ with gr.Blocks(css=css) as demo:
                         </div>
                         <div class="quality-toolbar">
                             <span class="quality-label">Quality:</span>
-                            <button class="tb-btn tb-quality" data-size="256">256 ⚡ Fastest</button>
-                            <button class="tb-btn tb-quality tb-quality-active" data-size="512">512 ✦ Default</button>
-                            <button class="tb-btn tb-quality" data-size="1024">1024 ▲ Better</button>
-                            <button class="tb-btn tb-quality" data-size="1920">1920 ▲▲ High</button>
-                            <button class="tb-btn tb-quality" data-size="2560">2560 ★ Max</button>
+                            <button class="tb-btn tb-quality" data-size="256">256 ? Fastest</button>
+                            <button class="tb-btn tb-quality tb-quality-active" data-size="512">512 ? Default</button>
+                            <button class="tb-btn tb-quality" data-size="1024">1024 ? Better</button>
+                            <button class="tb-btn tb-quality" data-size="1920">1920 ?? High</button>
+                            <button class="tb-btn tb-quality" data-size="2560">2560 ? Max</button>
                         </div>
                         <div id="gallery-drop-zone">
                             <div id="upload-prompt" class="upload-prompt-modern">
@@ -9129,7 +9657,7 @@ with gr.Blocks(css=css) as demo:
                         outputs=[pic_result, pic_seed, picgen_urls],
                         show_progress="full",
                         concurrency_id=PIC_QUEUE_ID,
-                        concurrency_limit=10,
+                        concurrency_limit=1,
                     ).then(
                         fn=lambda: __import__('time').sleep(2),
                         inputs=[],
@@ -9190,7 +9718,7 @@ with gr.Blocks(css=css) as demo:
                         outputs=[pic_result, pic_seed, picgen_urls],
                         show_progress="full",
                         concurrency_id=PIC_QUEUE_ID,
-                        concurrency_limit=10,
+                        concurrency_limit=1,
                     ).then(
                         fn=lambda: __import__('time').sleep(2),
                         inputs=[],
@@ -9660,7 +10188,7 @@ with gr.Blocks(css=css) as demo:
 """
     demo.load(fn=None, js=_encryption_init_js)
 
-    # ── Multi-Tool popup ──────────────────────────────────────────────────────
+    # -- Multi-Tool popup ------------------------------------------------------
     # Opened when the user clicks "Multi-Tool". Shows the current first gallery
     # image (or an upload zone if none). Edge drag-handles let the user extend
     # (outward = white space added) or crop (inward = image trimmed) on any
@@ -9669,13 +10197,13 @@ with gr.Blocks(css=css) as demo:
     _outpaint_popup_js = r"""
 () => {
 window.__openOutpaintPopup = function() {
-    // ── constants ────────────────────────────────────────────────────────────
+    // -- constants ------------------------------------------------------------
     const PROMPT = 'outpaint to only fill in what is missing only in the white part of the photo.';
     const HANDLE_SIZE = 28;   // px — draggable edge strip width
     const MIN_PAD = -4000;    // negative = crop inward
     const MAX_PAD = 1200;     // positive = add white space outward
 
-    // ── state ────────────────────────────────────────────────────────────────
+    // -- state ----------------------------------------------------------------
     let srcB64 = null;        // original image base64
     let padTop = 0, padRight = 0, padBottom = 0, padLeft = 0;
     let dragging = null;
@@ -9686,7 +10214,7 @@ window.__openOutpaintPopup = function() {
     // Update/Generate adds to the gallery or replaces.
     let _fromPopupUpload = false;
 
-    // ── overlay ──────────────────────────────────────────────────────────────
+    // -- overlay --------------------------------------------------------------
     let overlay = document.getElementById('ng-outpaint-overlay');
     if (overlay) {
         const imgs = window.__picgenImages || [];
@@ -9804,7 +10332,7 @@ window.__openOutpaintPopup = function() {
         + 'Generate (4 images)</button>';
     overlay.appendChild(btnRow);
 
-    // ── helpers ───────────────────────────────────────────────────────────────
+    // -- helpers ---------------------------------------------------------------
     function _clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
     function _positionHandles(dw, dh) {
@@ -9912,7 +10440,7 @@ window.__openOutpaintPopup = function() {
     overlay._loadSrc = _loadSrc;
     overlay._render  = _render;
 
-    // ── swap button wiring ────────────────────────────────────────────────────
+    // -- swap button wiring ----------------------------------------------------
     const swapBtn = document.getElementById('ng-op-swap');
     overlay._swapBtn = swapBtn;
     // Show button only when more than one gallery image exists
@@ -9931,7 +10459,7 @@ window.__openOutpaintPopup = function() {
         swapBtn.textContent = '\u21c4 Swap (' + (_galleryIdx + 1) + '/' + imgs.length + ')';
     });
 
-    // ── drag logic ────────────────────────────────────────────────────────────
+    // -- drag logic ------------------------------------------------------------
     function _onPointerDown(e) {
         const edge = e.currentTarget.dataset.edge;
         if (!edge || !srcB64) return;
@@ -9974,7 +10502,7 @@ window.__openOutpaintPopup = function() {
 
     Object.values(handles).forEach(h => h.addEventListener('pointerdown', _onPointerDown));
 
-    // ── file import ───────────────────────────────────────────────────────────
+    // -- file import -----------------------------------------------------------
     function _handleFile(file) {
         if (!file || !file.type.startsWith('image/')) return;
         const reader = new FileReader();
@@ -9997,12 +10525,12 @@ window.__openOutpaintPopup = function() {
         _handleFile(e.dataTransfer.files[0]);
     });
 
-    // ── export canvas to b64 ─────────────────────────────────────────────────
+    // -- export canvas to b64 -------------------------------------------------
     function _exportCanvas() {
         return cvs.toDataURL('image/jpeg', 0.95);
     }
 
-    // ── push to gallery (shared by Update Input and Generate) ─────────────────
+    // -- push to gallery (shared by Update Input and Generate) -----------------
     // If the image came from the popup's own upload, ADD it alongside existing images.
     // If it came from the gallery, REPLACE only that specific slot (_galleryIdx)
     // so all other images are preserved.
@@ -10047,7 +10575,7 @@ window.__openOutpaintPopup = function() {
         }
     }
 
-    // ── close ─────────────────────────────────────────────────────────────────
+    // -- close -----------------------------------------------------------------
     let _recentlyDragged = false;
     function _close() { overlay.style.display = 'none'; _recentlyDragged = false; }
     document.getElementById('ng-op-close').addEventListener('click', _close);
@@ -10055,20 +10583,20 @@ window.__openOutpaintPopup = function() {
         if (_recentlyDragged) { e.stopImmediatePropagation(); _recentlyDragged = false; }
     });
 
-    // ── reset ─────────────────────────────────────────────────────────────────
+    // -- reset -----------------------------------------------------------------
     document.getElementById('ng-op-reset').addEventListener('click', () => {
         padTop = padRight = padBottom = padLeft = 0;
         _render();
     });
 
-    // ── update input (no generation) ─────────────────────────────────────────
+    // -- update input (no generation) -----------------------------------------
     document.getElementById('ng-op-update').addEventListener('click', () => {
         if (!srcB64) { alert('Load an image first.'); return; }
         _pushToGallery(_exportCanvas(), 'edited_input.jpg');
         _close();
     });
 
-    // ── generate ─────────────────────────────────────────────────────────────
+    // -- generate -------------------------------------------------------------
     document.getElementById('ng-op-generate').addEventListener('click', () => {
         if (!srcB64) { alert('Load an image first.'); return; }
         _pushToGallery(_exportCanvas(), 'outpaint_input.jpg');
@@ -10127,7 +10655,7 @@ window.__openOutpaintPopup = function() {
         }, 150);
     });
 
-    // ── populate from gallery on first open ───────────────────────────────────
+    // -- populate from gallery on first open -----------------------------------
     const existing = window.__picgenImages;
     if (existing && existing.length > 0) {
         _galleryIdx = 0;
@@ -10357,6 +10885,11 @@ async def _logs_stream(request: _FastAPIRequest):
 if __name__ == "__main__":
     _start_push_api()
 
+    # Start the inactive CPU preload before demo.launch(), which blocks for the
+    # lifetime of the server.  The loader is idempotent and never claims GPU.
+    if not DUAL_GPU and STARTUP_MODE == "picgen" and not _wan_loaded:
+        threading.Thread(target=lambda: _load_wan("cpu"), daemon=True).start()
+
     if DUAL_GPU:
         print(f" GRADIO LAUNCHING  Wan on {WAN_DEVICE}, Qwen on {PIC_DEVICE}. Both tabs ready.")
         demo.queue()
@@ -10423,6 +10956,10 @@ if __name__ == "__main__":
                     if ew: pipe.text_encoder.load_state_dict(ew, strict=False)
                     del sd, tw, vw, ew
                     torch.cuda.empty_cache()
+                    # Cast transformer to fp8 (native checkpoint precision) so
+                    # the later GPU swap fits on a 32 GB card (~19 GB not ~38 GB).
+                    _cast_transformer_to_fp8(pipe)
+                    gc.collect()
                     pipe.vae.enable_tiling()
                     pipe.vae.enable_slicing()
                     pipe.transformer.to("cpu")
