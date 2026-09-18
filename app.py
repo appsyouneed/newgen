@@ -547,8 +547,19 @@ import numpy as np
 import torch
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
+# --- CUDA math/backend tuning (Blackwell RTX PRO 6000 friendly) -------------
+# TF32 on both the matmul and cuDNN paths speeds up any residual fp32 math
+# (VAE convs, norms, RIFE) with no visible quality change. bf16 matmuls in the
+# transformer are unaffected. cudnn.benchmark is set later, after GPU
+# detection, because it only helps fixed-shape convs and we want it on the big
+# card. set_float32_matmul_precision("high") lets fp32 ops use TF32 kernels.
 torch.backends.cudnn.benchmark = False
 torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
 
 logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 logging.getLogger("torch.utils._pytree").setLevel(logging.ERROR)
@@ -1012,6 +1023,50 @@ except ModuleNotFoundError:
         raise RuntimeError(f"torchvision install failed:\n{_r.stderr.strip()}")
     print("[SelfHeal] torchvision installed OK")
 
+
+# ---------------------------------------------------------------------------
+# Optional speedup dependencies (main app venv).
+#
+# These are performance-only libraries used by the vidgen attention optimizer
+# (_optimize_wan_attention). They are NOT required — the code falls back to
+# PyTorch SDPA if they're absent — so their install is fully non-fatal and runs
+# on a daemon thread to avoid adding ANY time to startup. They are pure Python /
+# CUDA-kernel wheels that do NOT pull or replace torch, so the protected system
+# torch dev build is never touched (we still pass --no-deps to be certain).
+# Disable entirely with NEWGEN_AUTOINSTALL_SPEEDUPS=0.
+def _bg_selfheal_speedup_libs():
+    if os.environ.get("NEWGEN_AUTOINSTALL_SPEEDUPS", "1") != "1":
+        return
+    import importlib.util as _ilu
+    # (import_name, pip_spec). Only sageattention today; flash-attn is left to
+    # the operator because its build is heavy and torch-version-specific.
+    _optional = [("sageattention", "sageattention")]
+    for _imp, _spec in _optional:
+        try:
+            if _ilu.find_spec(_imp) is not None:
+                continue
+        except Exception:
+            continue
+        try:
+            print(f"[SelfHeal] optional speedup lib '{_imp}' missing — "
+                  f"installing (non-fatal, no torch deps)...")
+            _rr = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet",
+                 "--no-cache-dir", "--no-deps", "--disable-pip-version-check",
+                 "--root-user-action=ignore", _spec],
+                capture_output=True, text=True,
+            )
+            if _rr.returncode == 0:
+                print(f"[SelfHeal] '{_imp}' installed — Wan attention will use it.")
+            else:
+                print(f"[SelfHeal] '{_imp}' install skipped (non-fatal): "
+                      f"{(_rr.stderr or '').strip()[-300:]}")
+        except Exception as _e:
+            print(f"[SelfHeal] '{_imp}' install error (non-fatal): {_e}")
+
+
+threading.Thread(target=_bg_selfheal_speedup_libs, daemon=True).start()
+
 sys.path.append(os.path.join(SCRIPT_DIR, "train_log"))
 from train_log.RIFE_HDv3 import Model
 
@@ -1100,9 +1155,29 @@ GPU_HIGH_VRAM = GPU_PROFILE["high_vram"]   # True = 95 GB Blackwell, False = 32 
 GPU_SM_STR    = GPU_PROFILE["sm_str"]      # for TORCH_CUDA_ARCH_LIST in mmcv build
 GPU_TORCH_IDX = GPU_PROFILE["torch_index"] # pip wheel index for MuseTalk venv
 
-DUAL_GPU = _gpu_count >= 2 and os.environ.get("NEWGEN_FORCE_SINGLE_GPU") != "1"
+# DUAL_GPU is OPT-IN only. Requirement: never have both tabs (Wan + Qwen)
+# resident on the GPU at the same time. Dual-GPU mode deliberately keeps both
+# models resident (one per card), which on a single physical card would put
+# both on the same GPU — exactly what we must avoid. So dual-GPU now requires
+# an explicit NEWGEN_ENABLE_DUAL_GPU=1 opt-in (for a genuine 2-physical-card
+# box). By default, even if the runtime reports >=2 device indices (MIG slices,
+# odd cloud setups), we stay single-GPU with swap-on-demand so only ONE model
+# ever occupies the GPU at a time.
+DUAL_GPU = (
+    _gpu_count >= 2
+    and os.environ.get("NEWGEN_FORCE_SINGLE_GPU") != "1"
+    and os.environ.get("NEWGEN_ENABLE_DUAL_GPU") == "1"
+)
 PIC_DEVICE = "cuda:0"
 WAN_DEVICE = "cuda:1" if DUAL_GPU else "cuda:0"
+
+# On a big card, enable cuDNN autotuning. Each video run uses a fixed
+# resolution (so conv shapes repeat across all frames/segments), which is
+# exactly the case cudnn.benchmark accelerates — it picks the fastest conv
+# algorithm once, then reuses it. The tiny first-call autotune cost is repaid
+# many times over across the frames of even a single segment.
+if GPU_HIGH_VRAM and os.environ.get("NEWGEN_CUDNN_BENCHMARK", "1") == "1":
+    torch.backends.cudnn.benchmark = True
 
 if DUAL_GPU:
     print(f"Dual GPU: Qwen -> {PIC_DEVICE}, Wan -> {WAN_DEVICE}. Both load at startup, no swapping.")
@@ -1305,153 +1380,82 @@ F5_VENV_DIR = Path(SCRIPT_DIR) / ".f5tts-venv"
 F5_VENV_PY  = F5_VENV_DIR / "bin" / "python"
 
 # HunyuanVideo-Foley venv — isolated: protobuf<5.0, own torch copy
+# (legacy — kept only so old installs still validate; SFX now uses MMAudio)
 FOLEY_VENV_DIR = Path(SCRIPT_DIR) / ".foley-venv"
 FOLEY_VENV_PY  = FOLEY_VENV_DIR / "bin" / "python"
+
+# MMAudio venv — isolated video-to-audio SFX/foley engine (replaces
+# HunyuanVideo-Foley). Own torch copy; the system torch is never touched.
+MMAUDIO_REPO_DIR  = Path(SCRIPT_DIR) / "MMAudio"
+MMAUDIO_VENV_DIR  = Path(SCRIPT_DIR) / ".mmaudio-venv"
+MMAUDIO_VENV_PY   = MMAUDIO_VENV_DIR / "bin" / "python"
+# MMAudio's demo.py expects weights/ and ext_weights/ inside the repo dir.
+MMAUDIO_WEIGHTS_DIR     = MMAUDIO_REPO_DIR / "weights"
+MMAUDIO_EXT_WEIGHTS_DIR = MMAUDIO_REPO_DIR / "ext_weights"
+# Which flow-prediction checkpoint MMAudio should load. The NSFW fine-tune
+# (phazei/NSFW_MMaudio) is a `large_44k` fine-tune (per its model card),
+# shipped as a single fp16 *.safetensors* file. MMAudio's demo.py loads
+# weights via torch.load(weights_only=True), which reads .pth — NOT
+# safetensors — so at bootstrap we convert the safetensors into the .pth
+# state_dict filename the `large_44k` variant expects
+# (weights/mmaudio_large_44k.pth) and run demo.py with --variant large_44k.
+MMAUDIO_VARIANT = "large_44k"
+MMAUDIO_NSFW_REPO = "phazei/NSFW_MMaudio"
+MMAUDIO_NSFW_FILE = "mmaudio_large_44k_nsfw_gold_8.5k_final_fp16.safetensors"
+# Env toggle: set NEWGEN_MMAUDIO_NSFW=0 to use the stock (SFW) checkpoint.
+MMAUDIO_USE_NSFW = os.environ.get("NEWGEN_MMAUDIO_NSFW", "1") == "1"
 
 # MuseTalk venv — isolated: mmcv/mmdet/mmpose (OpenMMLab) + own torch copy,
 # never touches system numpy/torch.
 MUSETALK_VENV_DIR = Path(SCRIPT_DIR) / ".musetalk-venv"
 MUSETALK_VENV_PY  = MUSETALK_VENV_DIR / "bin" / "python"
 
-_AUDIO_ENGINE_AVAILABLE = False   # set True once both engines verified usable
+# Sentinel written after a fully successful audio-engine bootstrap. When it
+# exists AND the venvs/weights are present, startup skips the redundant
+# per-launch subprocess import-verification calls (a warm-start speedup).
+_AUDIO_ENGINE_SENTINEL = Path(SCRIPT_DIR) / ".audio_engines_ok"
+
+_AUDIO_ENGINE_AVAILABLE = False   # set True once engines verified usable
 
 
 def _ensure_audio_engines():
     """
-    One-time setup: clone HunyuanVideo-Foley repo if missing, download model
-    weights from HuggingFace, and pip-install f5-tts if not present.
-    Called at startup so the first generation isn't delayed.
+    One-time setup for the audio engines:
+      • MMAudio (video-to-audio SFX/foley) — cloned + installed into its own
+        isolated venv (.mmaudio-venv), NSFW checkpoint downloaded.
+      • F5-TTS (voice cloning) — isolated venv (.f5tts-venv), English-only.
+
+    Called on a daemon thread at startup so it never blocks the UI launch.
+    Every step is guarded by existence checks so warm restarts are cheap, and a
+    sentinel file (_AUDIO_ENGINE_SENTINEL) lets us skip the redundant per-startup
+    subprocess import-verification launches once a full bootstrap has succeeded.
+    The system torch install is NEVER touched — all pip installs target the
+    isolated venvs only.
     """
     global _AUDIO_ENGINE_AVAILABLE
 
-    # --- Foley venv bootstrap -------------------------------------------------
-    # HunyuanVideo-Foley runs in its own isolated venv (.foley-venv) so its
-    # protobuf<5.0 requirement from descript-audiotools never touches the system
-    # python or the app venv. torch/torchaudio/torchcodec are installed inside
-    # this venv — the system torch is untouched.
-    _FOLEY_PIP_QUIET = [
+    _PIP_QUIET = [
         "--quiet", "--disable-pip-version-check", "--root-user-action=ignore",
         "--no-warn-conflicts", "--no-cache-dir",
     ]
 
-    if not FOLEY_VENV_PY.exists():
-        print("[AudioEngine] Creating isolated venv for HunyuanVideo-Foley ...")
-        subprocess.run([sys.executable, "-m", "venv", str(FOLEY_VENV_DIR)], check=True)
-        subprocess.run(
-            [str(FOLEY_VENV_PY), "-m", "pip", "install"] + _FOLEY_PIP_QUIET +
-            ["--upgrade", "pip"],
-            check=True, capture_output=True,
-        )
-        # Install torch + torchaudio + torchcodec inside the Foley venv.
-        # torchaudio 2.6+ routes torchaudio.save() through TorchCodec; without
-        # torchcodec, infer.py crashes at torchaudio.save() with
-        # "ModuleNotFoundError: No module named 'torchcodec'" and videos are silent.
-        print("[AudioEngine] Installing torch/torchaudio/torchcodec into Foley venv ...")
-        subprocess.run(
-            [str(FOLEY_VENV_PY), "-m", "pip", "install"] + _FOLEY_PIP_QUIET +
-            ["torch", "torchaudio"],
-            check=True, capture_output=True,
-        )
-        subprocess.run(
-            [str(FOLEY_VENV_PY), "-m", "pip", "install"] + _FOLEY_PIP_QUIET +
-            ["torchcodec"],
-            check=False, capture_output=True,  # non-fatal: falls back to sox
-        )
-        print("[AudioEngine] Foley venv base ready.")
-
-    # --- Ensure `transformers` is present in the Foley venv -----------------
-    # HunyuanVideo-Foley's requirements.txt pins a git+ dev branch of
-    # transformers. The repo-requirements install below deliberately strips
-    # any line starting with "transformers" (and any git+transformers line)
-    # out of that file — see _CONFLICTING_PREFIXES further down — because
-    # blindly installing a random dev branch is risky. But since that git+
-    # line was the ONLY place `transformers` would have been installed, the
-    # net effect was that the Foley venv never got `transformers` at all,
-    # so infer.py's `from transformers import ...` crashed with
-    # "ModuleNotFoundError: No module named 'transformers'". The Foley venv
-    # is fully isolated from the rest of the app, so installing a normal,
-    # stable PyPI `transformers` release here is safe — it can't conflict
-    # with anything outside `.foley-venv`. This check runs on every startup
-    # (cheap when already satisfied) so it also repairs venvs created before
-    # this fix existed, without needing to delete/recreate them.
-    _foley_transformers_check = subprocess.run(
-        [str(FOLEY_VENV_PY), "-c", "import transformers"],
-        capture_output=True,
-    )
-    if _foley_transformers_check.returncode != 0:
-        print("[AudioEngine] Installing transformers into Foley venv ...")
-        _foley_tf_result = subprocess.run(
-            [str(FOLEY_VENV_PY), "-m", "pip", "install"] + _FOLEY_PIP_QUIET +
-            ["transformers==4.46.3"],
-            capture_output=True,
-        )
-        if _foley_tf_result.returncode == 0:
-            print("[AudioEngine] transformers installed into Foley venv.")
-        else:
-            print("[AudioEngine] Failed to install transformers into Foley venv: "
-                  f"{_foley_tf_result.stderr[-500:]}")
-    else:
-        # Even if transformers is importable, an unpinned/too-new install
-        # (e.g. from a prior run of this code before the version was pinned)
-        # may be missing APIs HunyuanVideo-Foley's synchformer/ast_model.py
-        # needs — e.g. transformers.pytorch_utils.find_pruneable_heads_and_indices
-        # was removed in newer transformers releases, causing
-        # "ImportError: cannot import name 'find_pruneable_heads_and_indices'
-        # from 'transformers.pytorch_utils'". Detect that specific breakage
-        # and pin down to a known-good version if so.
-        _foley_ast_check = subprocess.run(
-            [str(FOLEY_VENV_PY), "-c",
-             "from transformers.pytorch_utils import find_pruneable_heads_and_indices"],
-            capture_output=True,
-        )
-        if _foley_ast_check.returncode != 0:
-            print("[AudioEngine] Foley venv's transformers is missing APIs "
-                  "HunyuanVideo-Foley needs — pinning to a compatible version ...")
-            _foley_tf_result = subprocess.run(
-                [str(FOLEY_VENV_PY), "-m", "pip", "install"] + _FOLEY_PIP_QUIET +
-                ["transformers==4.46.3"],
-                capture_output=True,
-            )
-            if _foley_tf_result.returncode == 0:
-                print("[AudioEngine] transformers pinned to 4.46.3 in Foley venv.")
-            else:
-                print("[AudioEngine] Failed to pin transformers in Foley venv: "
-                      f"{_foley_tf_result.stderr[-500:]}")
-
-    # --- Ensure `huggingface_hub` in the Foley venv is compatible with -------
-    # the pinned transformers==4.46.3 above. transformers 4.46.3 requires
-    # huggingface-hub>=0.23.2,<1.0. Nothing in the bootstrap above pins
-    # huggingface_hub (the repo requirements.txt install and the transformers
-    # pin above both leave it to pip's resolver), so a fresh venv created
-    # after huggingface_hub 1.0 was released on PyPI ends up with a >=1.0
-    # version that transformers refuses to import against, crashing every
-    # Foley run with "ImportError: huggingface-hub>=0.23.2,<1.0 is required
-    # ... but found huggingface-hub==1.x.x" even though the venv otherwise
-    # looks fully set up. This check runs on every startup (cheap when
-    # already satisfied) so it also repairs venvs created before this fix
-    # existed, without needing to delete/recreate them.
-    _foley_hub_check = subprocess.run(
-        [str(FOLEY_VENV_PY), "-c",
-         "from huggingface_hub.utils import get_session; "
-         "import huggingface_hub as _h; "
-         "import sys; "
-         "v = tuple(int(p) for p in _h.__version__.split('.')[:2]); "
-         "sys.exit(0 if v < (1, 0) else 1)"],
-        capture_output=True,
-    )
-    if _foley_hub_check.returncode != 0:
-        print("[AudioEngine] Foley venv's huggingface_hub is incompatible with "
-              "transformers==4.46.3 (needs <1.0) — pinning a compatible version ...")
-        _foley_hub_result = subprocess.run(
-            [str(FOLEY_VENV_PY), "-m", "pip", "install"] + _FOLEY_PIP_QUIET +
-            ["huggingface-hub>=0.23.2,<1.0"],
-            capture_output=True,
-        )
-        if _foley_hub_result.returncode == 0:
-            print("[AudioEngine] huggingface-hub pinned to <1.0 in Foley venv.")
-        else:
-            print("[AudioEngine] Failed to pin huggingface-hub in Foley venv: "
-                  f"{_foley_hub_result.stderr[-500:]}")
+    # --- Warm-start fast path -------------------------------------------------
+    # If a previous run fully bootstrapped the engines (sentinel present) AND
+    # the venvs + key weights still exist on disk, skip ALL the subprocess
+    # import-verification launches below (each spawns a fresh venv interpreter
+    # and costs real seconds). This is the main warm-start speedup.
+    try:
+        mm_ckpt = MMAUDIO_WEIGHTS_DIR / f"mmaudio_{MMAUDIO_VARIANT}.pth"
+        if (_AUDIO_ENGINE_SENTINEL.exists()
+                and MMAUDIO_VENV_PY.exists()
+                and F5_VENV_PY.exists()
+                and mm_ckpt.exists()):
+            _AUDIO_ENGINE_AVAILABLE = True
+            print("[AudioEngine] Warm start — engines already provisioned "
+                  "(sentinel + venvs + weights present). Skipping verification.")
+            return
+    except Exception:
+        pass
 
     # --- F5-TTS (isolated venv) -----------------------------------------
     # F5-TTS's dependency chain (via cached_path -> google-cloud-storage ->
@@ -1528,90 +1532,157 @@ def _ensure_audio_engines():
         )
         print("[AudioEngine] F5-TTS venv ready.")
 
-    # --- HunyuanVideo-Foley repo --------------------------------------
-    if not FOLEY_REPO_DIR.exists():
-        print("[AudioEngine] Cloning HunyuanVideo-Foley repo...")
+    # --- MMAudio repo + isolated venv (video-to-audio SFX/foley) -----------
+    # Replaces HunyuanVideo-Foley. MMAudio is small (~157M params) and fast
+    # (~1.2s for an 8s clip), supports a real negative prompt, and is purely a
+    # foley/SFX model — it does NOT synthesize speech, which is exactly what we
+    # want (no talking unless the F5-TTS voice branch is explicitly used).
+    if not MMAUDIO_REPO_DIR.exists():
+        print("[AudioEngine] Cloning MMAudio repo...")
         subprocess.run(
             ["git", "clone", "--depth=1",
-             "https://github.com/Tencent-Hunyuan/HunyuanVideo-Foley",
-             str(FOLEY_REPO_DIR)],
+             "https://github.com/hkchengrex/MMAudio", str(MMAUDIO_REPO_DIR)],
             check=True,
         )
-        # Install repo dependencies into current env, but strip out lines that
-        # would clobber our pinned stack. HunyuanVideo-Foley's own
-        # requirements.txt pins gradio==3.50.2 and a git transformers branch,
-        # and repeats torch/torchvision/torchaudio/numpy. Installing those
-        # verbatim downgrades our pinned gradio==4.43.0 mid-run, which is what
-        # caused "ImportError: cannot import name 'http_server' from 'gradio'"
-        # at demo.launch() — gradio's package files ended up a mix of two
-        # incompatible versions. Everything else in that file (av, einops,
-        # omegaconf, pyyaml, scipy, timm, sentencepiece, accelerate, pandas,
-        # pyarrow, loguru, easydict, descript-audiotools, etc.) is safe to
-        # install as-is here -- audiotools' protobuf<5.0.0 pin is fine in
-        # this env now that F5-TTS (the only thing that needed protobuf>=6.33)
-        # runs in its own isolated venv instead of this shared site-packages.
-        _CONFLICTING_PREFIXES = (
-            "torch", "gradio", "transformers", "numpy", "urllib3",
-        )
-        req_file = FOLEY_REPO_DIR / "requirements.txt"
-        if req_file.exists():
-            filtered_lines = []
-            for line in req_file.read_text().splitlines():
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                pkg_spec = stripped.lower()
-                if pkg_spec.startswith("git+"):
-                    # e.g. git+https://github.com/huggingface/transformers@...
-                    if "transformers" in pkg_spec:
-                        continue
-                elif pkg_spec.startswith(_CONFLICTING_PREFIXES):
-                    continue
-                filtered_lines.append(line)
+        print("[AudioEngine] MMAudio repo cloned.")
 
-            filtered_req = FOLEY_REPO_DIR / "requirements.filtered.txt"
-            filtered_req.write_text("\n".join(filtered_lines) + "\n")
-            # Install into the FOLEY venv — NEVER into sys.executable / main env
+    if not MMAUDIO_VENV_PY.exists():
+        print("[AudioEngine] Creating isolated venv for MMAudio (one-time; "
+              "installs its own torch/torchaudio for full isolation)...")
+        subprocess.run([sys.executable, "-m", "venv", str(MMAUDIO_VENV_DIR)], check=True)
+        subprocess.run(
+            [str(MMAUDIO_VENV_PY), "-m", "pip", "install"] + _PIP_QUIET + ["--upgrade", "pip"],
+            check=True, capture_output=True,
+        )
+        # torch/torchaudio first (isolated from the system dev build), then the
+        # MMAudio package itself installed editable from the cloned repo so its
+        # demo.py + mmaudio module resolve.
+        subprocess.run(
+            [str(MMAUDIO_VENV_PY), "-m", "pip", "install"] + _PIP_QUIET + ["torch", "torchaudio"],
+            check=True, capture_output=True,
+        )
+        _mm_install = subprocess.run(
+            [str(MMAUDIO_VENV_PY), "-m", "pip", "install"] + _PIP_QUIET + ["-e", str(MMAUDIO_REPO_DIR)],
+            capture_output=True, text=True,
+        )
+        if _mm_install.returncode != 0:
+            print("[AudioEngine] MMAudio editable install hit an issue, retrying with "
+                  f"requirements.txt: {(_mm_install.stderr or '')[-400:]}")
+            _mm_req = MMAUDIO_REPO_DIR / "requirements.txt"
+            if _mm_req.exists():
+                subprocess.run(
+                    [str(MMAUDIO_VENV_PY), "-m", "pip", "install"] + _PIP_QUIET +
+                    ["-r", str(_mm_req)],
+                    check=False, capture_output=True,
+                )
+                subprocess.run(
+                    [str(MMAUDIO_VENV_PY), "-m", "pip", "install"] + _PIP_QUIET +
+                    ["-e", str(MMAUDIO_REPO_DIR)],
+                    check=False, capture_output=True,
+                )
+        print("[AudioEngine] MMAudio venv ready.")
+    else:
+        # Cheap repair check: make sure the mmaudio package still imports in
+        # its venv (e.g. if a prior install was interrupted).
+        _mm_check = subprocess.run(
+            [str(MMAUDIO_VENV_PY), "-c", "import mmaudio"], capture_output=True,
+        )
+        if _mm_check.returncode != 0:
+            print("[AudioEngine] MMAudio package missing in venv — reinstalling (editable)...")
             subprocess.run(
-                [str(FOLEY_VENV_PY), "-m", "pip", "install", "--quiet",
-                 "--disable-pip-version-check", "--root-user-action=ignore",
-                 "--no-warn-conflicts", "--no-cache-dir",
-                 "-r", str(filtered_req)],
-                check=True, capture_output=True,
+                [str(MMAUDIO_VENV_PY), "-m", "pip", "install"] + _PIP_QUIET +
+                ["-e", str(MMAUDIO_REPO_DIR)],
+                check=False, capture_output=True,
             )
-        print("[AudioEngine] HunyuanVideo-Foley repo ready.")
 
-    # --- HunyuanVideo-Foley model weights -----------------------------
-    foley_ckpt = FOLEY_MODEL_DIR / "hunyuanvideo_foley_xl.pth"
-    if not foley_ckpt.exists():
-        print("[AudioEngine] Downloading HunyuanVideo-Foley XL weights...")
-        FOLEY_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        hf_hub_download(
-            repo_id="tencent/HunyuanVideo-Foley",
-            filename="hunyuanvideo_foley_xl.pth",
-            local_dir=str(FOLEY_MODEL_DIR),
-            local_dir_use_symlinks=False,
-        )
-        print("[AudioEngine] Foley main checkpoint downloaded.")
+    # --- MMAudio model weights --------------------------------------------
+    # demo.py loads weights/mmaudio_<variant>.pth plus ext_weights/{v1-44.pth,
+    # synchformer_state_dict.pth}. MMAudio can auto-download the stock weights,
+    # but we fetch them explicitly (and swap in the NSFW checkpoint) so the
+    # first generation isn't delayed and works fully offline afterwards.
+    MMAUDIO_WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+    MMAUDIO_EXT_WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Always ensure auxiliary weights exist (they may be missing even if ckpt is present)
-    for aux in ["synchformer_state_dict.pth", "vae_128d_48k.pth"]:
-        aux_path = FOLEY_MODEL_DIR / aux
-        if not aux_path.exists():
+    mm_ckpt = MMAUDIO_WEIGHTS_DIR / f"mmaudio_{MMAUDIO_VARIANT}.pth"
+    if not mm_ckpt.exists():
+        got_nsfw = False
+        if MMAUDIO_USE_NSFW:
+            # The NSFW fine-tune ships a single fp16 .safetensors of the
+            # large_44k model. Download it, then convert to the .pth state_dict
+            # filename MMAudio's torch.load(weights_only=True) loader expects.
             try:
-                print(f"[AudioEngine] Downloading auxiliary weight: {aux}")
+                print(f"[AudioEngine] Downloading MMAudio NSFW checkpoint "
+                      f"({MMAUDIO_NSFW_FILE})...")
+                _st_path = hf_hub_download(
+                    repo_id=MMAUDIO_NSFW_REPO, filename=MMAUDIO_NSFW_FILE,
+                    local_dir=str(MMAUDIO_WEIGHTS_DIR), local_dir_use_symlinks=False,
+                )
+                # Convert safetensors -> .pth INSIDE the mmaudio venv (it has
+                # torch + safetensors). Cast fp16 back to fp32 so the loader
+                # matches the model's default dtype handling; MMAudio casts to
+                # bf16/fp16 itself at load time.
+                _conv = subprocess.run(
+                    [str(MMAUDIO_VENV_PY), "-c",
+                     "import sys, torch; from safetensors.torch import load_file; "
+                     "sd = load_file(sys.argv[1]); "
+                     "sd = {k: (v.float() if v.is_floating_point() else v) for k, v in sd.items()}; "
+                     "torch.save(sd, sys.argv[2]); "
+                     "print('converted', len(sd), 'tensors')",
+                     str(_st_path), str(mm_ckpt)],
+                    capture_output=True, text=True,
+                )
+                if _conv.returncode == 0 and mm_ckpt.exists():
+                    got_nsfw = True
+                    print(f"[AudioEngine] MMAudio NSFW checkpoint installed and "
+                          f"converted to {mm_ckpt.name}.")
+                else:
+                    print("[AudioEngine] NSFW safetensors->pth conversion failed "
+                          f"({(_conv.stderr or '')[-400:]}) — falling back to stock weights.")
+            except Exception as _e:
+                print(f"[AudioEngine] Could not fetch NSFW MMAudio checkpoint ({_e}) "
+                      "— falling back to stock MMAudio weights.")
+        if not got_nsfw:
+            print("[AudioEngine] Downloading stock MMAudio flow checkpoint...")
+            _p = hf_hub_download(
+                repo_id="hkchengrex/MMAudio",
+                filename=f"weights/mmaudio_{MMAUDIO_VARIANT}.pth",
+                local_dir=str(MMAUDIO_REPO_DIR), local_dir_use_symlinks=False,
+            )
+            # hf places it under weights/ already if filename has that prefix.
+            if not mm_ckpt.exists() and Path(_p).exists():
+                try:
+                    Path(_p).rename(mm_ckpt)
+                except Exception:
+                    import shutil as _sh
+                    _sh.copyfile(_p, mm_ckpt)
+
+    # Auxiliary encoders/VAE MMAudio needs (44.1kHz). MMAudio also auto-fetches
+    # these, but pre-downloading avoids first-run stalls.
+    for _aux_name, _aux_file in (
+        ("synchformer", "ext_weights/synchformer_state_dict.pth"),
+        ("vae_44k",     "ext_weights/v1-44.pth"),
+    ):
+        _dst = MMAUDIO_REPO_DIR / _aux_file
+        if not _dst.exists():
+            try:
+                print(f"[AudioEngine] Downloading MMAudio aux weight: {_aux_name}")
                 hf_hub_download(
-                    repo_id="tencent/HunyuanVideo-Foley",
-                    filename=aux,
-                    local_dir=str(FOLEY_MODEL_DIR),
-                    local_dir_use_symlinks=False,
+                    repo_id="hkchengrex/MMAudio", filename=_aux_file,
+                    local_dir=str(MMAUDIO_REPO_DIR), local_dir_use_symlinks=False,
                 )
             except Exception as _e:
-                print(f"[AudioEngine] Warning: could not download {aux}: {_e}")
-    print("[AudioEngine] Foley weights ready.")
+                print(f"[AudioEngine] Aux weight {_aux_name} not pre-fetched "
+                      f"(MMAudio will auto-download on first run): {_e}")
+    print("[AudioEngine] MMAudio weights ready.")
 
     _AUDIO_ENGINE_AVAILABLE = True
-    print("[AudioEngine] Dual audio engine ready (F5-TTS + HunyuanVideo-Foley).")
+    # Write the warm-start sentinel so future startups skip the verification
+    # subprocess launches above.
+    try:
+        _AUDIO_ENGINE_SENTINEL.write_text("ok\n")
+    except Exception:
+        pass
+    print("[AudioEngine] Audio engines ready (MMAudio SFX + F5-TTS voice).")
 
 
 F5_INFER_SCRIPT = Path(SCRIPT_DIR) / ".f5tts_infer_worker.py"
@@ -1711,6 +1782,10 @@ def main():
 
     ensure_config()
 
+    # English-only by design: F5TTS_v1_Base is the English base checkpoint, and
+    # the reference clip is transcribed with whisper language="en" above. This
+    # keeps the cloned voice speaking English with no foreign language/accent
+    # switching. (No multilingual F5 model is loaded.)
     from f5_tts.api import F5TTS
     model = F5TTS(model="F5TTS_v1_Base")
     model.infer(
@@ -1815,8 +1890,105 @@ def _run_f5tts(ref_file: str, gen_text: str, out_wav: str, speed: float = 1.0) -
             print(f"[LipSync?F5-TTS] Failed to cleanup payload (non-fatal): {e}")
 
 
+def _run_mmaudio(video_path: str, sfx_prompt: str, negative_prompt: str,
+                 output_wav: str, duration_sec: float = None) -> bool:
+    """
+    Generate synchronized SFX/foley for a video with MMAudio via its isolated
+    venv subprocess. Replaces HunyuanVideo-Foley.
+
+    MMAudio is a video-to-audio foley model — it produces physical/ambient
+    sound effects synced to the visible motion. It does NOT synthesize speech,
+    so there is never any talking from this branch (speech only ever comes from
+    the explicitly-triggered F5-TTS voice branch). We also pass a negative
+    prompt that suppresses speech/music, and MMAudio natively supports negative
+    prompts (unlike the old Foley engine).
+
+    demo.py writes <stem>.flac (audio) into --output; with
+    --skip_video_composite it does NOT re-mux a video, which is what we want —
+    the caller's ffmpeg step mixes the .flac into the final MP4. Returns True
+    if output_wav (the renamed .flac) was produced with nonzero size.
+    """
+    demo_script = MMAUDIO_REPO_DIR / "demo.py"
+    if not MMAUDIO_VENV_PY.exists() or not demo_script.exists():
+        print(f"[AudioEngine] MMAudio not provisioned (venv/demo.py missing) — skipping SFX.")
+        return False
+
+    # Probe duration if not supplied (MMAudio caps to the video length anyway).
+    if duration_sec is None or duration_sec <= 0:
+        try:
+            dur_str = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            duration_sec = float(dur_str)
+        except Exception:
+            duration_sec = 8.0
+
+    out_dir = Path(output_wav).parent
+    stem = Path(video_path).stem
+    prompt = sfx_prompt if (sfx_prompt and sfx_prompt.strip()) else "natural ambient sounds"
+    # Always steer MMAudio away from speech/music so the SFX track stays pure
+    # foley/ambience with no talking, regardless of the user's negative box.
+    neg = (negative_prompt or "").strip()
+    _speech_guard = "speech, voice, talking, singing, music, vocals"
+    neg = f"{neg}, {_speech_guard}" if neg else _speech_guard
+
+    import torch as _torch
+    gpu_id = 1 if _torch.cuda.device_count() >= 2 else 0
+
+    cmd = [
+        str(MMAUDIO_VENV_PY), str(demo_script),
+        "--variant", MMAUDIO_VARIANT,
+        "--video", str(video_path),
+        "--prompt", prompt,
+        "--negative_prompt", neg,
+        "--duration", str(round(float(duration_sec), 2)),
+        "--num_steps", os.environ.get("NEWGEN_MMAUDIO_STEPS", "25"),
+        "--cfg_strength", os.environ.get("NEWGEN_MMAUDIO_CFG", "4.5"),
+        "--output", str(out_dir),
+        "--skip_video_composite",
+    ]
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=600,
+            cwd=str(MMAUDIO_REPO_DIR), env=env,
+        )
+        if result.returncode != 0:
+            print(f"[AudioEngine] MMAudio stderr: {(result.stderr or '')[-2000:]}")
+            return False
+        # demo.py saves <stem>.flac in out_dir.
+        produced = out_dir / f"{stem}.flac"
+        if not produced.exists():
+            # Fallback: pick up any freshly-written .flac/.wav in out_dir.
+            candidates = sorted(
+                list(out_dir.glob("*.flac")) + list(out_dir.glob("*.wav")),
+                key=lambda p: p.stat().st_mtime, reverse=True,
+            )
+            produced = candidates[0] if candidates else None
+        if not produced or not produced.exists():
+            print("[AudioEngine] MMAudio ran but no output audio found.")
+            return False
+        try:
+            if str(produced) != str(output_wav):
+                Path(produced).rename(output_wav)
+        except Exception:
+            import shutil as _sh
+            _sh.copyfile(str(produced), output_wav)
+        return os.path.exists(output_wav) and os.path.getsize(output_wav) > 0
+    except subprocess.TimeoutExpired:
+        print("[AudioEngine] MMAudio timed out.")
+        return False
+    except Exception as e:
+        print(f"[AudioEngine] MMAudio subprocess error: {e}")
+        return False
+
+
 def _run_foley(video_path: str, sfx_prompt: str, output_wav: str) -> bool:
     """
+    (LEGACY — no longer used; SFX now goes through _run_mmaudio.)
     Call HunyuanVideo-Foley's infer.py via subprocess, chaining for long videos.
     
     Foley can only generate ~15s at a time. For videos longer than 15s, split
@@ -2009,13 +2181,17 @@ def add_audio_to_video(
         has_foley = False
         has_voice = False
 
-        # ---- Branch A: Foley / SFX -----------------------------------
-        print("[AudioEngine] Running HunyuanVideo-Foley...")
-        has_foley = _run_foley(vid_tmp, sfx_prompt, foley_wav)
+        # ---- Branch A: SFX / Foley (MMAudio) -------------------------
+        # MMAudio is a pure video-to-audio foley model (no speech). It takes a
+        # real negative prompt, which we use to suppress any speech/music so
+        # the SFX track is ambience/effects only.
+        print("[AudioEngine] Running MMAudio (SFX/foley)...")
+        has_foley = _run_mmaudio(vid_tmp, sfx_prompt, audio_negative_prompt,
+                                 foley_wav, duration_sec)
         if has_foley:
-            print("[AudioEngine] Foley track generated.")
+            print("[AudioEngine] MMAudio SFX track generated.")
         else:
-            print("[AudioEngine] Foley failed — continuing without SFX track.")
+            print("[AudioEngine] MMAudio failed — continuing without SFX track.")
 
         # ---- Branch B: Voice cloning ---------------------------------
         # gr.File (Gradio 3.x) returns an object with .name; gr.Audio returns a path string.
@@ -2138,7 +2314,27 @@ def add_audio_to_video(
         return video_buf
 
 
-_ensure_audio_engines()
+# Audio-engine bootstrap (MMAudio + F5-TTS) is heavy: it can create venvs,
+# clone a repo, and download multi-GB weights on a cold machine, and even on a
+# warm machine it spawns several subprocess import-checks. Running it here on
+# the import thread was the single biggest cause of slow startup — it blocked
+# Gradio from launching until every audio dependency was verified. Instead we
+# kick it off on a daemon thread so the UI comes up immediately; audio simply
+# becomes available a little later (add_audio is OFF by default anyway, and
+# _AUDIO_ENGINE_AVAILABLE gates every audio call until the bootstrap finishes).
+# The post-launch _bg_predownload_assets thread also calls _ensure_audio_engines
+# as a fallback; the internal _AUDIO_ENGINE_AVAILABLE / sentinel guards make the
+# second call a cheap no-op.
+def _bg_bootstrap_audio_engines():
+    try:
+        _ensure_audio_engines()
+    except Exception as _e:
+        print(f"[AudioEngine] background bootstrap failed (non-fatal): {_e}")
+        import traceback as _tb
+        _tb.print_exc()
+
+
+threading.Thread(target=_bg_bootstrap_audio_engines, daemon=True).start()
 
 
 # -- MuseTalk (lip-sync post-processor) ---------------------------------------
@@ -3525,7 +3721,7 @@ for lora_id, info in AVAILABLE_LORAS.items():
 
 FIXED_FPS = 16
 
-WAN_STEPS = 3  # Default fallback, actual steps come from UI slider
+WAN_STEPS = 4  # Default fallback (matches UI slider default); actual steps come from UI slider
 WAN_FLOW_SHIFT = 6.9
 WAN_GUIDANCE = 1.0
 
@@ -3535,10 +3731,10 @@ SEGMENT_DURATION = round(MAX_FRAMES_MODEL / FIXED_FPS, 1)   # ~6.1s per segment
 MIN_DURATION = round(MIN_FRAMES_MODEL / FIXED_FPS, 1)
 MAX_DURATION = 600.0        # 10 minutes max via chaining
 
-AREA_1080P = 1920 * 1080
 AREA_720P  = 1280 * 720
 AREA_600P  = 1024 * 576   # in-between: ~16:9 at ~600p
 AREA_480P  = 832  * 480
+AREA_360P  = 640  * 360   # in-between 240p and 480p: ~16:9 at 360p
 AREA_240P  = 416  * 240   # half of 480p, ultra-fast/small
 MULTIPLE_OF = 16
 
@@ -3763,6 +3959,155 @@ def _from_pretrained_cached(repo: str, **kwargs):
         return WanImageToVideoPipeline.from_pretrained(repo, **kwargs)
 
 
+def _optimize_wan_attention(pipeline):
+    """Attach the fastest available attention backend to the Wan transformer(s).
+
+    Tries, in order of preference and all fully guarded so a missing library or
+    unsupported diffusers version silently falls back to PyTorch SDPA (the
+    default) with NO quality change:
+
+      1. diffusers' set_attention_backend("sage"/"flash")  — modern API
+         (diffusers >= 0.32). On Blackwell, Sage Attention (FP8/INT8 attention)
+         is the fastest and adds no measurable quality loss for inference.
+      2. sageattention monkeypatch on scaled_dot_product_attention.
+      3. Nothing — leave diffusers' default SDPA in place.
+
+    This is a pure speedup for the attention layers (which dominate a video
+    transformer's cost because token count = frames x H/16 x W/16). It does not
+    touch weights, precision of the residual path, or the denoise math, so
+    prompt adherence and detail are preserved.
+    """
+    if os.environ.get("NEWGEN_WAN_ATTENTION", "1") != "1":
+        print("    [wan-attn] disabled via NEWGEN_WAN_ATTENTION=0 — using default SDPA.")
+        return
+
+    transformers_list = [t for t in (
+        getattr(pipeline, "transformer", None),
+        getattr(pipeline, "transformer_2", None),
+    ) if t is not None]
+    if not transformers_list:
+        return
+
+    preferred = os.environ.get("NEWGEN_WAN_ATTENTION_BACKEND", "auto").lower()
+
+    def _has_lib(name):
+        try:
+            import importlib.util as _ilu
+            return _ilu.find_spec(name) is not None
+        except Exception:
+            return False
+
+    # --- Attempt 1: diffusers native set_attention_backend -----------------
+    # Only offer backends whose kernel library is actually importable, so we
+    # never spam errors calling a backend that can't load. "auto" prefers sage
+    # (fastest on Blackwell) then flash. If neither library is present we skip
+    # Attempt 1 entirely and fall through to the sage monkeypatch / SDPA.
+    _lib_for = {
+        "sage": "sageattention",
+        "sage_varlen": "sageattention",
+        "flash": "flash_attn",
+        "flash_varlen": "flash_attn",
+    }
+    if preferred == "auto":
+        candidates = ["sage", "flash", "flash_varlen"]
+    else:
+        candidates = [preferred]
+
+    # Keep only candidates whose backing library is installed.
+    filtered = [c for c in candidates if _has_lib(_lib_for.get(c, "")) or c not in _lib_for]
+
+    applied = None
+    if filtered:
+        for t in transformers_list:
+            setter = getattr(t, "set_attention_backend", None)
+            if not callable(setter):
+                applied = None
+                break  # this diffusers version lacks the API; go to Attempt 2
+            _this = None
+            for backend in filtered:
+                try:
+                    setter(backend)
+                    _this = backend
+                    break
+                except Exception as e:
+                    print(f"    [wan-attn] backend '{backend}' unavailable "
+                          f"({type(e).__name__}); trying next.")
+            if _this is None:
+                applied = None
+                break
+            applied = _this
+
+    if applied is not None:
+        print(f"    [wan-attn] using '{applied}' attention backend on Wan transformer(s) "
+              f"(faster than default SDPA, no quality loss).")
+        return
+
+    # --- Attempt 2: sageattention global monkeypatch -----------------------
+    # SageAttention is a plug-and-play INT8/FP8 attention that matches PyTorch
+    # SDPA's default 4D layout (batch, heads, seq, dim == sage's "HND") and is
+    # designed to be numerically accuracy-preserving, so it's safe for quality.
+    #
+    # CRITICAL: torch SDPA is called with the parameter names query/key/value,
+    # and diffusers' attention dispatcher passes them BY KEYWORD (query=...,
+    # key=..., value=..., attn_mask=...). The wrapper MUST therefore use those
+    # exact names, or a keyword call raises "missing positional arguments".
+    # We only take the sage fast-path for plain 4D, no-mask, no-dropout,
+    # half-precision inference; anything else (masks, dropout, GQA, odd dims,
+    # fp32) falls back to the real SDPA so correctness is never compromised.
+    if _has_lib("sageattention"):
+        try:
+            from sageattention import sageattn
+            import torch.nn.functional as _F
+            if not getattr(_F, "_newgen_sage_patched", False):
+                _orig_sdpa = _F.scaled_dot_product_attention
+
+                def _sage_sdpa(query=None, key=None, value=None, attn_mask=None,
+                               dropout_p=0.0, is_causal=False, scale=None,
+                               enable_gqa=False, **kw):
+                    q, k, v = query, key, value
+                    try:
+                        _eligible = (
+                            attn_mask is None
+                            and float(dropout_p) == 0.0
+                            and not enable_gqa
+                            and hasattr(q, "dim") and q.dim() == 4
+                            and hasattr(k, "dim") and k.dim() == 4
+                            and hasattr(v, "dim") and v.dim() == 4
+                            and q.dtype in (torch.float16, torch.bfloat16)
+                            # GQA also shows up as differing head counts; skip it.
+                            and q.shape[1] == k.shape[1] == v.shape[1]
+                        )
+                    except Exception:
+                        _eligible = False
+                    if _eligible:
+                        try:
+                            # HND == (batch, heads, seq, dim), the same layout
+                            # torch SDPA uses for 4D inputs.
+                            return sageattn(q, k, v, tensor_layout="HND",
+                                            is_causal=bool(is_causal))
+                        except Exception:
+                            pass  # fall through to exact SDPA
+                    # Exact PyTorch SDPA fallback — pass everything through by
+                    # keyword so no argument is ever dropped. Only forward
+                    # enable_gqa when set, since older torch SDPA lacks that
+                    # keyword and would raise on an unexpected kwarg.
+                    if enable_gqa:
+                        kw["enable_gqa"] = True
+                    return _orig_sdpa(q, k, v, attn_mask=attn_mask,
+                                      dropout_p=dropout_p, is_causal=is_causal,
+                                      scale=scale, **kw)
+
+                _F.scaled_dot_product_attention = _sage_sdpa
+                _F._newgen_sage_patched = True
+            print("    [wan-attn] Sage Attention monkeypatch active (fast path for "
+                  "plain 4D unmasked inference; exact SDPA fallback otherwise).")
+            return
+        except Exception as e:
+            print(f"    [wan-attn] sageattention patch failed ({e}); using default SDPA.")
+
+    print("    [wan-attn] no accelerated backend available — using PyTorch SDPA (default).")
+
+
 def _build_wan_pipeline(target_device="cpu"):
     global wan_pipe, _wan_loaded, _wan_scheduler_config
 
@@ -3792,8 +4137,34 @@ def _build_wan_pipeline(target_device="cpu"):
         print(f" WAMU v2 loaded fully on {target_device} ({GPU_VRAM_GB:.0f} GB VRAM) - Ready!")
 
     _wan_scheduler_config = dict(pipeline.scheduler.config)
-    pipeline.vae.enable_slicing()
-    pipeline.vae.enable_tiling()
+
+    # VAE memory savers: tiling splits the latent into spatial tiles and slicing
+    # decodes frames one at a time. Both exist to fit small (<=32 GB) cards, but
+    # they add decode overhead and tiling can leave faint seams / softening at
+    # tile borders. On a big card (>=40 GB) we decode the whole latent in one
+    # pass — faster AND higher quality (no seams, full detail). Only enable the
+    # savers on smaller cards where they're needed to avoid VAE-decode OOM.
+    try:
+        if GPU_HIGH_VRAM:
+            if hasattr(pipeline.vae, "disable_tiling"):
+                pipeline.vae.disable_tiling()
+            if hasattr(pipeline.vae, "disable_slicing"):
+                pipeline.vae.disable_slicing()
+            print("    [wan-vae] full-latent decode (tiling/slicing OFF) — "
+                  "high-VRAM card, faster decode + no tile seams.")
+        else:
+            pipeline.vae.enable_slicing()
+            pipeline.vae.enable_tiling()
+            print("    [wan-vae] tiling+slicing ON (low-VRAM card).")
+    except Exception as _vae_e:
+        print(f"    [wan-vae] tiling config note: {_vae_e}")
+
+    # Attach the fastest available attention backend (Sage/Flash) with graceful
+    # SDPA fallback. Pure speedup for the transformer attention layers.
+    try:
+        _optimize_wan_attention(pipeline)
+    except Exception as _attn_e:
+        print(f"    [wan-attn] optimization skipped ({_attn_e}).")
 
     wan_pipe = pipeline
     _wan_loaded = True
@@ -3849,7 +4220,7 @@ def _ensure_pil(image):
     return image
 
 
-def resize_image_for_wan(image: Image.Image, resolution: str = "720p") -> Image.Image:
+def resize_image_for_wan(image: Image.Image, resolution: str = "480p") -> Image.Image:
     """
     Fit an image to a target pixel area while preserving aspect ratio.
 
@@ -3865,12 +4236,12 @@ def resize_image_for_wan(image: Image.Image, resolution: str = "720p") -> Image.
     
     if resolution == "240p":
         max_area = AREA_240P
+    elif resolution == "360p":
+        max_area = AREA_360P
     elif resolution == "480p":
         max_area = AREA_480P
     elif resolution == "600p":
         max_area = AREA_600P
-    elif resolution == "1080p":
-        max_area = AREA_1080P
     else:
         max_area = AREA_720P
 
@@ -4802,15 +5173,19 @@ def animate_frame(
             kwargs["callback_on_step_end"] = _step_cb
 
         def _run(**kw):
-            try:
-                return wan_pipe(**kw).frames[0]
-            except TypeError as e:
-                # Older pipeline without callback_on_step_end support: retry
-                # without the callback rather than failing.
-                if "callback_on_step_end" in str(e) and "callback_on_step_end" in kw:
-                    kw.pop("callback_on_step_end", None)
+            # inference_mode disables autograd tracking entirely (stronger than
+            # no_grad): no version counters, no graph bookkeeping. Pure inference
+            # speedup with identical numerics, so no detail/adherence loss.
+            with torch.inference_mode():
+                try:
                     return wan_pipe(**kw).frames[0]
-                raise
+                except TypeError as e:
+                    # Older pipeline without callback_on_step_end support: retry
+                    # without the callback rather than failing.
+                    if "callback_on_step_end" in str(e) and "callback_on_step_end" in kw:
+                        kw.pop("callback_on_step_end", None)
+                        return wan_pipe(**kw).frames[0]
+                    raise
 
         if last_frame is None:
             return _run(**kwargs)
@@ -5110,7 +5485,7 @@ def generate_video(
     randomize_seed=True,
     add_audio_cb=True,
     audio_prompt_tb="quiet ambience, soft room tone",
-    audio_negative_prompt_tb="music, noise, wind, crowd",
+    audio_negative_prompt_tb="speech, talking, voice, music, noise, wind, crowd",
     ref_audio_path=None,
     dialogue_text="",
     voice_speed=0.8,
@@ -5391,7 +5766,7 @@ def generate_sequence(
     randomize_seed=True,
     add_audio_cb=True,
     audio_prompt_tb="quiet ambience, soft room tone",
-    audio_negative_prompt_tb="music, noise, wind, crowd",
+    audio_negative_prompt_tb="speech, talking, voice, music, noise, wind, crowd",
     ref_audio_path=None,
     dialogue_text="",
     voice_speed=0.8,
@@ -5590,7 +5965,7 @@ def generate_custom_edit_sequence(
     randomize_seed=True,
     add_audio_cb=True,
     audio_prompt_tb="quiet ambience, soft room tone",
-    audio_negative_prompt_tb="music, noise, wind, crowd",
+    audio_negative_prompt_tb="speech, talking, voice, music, noise, wind, crowd",
     ref_audio_path=None,
     dialogue_text="",
     voice_speed=0.8,
@@ -6556,18 +6931,20 @@ else:
     if _VRAM_PROBE:
         _probe_pipeline_vram(pic_pipe, label="Qwen picgen pipeline", exit_after=True)
 
-    # Measured sizes: transformer 19.0 GB (fp8) + text_encoder 15.5 GB (bf16)
-    # + vae 0.24 GB = 34.7 GB co-resident, which does NOT fit the 32 GB card.
-    # So picgen uses diffusers model-CPU-offload: each component is moved to
-    # GPU only while it runs, then back to CPU. The transformer stays resident
-    # for the entire denoise loop (peak ~19 GB + activations, fits with ~12 GB
-    # to spare), and the 15.5 GB text encoder only occupies GPU during the
-    # one-time prompt encode. No precision change, no per-step penalty.
+    # SINGLE-GPU RESIDENCY RULE (picgen startup mode):
+    # In picgen mode ONLY Qwen is placed on the GPU — Wan is loaded lazily to
+    # CPU by a background thread and is never on the GPU here, so making Qwen
+    # GPU-resident does NOT co-reside two models. This keeps picgen instantly
+    # usable (no first-request swap). If a vidgen request later arrives,
+    # activate_wan() evicts Qwen before placing Wan, so the one-model-at-a-time
+    # invariant still holds. _enable_pic_offload uses full residency on big
+    # cards and model-CPU-offload on small ones — either way only Qwen occupies
+    # the GPU.
     _enable_pic_offload(pic_pipe)
+    _active_model = "pic"
 
     qwen_time = time.time() - start_qwen
-    print(f" QWEN READY (model-CPU-offload) in {qwen_time:.1f}s - Picgen functional!")
-    _active_model = "pic"
+    print(f" QWEN READY on {PIC_DEVICE} in {qwen_time:.1f}s - Picgen functional!")
 
 _swap_lock = _gpu_op_lock
 
@@ -8123,9 +8500,9 @@ with gr.Blocks(css=css) as demo:
 
                     with gr.Group():
                         resolution = gr.Radio(
-                            choices=["240p", "480p", "600p", "720p", "1080p"], value="480p",
+                            choices=["240p", "360p", "480p", "600p", "720p"], value="480p",
                             label="Resolution",
-                            info="240p=ultra-fast/tiny, 480p=fast, 600p=balanced, 720p=high quality, 1080p=max (slow, VRAM heavy)",
+                            info="240p=ultra-fast/tiny, 360p=very fast, 480p=fast (default), 600p=balanced, 720p=high quality",
                         )
                     
                     def update_flow_shift_interactivity(auto_enabled):
@@ -8258,16 +8635,16 @@ with gr.Blocks(css=css) as demo:
                         )
 
             with gr.Group():
-                add_audio_cb = gr.Checkbox(label="Add Audio (F5-TTS + HunyuanVideo-Foley)", value=False)
+                add_audio_cb = gr.Checkbox(label="Add Audio (MMAudio SFX + F5-TTS voice)", value=False)
                 # -- Top row: all four panels side-by-side ----------------------
                 with gr.Row():
                     audio_prompt_tb = gr.Textbox(
-                        label="Sound Effects / Foley Prompt", value="quiet ambience, soft room tone",
+                        label="Sound Effects / Foley Prompt (MMAudio)", value="quiet ambience, soft room tone",
                         lines=4, scale=1,
                     )
                     audio_negative_prompt_tb = gr.Textbox(
-                        label="Audio Negative Prompt", value="music, noise, wind, crowd",
-                        placeholder="e.g. music, noise, wind, crowd",
+                        label="Audio Negative Prompt", value="speech, talking, voice, music, noise, wind, crowd",
+                        placeholder="e.g. speech, talking, voice, music",
                         lines=4, scale=1,
                     )
                     with gr.Column(scale=1):
