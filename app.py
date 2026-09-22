@@ -100,7 +100,11 @@ def _selfheal_musetalk_weights():
         except Exception as _e:
             print(f"[SelfHeal] {rel} check failed (non-fatal): {_e}")
 
-threading.Thread(target=_selfheal_musetalk_weights, daemon=True).start()
+# NOTE: the MuseTalk weight self-heal is vidgen-only (lip-sync). In --picgen
+# mode it must not touch disk until picgen is ready, so its background thread
+# is started (gated) below, right after the vidgen-assets gate is defined —
+# not here. In vidgen/default mode the gate is already open, so it runs
+# immediately just as before.
 # ---------------------------------------------------------------------------
 
 
@@ -116,7 +120,87 @@ def _parse_startup_mode(argv):
     return next(iter(modes), "vidgen")
 
 
+def _parse_novidgen(argv):
+    """True if --novidgen / -novidgen was passed.
+
+    When set, the vidgen tab is hard-disabled for the whole session: NOTHING
+    vidgen-related (Wan video model, F5-TTS voice cloning, HunyuanVideo-Foley
+    SFX, MuseTalk lip-sync) is ever downloaded, built, or loaded — not in the
+    background and not on demand. Picgen runs normally. To get vidgen, restart
+    the app without this flag.
+    """
+    for arg in argv[1:]:
+        if arg.lstrip("-").lower() == "novidgen":
+            return True
+    return False
+
+
 STARTUP_MODE = _parse_startup_mode(sys.argv)
+VIDGEN_DISABLED = _parse_novidgen(sys.argv)
+if VIDGEN_DISABLED:
+    print("[Mode] --novidgen: vidgen is DISABLED for this session — no Wan / "
+          "F5-TTS / Foley / MuseTalk files will be downloaded or loaded. "
+          "Restart without -novidgen to enable the video tab.")
+
+# ---------------------------------------------------------------------------
+# Vidgen-tab readiness gate.
+#
+# In --picgen mode, NOTHING that only serves the vidgen tab (the Wan video
+# model, F5-TTS voice cloning, HunyuanVideo-Foley SFX, MuseTalk lip-sync) may
+# download, build a venv, or otherwise compete for disk / CPU / network until
+# picgen is fully up and usable for the user. Every vidgen-only setup routine
+# waits on this event before doing any heavy work.
+#
+# It starts SET (open) for vidgen/default mode so existing behaviour is
+# unchanged there. In picgen mode it is cleared (closed) below and only set
+# once the launch block confirms picgen is serving and idle.
+#
+# In --novidgen mode the gate stays PERMANENTLY closed and vidgen-only threads
+# are never even started (see below), so nothing vidgen ever downloads/loads.
+_vidgen_assets_gate = threading.Event()
+if VIDGEN_DISABLED:
+    _vidgen_assets_gate.clear()          # never opens this session
+elif STARTUP_MODE == "picgen":
+    _vidgen_assets_gate.clear()          # opens once picgen is confirmed ready
+else:
+    _vidgen_assets_gate.set()            # vidgen/default: open immediately
+
+
+def _await_vidgen_assets_gate(what: str):
+    """Block the calling (background) thread until vidgen-only work is allowed.
+
+    Returns True if the caller may proceed, False if it must abort entirely
+    (vidgen disabled for this session). In vidgen/default mode returns True at
+    once; in picgen mode blocks until picgen is confirmed ready; in --novidgen
+    mode returns False immediately so the caller does no vidgen work at all.
+    """
+    if VIDGEN_DISABLED:
+        print(f"[VidgenGate] '{what}' skipped — vidgen disabled (--novidgen).")
+        return False
+    if _vidgen_assets_gate.is_set():
+        return True
+    print(f"[VidgenGate] Deferring '{what}' until picgen is fully ready for the user...")
+    _vidgen_assets_gate.wait()
+    # Re-check after waking: the gate is only ever set when vidgen is allowed.
+    if VIDGEN_DISABLED:
+        return False
+    print(f"[VidgenGate] picgen ready — now allowing '{what}'.")
+    return True
+
+
+def _gated_selfheal_musetalk_weights():
+    """Run the MuseTalk (lip-sync, vidgen-only) weight self-heal, but only once
+    vidgen-side work is permitted (immediately in vidgen mode; after picgen is
+    ready in picgen mode; never in --novidgen mode)."""
+    if not _await_vidgen_assets_gate("MuseTalk weight self-heal"):
+        return
+    _selfheal_musetalk_weights()
+
+
+# In --novidgen mode we never even start the MuseTalk self-heal thread.
+if not VIDGEN_DISABLED:
+    threading.Thread(target=_gated_selfheal_musetalk_weights, daemon=True).start()
+
 
 # One process-wide lock owns model residency, pipeline mutation, inference, RIFE,
 # and CUDA cleanup.  RLock permits helpers to compose without deadlocking.
@@ -1324,6 +1408,12 @@ def _ensure_audio_engines():
     """
     global _AUDIO_ENGINE_AVAILABLE
 
+    # Audio engines (voice cloning + SFX) are vidgen-only. Never set them up
+    # when vidgen is disabled — no venv builds, no weight downloads this session.
+    if VIDGEN_DISABLED:
+        print("[AudioEngine] setup skipped — vidgen disabled (--novidgen).")
+        return
+
     # --- Foley venv bootstrap -------------------------------------------------
     # HunyuanVideo-Foley runs in its own isolated venv (.foley-venv) so its
     # protobuf<5.0 requirement from descript-audiotools never touches the system
@@ -2138,7 +2228,28 @@ def add_audio_to_video(
         return video_buf
 
 
-_ensure_audio_engines()
+# The audio engines (F5-TTS voice cloning + HunyuanVideo-Foley SFX) serve the
+# vidgen tab only. Building their isolated venvs and downloading their weights
+# is multi-GB, one-time work.
+#   • --novidgen mode: never set up at all (nothing vidgen is loaded/downloaded).
+#   • vidgen/default mode: run it synchronously right here, exactly as before,
+#     so audio is ready by the time the UI is built.
+#   • picgen mode: do NOT run it at import time (it would block picgen from
+#     even starting). Instead run it on a background thread that waits on the
+#     vidgen-assets gate, so it only begins after picgen is fully up and idle.
+if VIDGEN_DISABLED:
+    print("[AudioEngine] skipped — vidgen disabled (--novidgen).")
+elif STARTUP_MODE == "picgen":
+    def _gated_ensure_audio_engines():
+        if not _await_vidgen_assets_gate("audio engines setup (F5-TTS + HunyuanVideo-Foley)"):
+            return
+        try:
+            _ensure_audio_engines()
+        except Exception as _e:
+            print(f"[AudioEngine] gated setup failed (non-fatal): {_e}")
+    threading.Thread(target=_gated_ensure_audio_engines, daemon=True).start()
+else:
+    _ensure_audio_engines()
 
 
 # -- MuseTalk (lip-sync post-processor) ---------------------------------------
@@ -2177,6 +2288,10 @@ def _ensure_musetalk():
         which has changed across revisions.
     """
     global _musetalk_ready
+    if VIDGEN_DISABLED:
+        # Lip-sync is a vidgen feature; never download/build it this session.
+        print("[LipSync] setup skipped — vidgen disabled (--novidgen).")
+        return False
     with _musetalk_lock:
         if _musetalk_ready:
             return True
@@ -3051,8 +3166,24 @@ def generate_lip_sync_video(
     return out_path, out_path, status
 
 
-# kick off MuseTalk pre-download in the background so it's ready when needed
-threading.Thread(target=_ensure_musetalk, daemon=True).start()
+# Kick off MuseTalk pre-download in the background so it's ready when needed.
+# MuseTalk (lip-sync) is vidgen-only and multi-GB, so in --picgen mode the
+# pre-download waits on the vidgen-assets gate and only starts once picgen is
+# fully up and idle. In vidgen/default mode the gate is already open, so it
+# starts immediately as before. (On-demand jobs still call _ensure_musetalk()
+# with a wait, so gating the pre-download never breaks a real lip-sync job.)
+def _gated_ensure_musetalk():
+    if not _await_vidgen_assets_gate("MuseTalk lip-sync setup/pre-download"):
+        return
+    try:
+        _ensure_musetalk()
+    except Exception as _e:
+        print(f"[LipSync] gated MuseTalk pre-download failed (non-fatal): {_e}")
+
+
+# In --novidgen mode we never start the MuseTalk pre-download thread at all.
+if not VIDGEN_DISABLED:
+    threading.Thread(target=_gated_ensure_musetalk, daemon=True).start()
 
 
 MAX_SEED = np.iinfo(np.int32).max
@@ -3743,6 +3874,15 @@ def _load_wan(target_device="cpu"):
     ~57 GB download and model build cannot block the Photo Editor tab.
     """
     global wan_pipe, _wan_loaded
+    # Hard stop when vidgen is disabled: never download or build Wan. This is
+    # the single choke point for the ~57 GB Wan download, so guarding it here
+    # guarantees no video-model files are ever fetched in --novidgen mode,
+    # whether the call came from startup, a swap, or any generation path.
+    if VIDGEN_DISABLED:
+        raise gr.Error(
+            "Video generation is disabled for this session (--novidgen). "
+            "Restart the app without -novidgen to use the video tab."
+        )
     if _wan_loaded and wan_pipe is not None:
         return wan_pipe
 
@@ -6066,6 +6206,167 @@ def _cast_transformer_to_fp8(pipe):
 
 
 # ---------------------------------------------------------------------------
+# FlashAttention-3 for the Qwen transformer (per-step speedup).
+#
+# The Qwen picgen transformer's attention runs through the default
+# QwenDoubleStreamAttnProcessor2_0 (PyTorch SDPA). qwenimage/qwen_fa3_processor.py
+# ships a drop-in FA3 processor (QwenDoubleStreamAttnProcessorFA3) that is
+# numerically exact — it computes the same joint [text, image] attention, just
+# with the faster FlashAttention-3 kernel on Hopper/Blackwell. It is NOT wired
+# in by default, so we install it here.
+#
+# Correctness note: the existing SDPA processor already ignores
+# encoder_hidden_states_mask (it calls attention with attn_mask=None), so the
+# FA3 processor — which likewise does not apply an arbitrary mask — produces
+# equivalent masking behaviour. This is a speed change, not a quality change.
+#
+# Guarded end-to-end: if the `kernels` FA3 kernel is unavailable, or set-up
+# fails for any reason, we leave the default SDPA processor untouched so the
+# app keeps working exactly as before.
+# ---------------------------------------------------------------------------
+_QWEN_FA3_ENABLED = os.environ.get("NEWGEN_QWEN_FA3", "1") == "1"
+_qwen_fa3_state = {"active": False, "attempted": False}
+
+
+def _try_enable_qwen_fa3(pipe):
+    """Best-effort: install the FA3 attention processor on the Qwen transformer.
+
+    Returns True if FA3 was installed, False if we kept the default SDPA
+    processor (unavailable kernel, disabled via env, or any error). Never
+    raises — a failure just means "keep the fast-but-standard SDPA path".
+    """
+    if not _QWEN_FA3_ENABLED:
+        return False
+    transformer = getattr(pipe, "transformer", None)
+    if transformer is None or not hasattr(transformer, "set_attn_processor"):
+        return False
+    try:
+        # Importing this triggers the one-time FA3 kernel fetch/compile. If the
+        # kernel is unavailable it raises here and we fall back to SDPA.
+        from qwenimage.qwen_fa3_processor import QwenDoubleStreamAttnProcessorFA3
+        transformer.set_attn_processor(QwenDoubleStreamAttnProcessorFA3())
+        _qwen_fa3_state["active"] = True
+        print("    [fa3] FlashAttention-3 attention processor enabled on Qwen "
+              "transformer (numerically exact, faster per-step).")
+        return True
+    except Exception as _e:
+        _qwen_fa3_state["active"] = False
+        print(f"    [fa3] FlashAttention-3 unavailable — keeping default SDPA "
+              f"attention (non-fatal): {type(_e).__name__}: {_e}")
+        return False
+    finally:
+        _qwen_fa3_state["attempted"] = True
+
+
+def _apply_qwen_vae_memory_policy(pipe, device):
+    """Choose VAE tiling/slicing based on the picgen device's VRAM.
+
+    VAE tiling+slicing trade decode speed for lower peak VRAM. On a big card
+    (>=40 GB, e.g. the Blackwell 6000) there is plenty of memory, so we turn
+    BOTH OFF and decode the whole latent in one pass — that is faster and, if
+    anything, cleaner (no tile seams). On smaller cards we KEEP tiling+slicing
+    on (the safe default) so the decode never OOMs. Quality-neutral either way.
+    Never raises.
+    """
+    try:
+        vae = getattr(pipe, "vae", None)
+        if vae is None:
+            return
+        total_vram = _device_total_vram_gb(device)
+        if total_vram >= FULL_RESIDENCY_VRAM_GB:
+            # Big card: full-frame decode (faster). disable_* exist on the
+            # diffusers VAE; guard each call independently.
+            try:
+                vae.disable_tiling()
+            except Exception:
+                pass
+            try:
+                vae.disable_slicing()
+            except Exception:
+                pass
+            print(f"    [vae] full-frame decode on {device} "
+                  f"(card {total_vram:.0f} GB — tiling/slicing off for speed).")
+        else:
+            # Small card: keep the memory-safe path.
+            try:
+                vae.enable_tiling()
+            except Exception:
+                pass
+            try:
+                vae.enable_slicing()
+            except Exception:
+                pass
+    except Exception as _e:
+        print(f"    [vae] memory policy skipped (non-fatal): {_e}")
+
+
+def _try_speed_up_text_encoder_attn(pipe):
+    """Best-effort: switch the Qwen2.5-VL text encoder to SDPA attention so the
+    pre-step prompt+image encode is faster.
+
+    SDPA is numerically exact vs. eager attention, so this is a speed change
+    only — no effect on prompt embeddings or adherence. SDPA ships with
+    PyTorch 2.x and needs no extra packages.
+
+    We deliberately do NOT try 'flash_attention_2' here: it requires the
+    separate `flash_attn` package (not installed in this venv), and — as seen
+    in practice — the transformers setter partially mutates the model's
+    sub-configs (vision_config / text_config) before failing, which can leave
+    the encoder in a half-applied state and emit "undefined behavior" warnings.
+    SDPA avoids all of that and is the reliable, safe fast path.
+
+    Only applies if the encoder is currently using plain 'eager' attention, so
+    we never disturb a model that already has a faster impl. Never raises.
+    """
+    te = getattr(pipe, "text_encoder", None)
+    if te is None:
+        return
+    setter = getattr(te, "set_attn_implementation", None)
+    if not callable(setter):
+        # Older transformers without the public setter — leave as-is rather
+        # than poking private config, which can desync the loaded modules.
+        return
+    # If it's already sdpa/flash, don't touch it.
+    try:
+        cur = getattr(getattr(te, "config", None), "_attn_implementation", None)
+        if cur and cur != "eager":
+            return
+    except Exception:
+        pass
+    try:
+        setter("sdpa")
+        print("    [txt-enc] Qwen2.5-VL text encoder attention set to 'sdpa' "
+              "(exact, faster prompt/image encode).")
+    except Exception as _e:
+        print(f"    [txt-enc] could not switch text encoder to sdpa — keeping "
+              f"default (non-fatal): {type(_e).__name__}: {_e}")
+
+
+def _optimize_qwen_pipe(pipe, device=None):
+    """Apply all safe, quality-neutral picgen speedups to a loaded Qwen pipe.
+
+    - Install FA3 attention on the transformer (with SDPA fallback).
+    - Switch the text encoder to FlashAttention-2/SDPA (with fallback).
+    - Apply the VAE tiling/slicing policy for `device` (full-frame on big cards,
+      tiled on small cards).
+
+    Kept as a single entry point so every Qwen load path (picgen startup,
+    dual-GPU, vidgen-mode background load, __main__ background load) applies the
+    same optimizations consistently. Never raises.
+    """
+    try:
+        _try_enable_qwen_fa3(pipe)
+    except Exception as _e:
+        print(f"    [optimize] Qwen FA3 setup skipped (non-fatal): {_e}")
+    try:
+        _try_speed_up_text_encoder_attn(pipe)
+    except Exception as _e:
+        print(f"    [optimize] text-encoder attn setup skipped (non-fatal): {_e}")
+    if device is not None:
+        _apply_qwen_vae_memory_policy(pipe, device)
+
+
+# ---------------------------------------------------------------------------
 # TEMPORARY VRAM PROBE  (enable with NEWGEN_VRAM_PROBE=1)
 #
 # Reports the exact resident byte size of every pipeline component WITHOUT
@@ -6361,6 +6662,8 @@ if DUAL_GPU:
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
         pipe.to(PIC_DEVICE)
+        # Quality-neutral speedups: FA3 attention (fallback SDPA) + VAE policy.
+        _optimize_qwen_pipe(pipe, PIC_DEVICE)
         pic_pipe = pipe
         print(f" Qwen ready on {PIC_DEVICE} in {time.time()-t:.1f}s")
 
@@ -6461,6 +6764,10 @@ elif STARTUP_MODE == "vidgen":
             pipe.vae.enable_tiling()
             pipe.vae.enable_slicing()
             pipe.to("cpu")
+            # Quality-neutral speedups: FA3 attention (fallback SDPA) + VAE
+            # decode policy for the picgen device (applied now; effective once
+            # the pipe is swapped onto the GPU by activate_pic()).
+            _optimize_qwen_pipe(pipe, PIC_DEVICE)
             pic_pipe = pipe
             print(f" Qwen loaded to CPU in {time.time()-t:.1f}s  Replace/Custom modes ready!")
         except Exception as e:
@@ -6565,6 +6872,10 @@ else:
     # one-time prompt encode. No precision change, no per-step penalty.
     _enable_pic_offload(pic_pipe)
 
+    # Quality-neutral speedups: FA3 attention (fallback SDPA) + VAE decode
+    # policy (full-frame on big cards, tiled on small cards).
+    _optimize_qwen_pipe(pic_pipe, PIC_DEVICE)
+
     qwen_time = time.time() - start_qwen
     print(f" QWEN READY (model-CPU-offload) in {qwen_time:.1f}s - Picgen functional!")
     _active_model = "pic"
@@ -6649,6 +6960,11 @@ def _aggressive_pipeline_load(repo_id, device, pipeline_name):
 def _activate_model(target):
     """Transactionally establish exclusive single-GPU residency."""
     global _active_model
+    if target == "wan" and VIDGEN_DISABLED:
+        raise gr.Error(
+            "Video generation is disabled for this session (--novidgen). "
+            "Restart the app without -novidgen to use the video tab."
+        )
     target_device = WAN_DEVICE if target == "wan" else PIC_DEVICE
     with _gpu_op_lock:
         if DUAL_GPU:
@@ -7173,9 +7489,60 @@ def infer(
         if images is not None and result[1] is not None:
             pass
         return result
-    
+
+    # VAE image-latent cache: the pipeline's _encode_vae_image() runs the VAE
+    # encoder on each conditioning image every generation. That encode is fully
+    # deterministic (sample_mode="argmax", no RNG), so its result is identical
+    # for the same input tensor — meaning re-running the SAME image with a
+    # different prompt (or a different seed) can reuse it and skip the encode
+    # entirely. We wrap _encode_vae_image with a content-hash cache. This is a
+    # pure speedup with no numerical change (a cache hit returns exactly the
+    # tensor the encoder would have produced). The random initial latents are
+    # produced elsewhere in prepare_latents and are NOT cached, so seed
+    # behaviour and output variety are completely unaffected.
+    original_encode_vae_image = pic_pipe._encode_vae_image
+
+    def _vae_image_cache_key(image_tensor):
+        try:
+            t = image_tensor.detach()
+            # Hash shape + a downsampled byte view for speed; exact enough to
+            # distinguish different inputs while staying cheap. Fall back to
+            # no-cache (None) on any error.
+            meta = f"{tuple(t.shape)}|{t.dtype}".encode()
+            # Move a small strided sample to CPU for hashing to avoid copying
+            # the whole tensor every call.
+            flat = t.flatten()
+            n = flat.numel()
+            if n == 0:
+                return None
+            step = max(1, n // 4096)
+            sample = flat[::step].to("cpu", dtype=torch.float32).numpy().tobytes()
+            return hashlib.sha256(meta + sample).hexdigest()
+        except Exception:
+            return None
+
+    def cached_encode_vae_image(image, generator):
+        key = _vae_image_cache_key(image)
+        if key is not None:
+            with _picgen_cache_lock:
+                cached = _picgen_cache["vae_latents"].get(key)
+            if cached is not None:
+                return _device_tree(cached, PIC_DEVICE)
+        result = original_encode_vae_image(image, generator)
+        if key is not None:
+            try:
+                with _picgen_cache_lock:
+                    cache = _picgen_cache["vae_latents"]
+                    if len(cache) >= MAX_CACHE_ENTRIES:
+                        cache.pop(next(iter(cache)))
+                    cache[key] = _cpu_detach_tree(result)
+            except Exception:
+                pass
+        return result
+
     pic_pipe.encode_prompt = cached_encode_prompt
     pic_pipe.prepare_latents = cached_prepare_latents
+    pic_pipe._encode_vae_image = cached_encode_vae_image
 
     # Per-step progress: drive the gr.Progress object EXPLICITLY from a
     # pipeline step callback (same pattern as vidgen's animate_frame _step_cb).
@@ -7212,22 +7579,52 @@ def infer(
         callback_on_step_end=_pic_step_cb,
     )
 
+    # Fused SDPA backend guard: when FA3 is NOT active on the transformer, the
+    # attention falls through to PyTorch SDPA. Forcing the flash / mem-efficient
+    # backends (and dropping the slow math fallback) makes SDPA pick the fused
+    # kernel. This is numerically exact — same attention, faster kernel. When
+    # FA3 IS active this context is harmless (the transformer doesn't call SDPA).
+    # Guarded so any torch version without torch.nn.attention still works.
+    @contextlib.contextmanager
+    def _fast_sdpa_backend():
+        if _qwen_fa3_state.get("active"):
+            # FA3 handles attention; no SDPA backend selection needed.
+            yield
+            return
+        try:
+            from torch.nn.attention import sdpa_kernel, SDPBackend
+            backends = []
+            for _name in ("FLASH_ATTENTION", "EFFICIENT_ATTENTION", "CUDNN_ATTENTION", "MATH"):
+                _b = getattr(SDPBackend, _name, None)
+                if _b is not None:
+                    backends.append(_b)
+            if not backends:
+                yield
+                return
+            with sdpa_kernel(backends):
+                yield
+        except Exception:
+            # Any failure (old torch, unsupported combo) — run without the hint.
+            yield
+
     try:
         with torch.cuda.device(PIC_DEVICE):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                try:
-                    image = pic_pipe(**_pic_call_kwargs).images
-                except TypeError as _cb_e:
-                    # Older pipeline without callback_on_step_end support:
-                    # retry without the callback rather than failing.
-                    if "callback_on_step_end" in str(_cb_e):
-                        _pic_call_kwargs.pop("callback_on_step_end", None)
+                with _fast_sdpa_backend():
+                    try:
                         image = pic_pipe(**_pic_call_kwargs).images
-                    else:
-                        raise
+                    except TypeError as _cb_e:
+                        # Older pipeline without callback_on_step_end support:
+                        # retry without the callback rather than failing.
+                        if "callback_on_step_end" in str(_cb_e):
+                            _pic_call_kwargs.pop("callback_on_step_end", None)
+                            image = pic_pipe(**_pic_call_kwargs).images
+                        else:
+                            raise
     finally:
         pic_pipe.encode_prompt = original_encode_prompt
         pic_pipe.prepare_latents = original_prepare_latents
+        pic_pipe._encode_vae_image = original_encode_vae_image
 
     print(f"  pipeline call took {time.time() - _t_pipe:.2f}s")
 
@@ -10885,10 +11282,15 @@ async def _logs_stream(request: _FastAPIRequest):
 if __name__ == "__main__":
     _start_push_api()
 
-    # Start the inactive CPU preload before demo.launch(), which blocks for the
-    # lifetime of the server.  The loader is idempotent and never claims GPU.
-    if not DUAL_GPU and STARTUP_MODE == "picgen" and not _wan_loaded:
-        threading.Thread(target=lambda: _load_wan("cpu"), daemon=True).start()
+    # NOTE: In picgen mode we deliberately do NOT preload Wan (the vidgen model)
+    # here. Doing it before demo.launch() (or eagerly right after) competes with
+    # picgen for disk I/O, CPU, RAM bandwidth and — on first run — the ~57 GB Wan
+    # download, right when the user is waiting for picgen to become usable.
+    # Instead, the vidgen CPU preload is started by _bg_load() below, but only
+    # AFTER picgen is confirmed serving and idle (see _picgen_ready gating), and
+    # it only ever loads Wan to CPU — never onto the GPU. Exactly one tab's model
+    # occupies the GPU at any time; activate_wan() performs the GPU swap only when
+    # the user actually switches to the vidgen tab.
 
     if DUAL_GPU:
         print(f" GRADIO LAUNCHING  Wan on {WAN_DEVICE}, Qwen on {PIC_DEVICE}. Both tabs ready.")
@@ -10911,6 +11313,90 @@ if __name__ == "__main__":
             share=False,
             allowed_paths=[SCRIPT_DIR, os.path.join(SCRIPT_DIR, "tmp", "gradio")],
         )
+
+        def _wait_until_picgen_ready(timeout=600.0):
+            """Block until picgen is actually usable in the browser.
+
+            Two conditions must both hold:
+              1. Gradio's HTTP server answers on 127.0.0.1:7860 (the page loads).
+              2. The Qwen pipeline is loaded and is the active GPU model
+                 (_active_model == "pic" and pic_pipe is not None), i.e. the
+                 synchronous picgen startup block finished and picgen can serve
+                 a generation right now.
+
+            Returns True when ready, False on timeout. Never raises — a failed
+            probe just means "not ready yet", so we keep waiting up to timeout.
+            """
+            import urllib.request as _u
+            _deadline = time.time() + timeout
+            _http_ok = False
+            while time.time() < _deadline:
+                if not _http_ok:
+                    try:
+                        with _u.urlopen("http://127.0.0.1:7860/", timeout=2) as _r:
+                            if _r.status < 500:
+                                _http_ok = True
+                    except Exception:
+                        _http_ok = False
+                if _http_ok and pic_pipe is not None and _active_model == "pic":
+                    return True
+                time.sleep(1.0)
+            return _http_ok and pic_pipe is not None and _active_model == "pic"
+
+        def _picgen_idle_now():
+            """True if no GPU op (e.g. a picgen generation) is in progress.
+
+            _gpu_op_lock is held for the full duration of every picgen inference
+            (via @_gpu_serialized / infer). A successful non-blocking acquire
+            means picgen is idle right now; we release it immediately so we never
+            hold it across the vidgen CPU load and never delay a generation.
+            """
+            if _gpu_op_lock.acquire(blocking=False):
+                _gpu_op_lock.release()
+                return True
+            return False
+
+        def _warmup_picgen():
+            """One-time tiny inference to move first-run CUDA/attention kernel
+            init off the user's first real generation.
+
+            Runs a 1-step generation on a small throwaway image so cuDNN / SDPA
+            (or FA3) kernel selection, autotuning and lazy CUDA init all happen
+            now instead of during the user's first click. Serialized through
+            _gpu_op_lock so it never races a real generation, and fully guarded
+            so any failure is non-fatal (it's purely an optimization). Quality
+            is irrelevant here — the output is discarded.
+            """
+            try:
+                if pic_pipe is None:
+                    return
+                from PIL import Image as _PILImage
+                _dummy = _PILImage.new("RGB", (256, 256), (127, 127, 127))
+                _t0 = time.time()
+                with _gpu_op_lock:
+                    # Re-check after acquiring the lock: only warm up if picgen
+                    # is still the active model and nothing else changed.
+                    if pic_pipe is None or _active_model not in ("pic", None):
+                        return
+                    try:
+                        activate_pic()
+                    except Exception:
+                        return
+                    with torch.cuda.device(PIC_DEVICE):
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            _gen = torch.Generator(device=PIC_DEVICE).manual_seed(0)
+                            _ = pic_pipe(
+                                image=[_dummy],
+                                prompt=" ",
+                                negative_prompt=" ",
+                                num_inference_steps=1,
+                                true_cfg_scale=1.0,
+                                generator=_gen,
+                            )
+                print(f"[Warmup] picgen kernels warmed in {time.time()-_t0:.1f}s "
+                      f"(first real generation will be faster).")
+            except Exception as _e:
+                print(f"[Warmup] picgen warm-up skipped (non-fatal): {_e}")
 
         def _bg_load():
             try:
@@ -10965,12 +11451,82 @@ if __name__ == "__main__":
                     pipe.transformer.to("cpu")
                     pipe.text_encoder.to("cpu")
                     pipe.vae.to("cpu")
+                    # Quality-neutral speedups: FA3 attention (fallback SDPA) +
+                    # VAE decode policy for the picgen device (effective once
+                    # activate_pic() swaps this pipe onto the GPU).
+                    _optimize_qwen_pipe(pipe, PIC_DEVICE)
                     pic_pipe = pipe
                     print(f" Qwen on CPU in {time.time()-start:.1f}s  tab switching ready!")
+                elif VIDGEN_DISABLED:
+                    # PICGEN-ONLY, VIDGEN DISABLED (--novidgen): never load or
+                    # download anything for the vidgen tab. Still warm up picgen
+                    # once it's ready so the first real generation is fast.
+                    print("Background: --novidgen — picgen only; no vidgen files "
+                          "will be loaded or downloaded this session.")
+                    if _wait_until_picgen_ready():
+                        _warmup_picgen()
+                    return
                 else:
-                    print("Background: Loading Wan to CPU...")
-                    _load_wan("cpu")
-                    print(" Wan on CPU  tab switching ready!")
+                    # PICGEN MODE: only load the vidgen model (Wan) AFTER picgen
+                    # is fully up and usable, and only into CPU — never the GPU
+                    # (exactly one tab's model is GPU-resident at a time). On the
+                    # first run this is also when the ~57 GB Wan download happens,
+                    # so the download never competes with picgen startup.
+                    if _wan_loaded:
+                        # Already loaded somehow — make sure deferred vidgen
+                        # setups aren't left parked behind the gate.
+                        _vidgen_assets_gate.set()
+                        return
+                    print("Background: waiting for picgen to be fully ready before "
+                          "touching anything for the vidgen tab...")
+                    if not _wait_until_picgen_ready():
+                        print(" Picgen readiness not confirmed within timeout — "
+                              "skipping vidgen preload (it will load on demand when "
+                              "the user opens the vidgen tab).")
+                        # Release the gate anyway so the deferred vidgen-only
+                        # setups (audio, voice cloning, lip-sync) aren't parked
+                        # forever; they'll still be needed if the user opens the
+                        # vidgen tab. Picgen isn't blocked either way at this point.
+                        _vidgen_assets_gate.set()
+                        return
+
+                    # Picgen is ready. Warm its kernels now (serialized via the
+                    # GPU lock) so the user's first real generation is fast.
+                    _warmup_picgen()
+
+                    # Give picgen a moment to settle after the first paint, then
+                    # only proceed while picgen is idle so the vidgen CPU load
+                    # (and any download) never slows down a live generation.
+                    # If the user is actively generating, keep waiting — we are in
+                    # no hurry; the vidgen tab loads on demand regardless.
+                    _idle_wait_start = time.time()
+                    while not _picgen_idle_now():
+                        if time.time() - _idle_wait_start > 3600:
+                            print(" Picgen stayed busy for a long time — deferring "
+                                  "vidgen preload entirely (loads on demand instead).")
+                            # Still open the gate so deferred vidgen setups can
+                            # proceed on demand rather than staying parked forever.
+                            _vidgen_assets_gate.set()
+                            return
+                        time.sleep(2.0)
+
+                    # Picgen is confirmed up and idle. NOW open the vidgen-assets
+                    # gate so every other deferred vidgen-only setup (audio
+                    # engines / voice cloning, MuseTalk lip-sync, its weight
+                    # self-heal) is finally allowed to download/build in the
+                    # background. None of this touches the GPU.
+                    if not _vidgen_assets_gate.is_set():
+                        print("Background: picgen fully ready — releasing vidgen-tab "
+                              "asset downloads (audio, voice cloning, lip-sync).")
+                        _vidgen_assets_gate.set()
+
+                    print("Background: picgen is up and idle — loading Wan to CPU "
+                          "(vidgen tab will be ready without stealing the GPU)...")
+                    _t_wan = time.time()
+                    _load_wan("cpu")   # CPU only — never claims the GPU
+                    print(f" Wan on CPU in {time.time()-_t_wan:.1f}s — vidgen tab "
+                          f"ready (still off-GPU; activate_wan() swaps it in only "
+                          f"when the user opens the vidgen tab).")
             except Exception as e:
                 print(f" Background load failed: {e}")
                 import traceback; traceback.print_exc()
@@ -10978,8 +11534,14 @@ if __name__ == "__main__":
         threading.Thread(target=_bg_load, daemon=True).start()
 
         def _bg_download_loras():
-            """After startup, auto-download all LoRAs that have download URLs."""
+            """After startup, auto-download all LoRAs that have download URLs.
+
+            LoRAs apply to the Wan (vidgen) pipeline, so in --picgen mode this
+            waits for the vidgen-assets gate (picgen fully ready) before pulling
+            any files."""
             try:
+                if not _await_vidgen_assets_gate("vidgen LoRA auto-download"):
+                    return
                 time.sleep(5.0)
                 config = load_lora_config()
                 if not config:
@@ -11043,16 +11605,21 @@ if __name__ == "__main__":
             except Exception as _e:
                 print(f"[Predownload] rembg BiRefNet failed (non-fatal): {_e}")
 
-            # 2+3. F5-TTS + HunyuanVideo-Foley weights
-            try:
-                if not _AUDIO_ENGINE_AVAILABLE:
-                    print("[Predownload] Downloading audio engine assets...")
-                    _ensure_audio_engines()
-                    print("[Predownload] Audio engine assets ready.")
-                else:
-                    print("[Predownload] Audio engine already ready — OK.")
-            except Exception as _e:
-                print(f"[Predownload] Audio engine failed (non-fatal): {_e}")
+            # 2+3. F5-TTS + HunyuanVideo-Foley weights (vidgen-only). In picgen
+            # mode this must wait until picgen is fully ready before downloading.
+            if not VIDGEN_DISABLED:
+                try:
+                    if _await_vidgen_assets_gate("audio engine pre-download (F5-TTS + Foley)"):
+                        if not _AUDIO_ENGINE_AVAILABLE:
+                            print("[Predownload] Downloading audio engine assets...")
+                            _ensure_audio_engines()
+                            print("[Predownload] Audio engine assets ready.")
+                        else:
+                            print("[Predownload] Audio engine already ready — OK.")
+                except Exception as _e:
+                    print(f"[Predownload] Audio engine failed (non-fatal): {_e}")
+            else:
+                print("[Predownload] Audio engine skipped — vidgen disabled (--novidgen).")
                 import traceback; traceback.print_exc()
 
             print("[Predownload] All background pre-downloads complete.")

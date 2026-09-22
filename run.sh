@@ -144,16 +144,29 @@ do_stop() {
     echo "[run] Stopped."
 }
 
-# $1 = optional mode flag ("picgen" / "-picgen" / "--picgen"), empty = vidgen
+# Args = any combination of mode/option flags, forwarded to app.py:
+#   picgen / -picgen / --picgen   -> picgen mode (else vidgen default)
+#   novidgen / -novidgen / --novidgen -> hard-disable the vidgen tab this session
 do_start() {
     local MODE_ARG=""
     local mode_display="vidgen (default)"
-    local raw="${1:-}"
-    local flag="${raw#-}"
-    flag="${flag#-}"
-    if [[ "${flag,,}" == "picgen" ]]; then
+    local want_picgen=0
+    local want_novidgen=0
+    local a flag
+    for a in "$@"; do
+        flag="${a#-}"; flag="${flag#-}"
+        case "${flag,,}" in
+            picgen)   want_picgen=1 ;;
+            novidgen) want_novidgen=1 ;;
+        esac
+    done
+    if [[ "$want_picgen" == "1" ]]; then
         MODE_ARG="--picgen"
         mode_display="picgen"
+    fi
+    if [[ "$want_novidgen" == "1" ]]; then
+        MODE_ARG="$MODE_ARG --novidgen"
+        mode_display="$mode_display, no-vidgen (video tab disabled)"
     fi
 
     if is_running; then
@@ -209,21 +222,37 @@ do_start() {
 
 # ---------------------------------------------------------------------------
 # Parse command
+#
+# Accepts flags in any order, e.g.:
+#   bash run.sh -picgen
+#   bash run.sh -picgen -novidgen
+#   bash run.sh restart -picgen -novidgen
+# The subcommand (start/stop/restart/status/logs/url) may be omitted (defaults
+# to start). All mode/option flags (picgen/novidgen) are collected and passed
+# through to do_start, which forwards them to app.py.
 # ---------------------------------------------------------------------------
-CMD="${1:-start}"
-MODE="${2:-}"
-
-case "${CMD,,}" in
-    picgen|-picgen|--picgen)
-        MODE="$CMD"
-        CMD="start"
-        ;;
-esac
+CMD="start"
+MODE_FLAGS=()
+for _arg in "$@"; do
+    _f="${_arg#-}"; _f="${_f#-}"
+    case "${_f,,}" in
+        start|stop|restart|status|logs|url)
+            CMD="${_f,,}"
+            ;;
+        picgen|novidgen|vidgen)
+            MODE_FLAGS+=("$_arg")
+            ;;
+        *)
+            # Unknown token — treat as a potential subcommand for the error path.
+            CMD="${_f,,}"
+            ;;
+    esac
+done
 
 case "$CMD" in
-    start)   do_start "$MODE" ;;
+    start)   do_start "${MODE_FLAGS[@]}" ;;
     stop)    do_stop ;;
-    restart) do_stop; sleep 2; do_start "$MODE" ;;
+    restart) do_stop; sleep 2; do_start "${MODE_FLAGS[@]}" ;;
     status)
         if is_running; then
             echo "[run] App running (PID $(cat "$PID_FILE"))"
@@ -249,10 +278,11 @@ case "$CMD" in
         fi
         ;;
     *)
-        echo "Usage: bash run.sh [picgen] [start|stop|restart|status|logs|url]"
-        echo "       bash run.sh picgen          # start in picgen mode"
-        echo "       bash run.sh restart picgen  # restart in picgen mode"
-        echo "       bash run.sh url             # print current HTTPS URL"
+        echo "Usage: bash run.sh [start|stop|restart|status|logs|url] [picgen] [novidgen]"
+        echo "       bash run.sh -picgen              # start in picgen mode"
+        echo "       bash run.sh -picgen -novidgen    # picgen only; video tab disabled, no vidgen downloads"
+        echo "       bash run.sh restart -picgen      # restart in picgen mode (with vidgen)"
+        echo "       bash run.sh url                  # print current HTTPS URL"
         exit 1
         ;;
 esac

@@ -712,17 +712,28 @@ do_stop() {
 }
 
 do_start() {
+    # Any startup flags forwarded straight to app.py, e.g.:
+    #   picgen / -picgen / --picgen        (picgen mode; else vidgen default)
+    #   novidgen / -novidgen / --novidgen  (hard-disable the vidgen tab)
+    # Passed as separate args; joined verbatim into the launch command.
+    local MODE_ARG="$*"
+
     if is_running; then
         echo "[autorun] Already running (PID $(cat "$PID_FILE")). Run:  bash autorun.sh restart"
         exit 0
     fi
     [[ -f "$APP" ]] || { echo "[autorun] ERROR: $APP not found."; exit 1; }
 
-    echo "[autorun] Starting app.py..."
+    if [ -n "$MODE_ARG" ]; then
+        echo "[autorun] Starting app.py ($MODE_ARG)..."
+    else
+        echo "[autorun] Starting app.py..."
+    fi
     echo "[autorun] Log  -> $LOG"
 
-    # nohup + setsid: process survives SSH disconnect and terminal close
-    nohup setsid "$PYTHON" "$APP" > "$LOG" 2>&1 &
+    # nohup + setsid: process survives SSH disconnect and terminal close.
+    # $MODE_ARG is passed through to app.py (_parse_startup_mode / _parse_novidgen).
+    nohup setsid "$PYTHON" "$APP" $MODE_ARG > "$LOG" 2>&1 &
     echo $! > "$PID_FILE"
 
     echo "[autorun] Waiting for startup..."
@@ -749,10 +760,12 @@ do_start() {
     tail -n 80 -f "$LOG"
 }
 
-case "${1:-start}" in
-    start)   do_start ;;
+_sub="${1:-start}"
+shift 2>/dev/null || true
+case "$_sub" in
+    start)   do_start "$@" ;;
     stop)    do_stop ;;
-    restart) do_stop; sleep 2; do_start ;;
+    restart) do_stop; sleep 2; do_start "$@" ;;
     status)
         if is_running; then
             echo "[autorun] Running (PID $(cat "$PID_FILE"))"
@@ -765,7 +778,9 @@ case "${1:-start}" in
         tail -f "$LOG"
         ;;
     *)
-        echo "Usage: bash autorun.sh [start|stop|restart|status|logs]"
+        echo "Usage: bash autorun.sh [start|stop|restart|status|logs] [picgen] [novidgen]"
+        echo "       bash autorun.sh start -picgen              # picgen mode"
+        echo "       bash autorun.sh start -picgen -novidgen    # picgen only, video tab disabled"
         exit 1
         ;;
 esac
@@ -812,9 +827,11 @@ if [ ! -d /run/systemd/system ]; then
     echo "📋 Video Tab: Qwen relocate -> Wan 2.2 merged 4-step animate"
     echo "🖼️  Image Tab: Unchanged (Qwen Image Edit)"
     echo ""
-    # Stop any old instance first, then start fresh.
+    # Stop any old instance first, then start fresh in PICGEN-ONLY mode with the
+    # video tab disabled (no Wan / F5-TTS / Foley / MuseTalk downloads). To use
+    # vidgen, restart yourself without -novidgen, e.g. bash run.sh restart -picgen
     bash /root/newgen/autorun.sh stop 2>/dev/null || true
-    exec bash /root/newgen/autorun.sh start
+    exec bash /root/newgen/autorun.sh start -picgen -novidgen
 fi
 
 echo "Setting up systemd service..."
@@ -841,4 +858,8 @@ echo ""
 # live log and startup confirmation in their current SSH session, exactly the
 # same experience as a manual launch.  The systemd unit is still registered and
 # will auto-start the app on future reboots via run_app.sh.
-exec bash /root/newgen/autorun.sh start
+# Autostart in PICGEN-ONLY mode with the video tab DISABLED (-novidgen): picgen
+# comes up fast and NOTHING for the vidgen tab is downloaded or loaded on the
+# device. To enable video generation, restart the app yourself without
+# -novidgen, e.g.  bash run.sh restart -picgen   (or edit the systemd unit).
+exec bash /root/newgen/autorun.sh start -picgen -novidgen
