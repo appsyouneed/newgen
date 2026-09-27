@@ -1148,23 +1148,101 @@ if not os.path.exists(os.path.join(SCRIPT_DIR, "train_log", "RIFE_HDv3.py")):
         ], check=True)
     subprocess.run(["unzip", "-n", os.path.join(SCRIPT_DIR, "RIFEv4.26_0921.zip")], check=True)
 
-try:
-    import torchvision
-except ModuleNotFoundError:
-    print("[SelfHeal] torchvision missing — installing...")
-    _r = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir",
-         "torchvision", "--index-url", "https://download.pytorch.org/whl/cu130"],
-        capture_output=True, text=True,
-    )
-    if _r.returncode != 0:
+# ---------------------------------------------------------------------------
+# torchvision self-heal (robust — repairs on rerun).
+#
+# transformers' AutoVideoProcessor (pulled in by the Qwen pipeline) HARD-REQUIRES
+# torchvision at model-load time. On boxes where setup.sh found no system torch
+# to symlink, torchvision can be missing OR present but ABI-mismatched against
+# the installed torch (imports but fails deep inside). The old heal installed
+# an UNPINNED torchvision from a hardcoded index and never re-verified — so a
+# mismatched build "installed OK" yet still didn't import, and the app crashed
+# at Qwen load with "AutoVideoProcessor requires the Torchvision library".
+#
+# This version:
+#   1. Detects the installed torch's EXACT version + CUDA tag.
+#   2. Verifies torchvision actually IMPORTS and its C-extension works
+#      (torchvision.ops.nms) — not just "is installed".
+#   3. If broken/missing, installs the MATCHING torchvision from the same
+#      CUDA wheel index, force-reinstalling to replace a mismatched build.
+#   4. Re-verifies; if it had to install, RE-EXECs the process so the fresh
+#      torchvision is imported cleanly (a mid-run pip install is NOT visible
+#      to the already-running interpreter — that was why the old heal's
+#      "installed OK" still left torchvision unavailable).
+# ---------------------------------------------------------------------------
+def _torchvision_ok():
+    """True if torchvision imports AND its compiled ops load (ABI match)."""
+    try:
+        import importlib
+        importlib.invalidate_caches()
+        import torchvision  # noqa: F401
+        import torchvision.ops as _tvops
+        _ = _tvops.nms  # touch the C-extension op
+        return True
+    except Exception:
+        return False
+
+
+def _heal_torchvision():
+    if _torchvision_ok():
+        return  # already fine
+    # Figure out the matching wheel index from torch's build tag.
+    try:
+        import torch as _t
+        _tv = _t.__version__            # e.g. "2.14.0+cu130"
+        _cu = ""
+        if "+cu" in _tv:
+            _cu = "cu" + _tv.split("+cu", 1)[1].split(".")[0]
+    except Exception:
+        _cu = ""
+    _index = f"https://download.pytorch.org/whl/{_cu}" if _cu else None
+
+    print(f"[SelfHeal] torchvision missing/broken — installing matching build "
+          f"(torch tag: {_cu or 'unknown'})...")
+    _cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir",
+            "--force-reinstall", "--no-deps", "torchvision"]
+    if _index:
+        _cmd += ["--index-url", _index]
+    _r = subprocess.run(_cmd, capture_output=True, text=True)
+    if _r.returncode != 0 and _index:
+        # Fall back to the default PyPI index (some cu tags lack a matching
+        # torchvision wheel; PyPI's cpu/cu-agnostic build may still import).
+        print(f"[SelfHeal] {_cu} index install failed, retrying default index...")
         _r = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "torchvision"],
+            [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir",
+             "--force-reinstall", "--no-deps", "torchvision"],
             capture_output=True, text=True,
         )
     if _r.returncode != 0:
-        raise RuntimeError(f"torchvision install failed:\n{_r.stderr.strip()}")
-    print("[SelfHeal] torchvision installed OK")
+        raise RuntimeError(f"torchvision install failed:\n{_r.stderr.strip()[-1000:]}")
+
+    # A mid-run install is NOT visible to this already-running interpreter, and
+    # transformers may have already cached torchvision as unavailable. Re-exec
+    # the process so the fresh torchvision is picked up from a clean start.
+    # Guard against an infinite re-exec loop: only re-exec ONCE. If torchvision
+    # still isn't importable after a re-exec+reinstall, fail loudly instead of
+    # looping.
+    if os.environ.get("NEWGEN_TV_HEAL_REEXEC") == "1":
+        if _torchvision_ok():
+            return
+        raise RuntimeError(
+            "torchvision still not importable after reinstall + re-exec. "
+            "No compatible torchvision wheel for this torch build was found. "
+            "Install a matching torchvision manually into the app venv."
+        )
+    if _torchvision_ok():
+        return  # install worked and somehow is already importable — no re-exec needed
+    print("[SelfHeal] torchvision installed — restarting process to load it cleanly...")
+    _env2 = dict(os.environ)
+    _env2["NEWGEN_TV_HEAL_REEXEC"] = "1"
+    try:
+        os.execve(sys.executable, [sys.executable] + sys.argv, _env2)
+    except Exception as _e:
+        if not _torchvision_ok():
+            raise RuntimeError(f"torchvision still not importable after install: {_e}")
+
+
+_heal_torchvision()
 
 sys.path.append(os.path.join(SCRIPT_DIR, "train_log"))
 from train_log.RIFE_HDv3 import Model
