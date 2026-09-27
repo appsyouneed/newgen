@@ -221,6 +221,44 @@ os.makedirs("/dev/shm/newgen", exist_ok=True)
 os.makedirs(os.path.join(SCRIPT_DIR, "tmp", "gradio"), exist_ok=True)
 
 # ---------------------------------------------------------------------------
+# Cloudflare access-URL banner.
+#
+# run.sh starts a Cloudflare tunnel and writes the public HTTPS URL to
+# cloudflare-url.txt next to this file. run.sh prints it once at startup, but
+# the app keeps logging background-load messages afterward, so that URL scrolls
+# away. This helper reprints a prominent, clickable banner at the TRUE end —
+# once the app is fully up and every background load has settled — so the last
+# thing in the log is always the URL to open.
+# ---------------------------------------------------------------------------
+_CLOUDFLARE_URL_FILE = os.path.join(SCRIPT_DIR, "cloudflare-url.txt")
+
+
+def _read_cloudflare_url():
+    try:
+        with open(_CLOUDFLARE_URL_FILE, "r", encoding="utf-8") as _f:
+            u = _f.read().strip()
+        return u or None
+    except Exception:
+        return None
+
+
+def _print_ready_banner(what: str = "READY"):
+    """Print the final clickable access-URL banner. Falls back to the local URL
+    if the Cloudflare file isn't present (e.g. launched without run.sh)."""
+    url = _read_cloudflare_url() or "http://0.0.0.0:7860"
+    line = f"  OPEN IN BROWSER:  {url}"
+    bar = "=" * max(58, len(line) + 2)
+    try:
+        print("")
+        print(bar)
+        print(f"  ✅ NEWGEN {what} — everything is running and ready to use.")
+        print(line)
+        print(bar)
+        print("")
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
 # EARLY FILE PATCHES — runs before any gradio import.
 # sysconfig.get_path("purelib") always returns the site-packages of the
 # running interpreter, so this works correctly inside a venv.
@@ -631,8 +669,40 @@ import numpy as np
 import torch
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
-torch.backends.cudnn.benchmark = False
+# cudnn.benchmark=True lets cuDNN autotune the fastest conv algorithm for each
+# input shape. Video generation uses fixed shapes within a run (same resolution
+# across all steps/segments), so autotuning pays off after the first step and
+# speeds every subsequent conv — quality-neutral (same math, faster kernel).
+torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
+@contextlib.contextmanager
+def _fused_sdpa_backend():
+    """Force PyTorch SDPA to use the fused flash / mem-efficient / cuDNN kernels
+    (and drop the slow math fallback) for attention inside the block. This is
+    numerically exact — same attention, faster kernel — so no quality or
+    prompt-adherence change. Fully guarded: on any torch without the
+    torch.nn.attention API, it is a no-op and the code runs unchanged.
+    Used around the Wan video denoise loop and available for other GPU work.
+    """
+    try:
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+        backends = []
+        for _name in ("FLASH_ATTENTION", "EFFICIENT_ATTENTION", "CUDNN_ATTENTION", "MATH"):
+            _b = getattr(SDPBackend, _name, None)
+            if _b is not None:
+                backends.append(_b)
+        if not backends:
+            yield
+            return
+        with sdpa_kernel(backends):
+            yield
+    except Exception:
+        # Old torch / unsupported combo — run without the backend hint.
+        yield
+
 
 logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 logging.getLogger("torch.utils._pytree").setLevel(logging.ERROR)
@@ -1397,6 +1467,35 @@ FOLEY_VENV_PY  = FOLEY_VENV_DIR / "bin" / "python"
 MUSETALK_VENV_DIR = Path(SCRIPT_DIR) / ".musetalk-venv"
 MUSETALK_VENV_PY  = MUSETALK_VENV_DIR / "bin" / "python"
 
+# ---------------------------------------------------------------------------
+# MMAudio (video-to-audio SFX/ambience) — REPLACES HunyuanVideo-Foley for the
+# vidgen SFX branch. F5-TTS voice cloning is unchanged and still mixed on top.
+#
+# Uses the official hkchengrex/MMAudio framework (cloned + pip install -e .)
+# in its own isolated venv, driven by MMAudio's demo.py. The model weights are
+# the NSFW large_44k finetune from phazei/NSFW_MMaudio, dropped in as the
+# large_44k checkpoint; the standard aux weights (v1-44 VAE + synchformer) come
+# from hkchengrex/MMAudio.
+#
+# Everything here is installed/downloaded LAZILY at runtime — only the first
+# time a video is generated with "Add Audio" enabled — never at startup, and
+# never when vidgen is disabled (--novidgen).
+# ---------------------------------------------------------------------------
+MMAUDIO_REPO_DIR   = Path(SCRIPT_DIR) / "MMAudio"
+MMAUDIO_VENV_DIR   = Path(SCRIPT_DIR) / ".mmaudio-venv"
+MMAUDIO_VENV_PY    = MMAUDIO_VENV_DIR / "bin" / "python"
+# MMAudio resolves weights relative to its own cwd: weights/ and ext_weights/.
+MMAUDIO_WEIGHTS_DIR     = MMAUDIO_REPO_DIR / "weights"
+MMAUDIO_EXT_WEIGHTS_DIR = MMAUDIO_REPO_DIR / "ext_weights"
+# NSFW large_44k finetune (fp16 safetensors) — used as the large_44k model.
+MMAUDIO_NSFW_REPO   = "phazei/NSFW_MMaudio"
+MMAUDIO_NSFW_FILE   = "mmaudio_large_44k_nsfw_gold_8.5k_final_fp16.safetensors"
+# HF token for gated/NSFW model access (used verbatim as requested).
+MMAUDIO_HF_TOKEN    = "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"
+
+_mmaudio_ready = False
+_mmaudio_lock  = threading.Lock()
+
 _AUDIO_ENGINE_AVAILABLE = False   # set True once both engines verified usable
 
 
@@ -1618,90 +1717,13 @@ def _ensure_audio_engines():
         )
         print("[AudioEngine] F5-TTS venv ready.")
 
-    # --- HunyuanVideo-Foley repo --------------------------------------
-    if not FOLEY_REPO_DIR.exists():
-        print("[AudioEngine] Cloning HunyuanVideo-Foley repo...")
-        subprocess.run(
-            ["git", "clone", "--depth=1",
-             "https://github.com/Tencent-Hunyuan/HunyuanVideo-Foley",
-             str(FOLEY_REPO_DIR)],
-            check=True,
-        )
-        # Install repo dependencies into current env, but strip out lines that
-        # would clobber our pinned stack. HunyuanVideo-Foley's own
-        # requirements.txt pins gradio==3.50.2 and a git transformers branch,
-        # and repeats torch/torchvision/torchaudio/numpy. Installing those
-        # verbatim downgrades our pinned gradio==4.43.0 mid-run, which is what
-        # caused "ImportError: cannot import name 'http_server' from 'gradio'"
-        # at demo.launch() — gradio's package files ended up a mix of two
-        # incompatible versions. Everything else in that file (av, einops,
-        # omegaconf, pyyaml, scipy, timm, sentencepiece, accelerate, pandas,
-        # pyarrow, loguru, easydict, descript-audiotools, etc.) is safe to
-        # install as-is here -- audiotools' protobuf<5.0.0 pin is fine in
-        # this env now that F5-TTS (the only thing that needed protobuf>=6.33)
-        # runs in its own isolated venv instead of this shared site-packages.
-        _CONFLICTING_PREFIXES = (
-            "torch", "gradio", "transformers", "numpy", "urllib3",
-        )
-        req_file = FOLEY_REPO_DIR / "requirements.txt"
-        if req_file.exists():
-            filtered_lines = []
-            for line in req_file.read_text().splitlines():
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                pkg_spec = stripped.lower()
-                if pkg_spec.startswith("git+"):
-                    # e.g. git+https://github.com/huggingface/transformers@...
-                    if "transformers" in pkg_spec:
-                        continue
-                elif pkg_spec.startswith(_CONFLICTING_PREFIXES):
-                    continue
-                filtered_lines.append(line)
-
-            filtered_req = FOLEY_REPO_DIR / "requirements.filtered.txt"
-            filtered_req.write_text("\n".join(filtered_lines) + "\n")
-            # Install into the FOLEY venv — NEVER into sys.executable / main env
-            subprocess.run(
-                [str(FOLEY_VENV_PY), "-m", "pip", "install", "--quiet",
-                 "--disable-pip-version-check", "--root-user-action=ignore",
-                 "--no-warn-conflicts", "--no-cache-dir",
-                 "-r", str(filtered_req)],
-                check=True, capture_output=True,
-            )
-        print("[AudioEngine] HunyuanVideo-Foley repo ready.")
-
-    # --- HunyuanVideo-Foley model weights -----------------------------
-    foley_ckpt = FOLEY_MODEL_DIR / "hunyuanvideo_foley_xl.pth"
-    if not foley_ckpt.exists():
-        print("[AudioEngine] Downloading HunyuanVideo-Foley XL weights...")
-        FOLEY_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        hf_hub_download(
-            repo_id="tencent/HunyuanVideo-Foley",
-            filename="hunyuanvideo_foley_xl.pth",
-            local_dir=str(FOLEY_MODEL_DIR),
-            local_dir_use_symlinks=False,
-        )
-        print("[AudioEngine] Foley main checkpoint downloaded.")
-
-    # Always ensure auxiliary weights exist (they may be missing even if ckpt is present)
-    for aux in ["synchformer_state_dict.pth", "vae_128d_48k.pth"]:
-        aux_path = FOLEY_MODEL_DIR / aux
-        if not aux_path.exists():
-            try:
-                print(f"[AudioEngine] Downloading auxiliary weight: {aux}")
-                hf_hub_download(
-                    repo_id="tencent/HunyuanVideo-Foley",
-                    filename=aux,
-                    local_dir=str(FOLEY_MODEL_DIR),
-                    local_dir_use_symlinks=False,
-                )
-            except Exception as _e:
-                print(f"[AudioEngine] Warning: could not download {aux}: {_e}")
-    print("[AudioEngine] Foley weights ready.")
+    # NOTE: SFX/ambience is now handled by MMAudio (see _ensure_mmaudio /
+    # _run_mmaudio), installed lazily on first audio-enabled video generation.
+    # HunyuanVideo-Foley is no longer set up here. This function now only
+    # provisions the F5-TTS voice-cloning venv.
 
     _AUDIO_ENGINE_AVAILABLE = True
-    print("[AudioEngine] Dual audio engine ready (F5-TTS + HunyuanVideo-Foley).")
+    print("[AudioEngine] Voice engine ready (F5-TTS). SFX via MMAudio (lazy).")
 
 
 F5_INFER_SCRIPT = Path(SCRIPT_DIR) / ".f5tts_infer_worker.py"
@@ -1905,6 +1927,401 @@ def _run_f5tts(ref_file: str, gen_text: str, out_wav: str, speed: float = 1.0) -
             print(f"[LipSync?F5-TTS] Failed to cleanup payload (non-fatal): {e}")
 
 
+# ---------------------------------------------------------------------------
+# MMAudio (video-to-audio SFX) — lazy install + subprocess worker.
+# ---------------------------------------------------------------------------
+MMAUDIO_INFER_SCRIPT = Path(SCRIPT_DIR) / ".mmaudio_infer_worker.py"
+
+# Standalone worker: given a video + prompt, generate an SFX wav with MMAudio's
+# NSFW large_44k finetune. Runs ONLY inside MMAUDIO_VENV_PY. Keeps its own copy
+# of the model config so it can register the NSFW safetensors as large_44k.
+_MMAUDIO_INFER_WORKER_SOURCE = '''\
+"""MMAudio SFX inference worker. Run inside MMAUDIO_VENV_PY only.
+Args: <json_payload_file>
+JSON keys: video (path), prompt, negative_prompt, out_wav, duration (sec)
+Writes a mono/stereo wav at out_wav (via soundfile/torchaudio).
+"""
+import sys, json, os
+from pathlib import Path
+import torch
+
+@torch.inference_mode()
+def main():
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        p = json.load(fh)
+    video   = p["video"]
+    prompt  = p.get("prompt", "") or ""
+    neg     = p.get("negative_prompt", "") or ""
+    out_wav = p["out_wav"]
+    dur     = float(p.get("duration", 8.0))
+
+    from mmaudio.eval_utils import (ModelConfig, all_model_cfg, generate,
+                                    load_video, make_video)
+    from mmaudio.model.flow_matching import FlowMatching
+    from mmaudio.model.networks import MMAudio, get_my_mmaudio
+    from mmaudio.model.utils.features_utils import FeaturesUtils
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16
+
+    # Use the standard large_44k config, but point its model_path at the NSFW
+    # finetune we downloaded (registered by the app in weights/).
+    cfg = all_model_cfg["large_44k"]
+    nsfw = os.environ.get("MMAUDIO_NSFW_CKPT", "")
+    if nsfw and Path(nsfw).exists():
+        cfg.model_path = Path(nsfw)
+
+    # Download ONLY the aux weights (VAE + synchformer) via MMAudio's own
+    # helper. We must NOT call cfg.download_if_needed() because the NSFW model
+    # filename isn't in MMAudio's download table (it would raise "No link
+    # found"). The base large_44k model is replaced by the NSFW checkpoint.
+    from mmaudio.utils.download_utils import download_model_if_needed as _dl_if_needed
+    try:
+        _dl_if_needed(cfg.vae_path)
+    except Exception as _e:
+        print(f"[MMAudioWorker] VAE download note: {_e}")
+    try:
+        _dl_if_needed(cfg.synchformer_ckpt)
+    except Exception as _e:
+        print(f"[MMAudioWorker] synchformer download note: {_e}")
+    if cfg.bigvgan_16k_path is not None:
+        try:
+            _dl_if_needed(cfg.bigvgan_16k_path)
+        except Exception as _e:
+            print(f"[MMAudioWorker] bigvgan download note: {_e}")
+
+    seq_cfg = cfg.seq_cfg
+
+    net = get_my_mmaudio(cfg.model_name).to(device, dtype).eval()
+
+    def _load_ckpt(path):
+        path = str(path)
+        if path.endswith(".safetensors"):
+            from safetensors.torch import load_file as _lf
+            return _lf(path)
+        return torch.load(path, map_location=device, weights_only=True)
+
+    sd = _load_ckpt(cfg.model_path)
+    # MMAudio checkpoints may wrap weights under a key; unwrap common cases.
+    if isinstance(sd, dict) and "weights" in sd and isinstance(sd["weights"], dict):
+        sd = sd["weights"]
+    try:
+        net.load_weights(sd)
+    except Exception:
+        net.load_state_dict(sd, strict=False)
+
+    fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=25)
+    feat = FeaturesUtils(
+        tod_vae_ckpt=cfg.vae_path,
+        synchformer_ckpt=cfg.synchformer_ckpt,
+        enable_conditions=True,
+        mode=cfg.mode,
+        bigvgan_vocoder_ckpt=cfg.bigvgan_16k_path,
+        need_vae_encoder=False,
+    ).to(device, dtype).eval()
+
+    # Load video, then set duration from the ACTUAL loaded length and update
+    # sequence lengths — same ordering as MMAudio's demo.py.
+    video_info = load_video(Path(video), dur)
+    clip_frames = video_info.clip_frames.unsqueeze(0)
+    sync_frames = video_info.sync_frames.unsqueeze(0)
+    dur = video_info.duration_sec
+    seq_cfg.duration = dur
+    net.update_seq_lengths(seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len)
+
+    rng = torch.Generator(device=device); rng.manual_seed(42)
+    audios = generate(
+        clip_frames, sync_frames, [prompt],
+        negative_text=[neg],
+        feature_utils=feat, net=net, fm=fm, rng=rng, cfg_strength=4.5,
+    )
+    audio = audios.float().cpu()[0]  # (channels, samples) or (samples,)
+    if audio.dim() == 1:
+        audio = audio.unsqueeze(0)
+    sr = int(seq_cfg.sampling_rate)
+
+    # Write the wav WITHOUT torchaudio.save(): torchaudio 2.6+ routes save()
+    # through torchcodec, whose native lib (libtorchcodec_image.so) fails to
+    # load in this venv (ABI/ffmpeg mismatch) and crashes. soundfile (libsndfile)
+    # and scipy write plain wavs directly, no torchcodec involved.
+    import numpy as _np
+    wav = audio.transpose(0, 1).contiguous().numpy().astype(_np.float32)  # (samples, channels)
+    _written = False
+    try:
+        import soundfile as _sf
+        _sf.write(out_wav, wav, sr)
+        _written = True
+    except Exception as _e_sf:
+        print(f"[MMAudioWorker] soundfile write failed ({_e_sf}); trying scipy...")
+        try:
+            from scipy.io import wavfile as _wf
+            # scipy wants int16 or float32; write float32 PCM.
+            _wf.write(out_wav, sr, wav)
+            _written = True
+        except Exception as _e_sp:
+            print(f"[MMAudioWorker] scipy write also failed: {_e_sp}")
+    if not _written:
+        raise RuntimeError("could not write output wav with soundfile or scipy")
+    print(f"[MMAudioWorker] wrote {out_wav} ({wav.shape[0]} samples @ {sr} Hz)")
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _ensure_mmaudio() -> bool:
+    """Lazy, one-time setup for MMAudio. Clones the repo, builds an isolated
+    venv, installs MMAudio + torch/torchvision/torchaudio, and downloads the
+    NSFW large_44k weights + aux weights. Called ONLY at runtime from
+    add_audio_to_video() when audio is activated. Blocks the first such call.
+
+    Respects the --novidgen session gate (never installs when vidgen is off).
+    Returns True when MMAudio is ready to run, False otherwise.
+    """
+    global _mmaudio_ready
+    if VIDGEN_DISABLED:
+        print("[MMAudio] setup skipped — vidgen disabled (--novidgen).")
+        return False
+    with _mmaudio_lock:
+        if _mmaudio_ready:
+            return True
+        try:
+            _PIP_QUIET = [
+                "--quiet", "--disable-pip-version-check", "--root-user-action=ignore",
+                "--no-warn-conflicts", "--no-cache-dir",
+            ]
+            # --- Clone MMAudio ------------------------------------------------
+            if not (MMAUDIO_REPO_DIR / "setup.py").exists() and not (MMAUDIO_REPO_DIR / "pyproject.toml").exists():
+                if MMAUDIO_REPO_DIR.exists():
+                    shutil.rmtree(MMAUDIO_REPO_DIR, ignore_errors=True)
+                print("[MMAudio] Cloning hkchengrex/MMAudio ...")
+                subprocess.run(
+                    ["git", "clone", "--depth", "1",
+                     "https://github.com/hkchengrex/MMAudio.git", str(MMAUDIO_REPO_DIR)],
+                    check=True, capture_output=True,
+                )
+
+            # --- Isolated venv ------------------------------------------------
+            if not MMAUDIO_VENV_PY.exists():
+                print("[MMAudio] Creating isolated venv ...")
+                subprocess.run([sys.executable, "-m", "venv", str(MMAUDIO_VENV_DIR)], check=True)
+                subprocess.run(
+                    [str(MMAUDIO_VENV_PY), "-m", "pip", "install"] + _PIP_QUIET + ["--upgrade", "pip", "setuptools", "wheel"],
+                    check=False, capture_output=True,
+                )
+                # Torch stack matching this GPU (Blackwell sm_120 -> cu128, else cu130).
+                print(f"[MMAudio] Installing torch/torchvision/torchaudio ({GPU_TORCH_IDX}) ...")
+                subprocess.run(
+                    [str(MMAUDIO_VENV_PY), "-m", "pip", "install"] + _PIP_QUIET +
+                    ["--index-url", GPU_TORCH_IDX, "torch", "torchvision", "torchaudio"],
+                    check=True, capture_output=True,
+                )
+
+            # --- Install MMAudio itself (editable) ---------------------------
+            # Verify a real SUBMODULE import (mmaudio.eval_utils), NOT bare
+            # `import mmaudio`. Bare import falsely succeeds because the cloned
+            # repo contains an `mmaudio/` directory that Python treats as a
+            # namespace package from certain cwds even when nothing is actually
+            # installed — which is exactly why the worker later failed with
+            # "No module named 'mmaudio.eval_utils'". Run the check from a
+            # neutral cwd (/tmp) so the local repo dir can't shadow the result.
+            def _mmaudio_importable():
+                r = subprocess.run(
+                    [str(MMAUDIO_VENV_PY), "-c",
+                     "import mmaudio.eval_utils, mmaudio.model.networks"],
+                    capture_output=True, text=True, cwd="/tmp",
+                )
+                return r.returncode == 0
+
+            if not _mmaudio_importable():
+                # hatchling is the build backend declared in pyproject.toml —
+                # ensure it's present so the editable install can build metadata.
+                subprocess.run(
+                    [str(MMAUDIO_VENV_PY), "-m", "pip", "install"] + _PIP_QUIET +
+                    ["hatchling", "editables"],
+                    check=False, capture_output=True,
+                )
+                print("[MMAudio] Installing MMAudio package (pip install -e .) ...")
+                _r = subprocess.run(
+                    [str(MMAUDIO_VENV_PY), "-m", "pip", "install"] + _PIP_QUIET + ["-e", "."],
+                    cwd=str(MMAUDIO_REPO_DIR), capture_output=True, text=True,
+                )
+                if _r.returncode != 0:
+                    print(f"[MMAudio] pip install -e . failed: {_r.stdout[-800:]}\n{_r.stderr[-1500:]}")
+                    # Fall back to a NON-editable install (copies the package
+                    # into site-packages, avoiding editable-finder issues).
+                    print("[MMAudio] Retrying with a regular (non-editable) install ...")
+                    _r2 = subprocess.run(
+                        [str(MMAUDIO_VENV_PY), "-m", "pip", "install"] + _PIP_QUIET + ["."],
+                        cwd=str(MMAUDIO_REPO_DIR), capture_output=True, text=True,
+                    )
+                    if _r2.returncode != 0:
+                        print(f"[MMAudio] non-editable install also failed: {_r2.stderr[-1500:]}")
+                        return False
+
+                # Re-verify the actual submodule import now.
+                if not _mmaudio_importable():
+                    _diag = subprocess.run(
+                        [str(MMAUDIO_VENV_PY), "-c", "import mmaudio.eval_utils"],
+                        capture_output=True, text=True, cwd="/tmp",
+                    )
+                    print(f"[MMAudio] mmaudio still not importable after install: "
+                          f"{_diag.stderr[-1000:]}")
+                    return False
+                print("[MMAudio] MMAudio package import verified.")
+
+            # Ensure a torchcodec-free wav writer is available. The worker writes
+            # output via soundfile (libsndfile) instead of torchaudio.save(),
+            # because torchaudio 2.6+ routes save() through torchcodec whose
+            # native lib fails to load in this venv. soundfile usually comes in
+            # via librosa, but install it explicitly so the writer never fails.
+            _sf_check = subprocess.run(
+                [str(MMAUDIO_VENV_PY), "-c", "import soundfile"], capture_output=True,
+            )
+            if _sf_check.returncode != 0:
+                print("[MMAudio] installing soundfile (wav writer) ...")
+                subprocess.run(
+                    [str(MMAUDIO_VENV_PY), "-m", "pip", "install"] + _PIP_QUIET + ["soundfile"],
+                    check=False, capture_output=True,
+                )
+
+            # --- Download aux weights (VAE + synchformer) into the layout -----
+            # MMAudio's own download_if_needed() (run inside the worker) fetches
+            # v1-44.pth and synchformer_state_dict.pth on first run. We only
+            # need to place the NSFW model checkpoint as large_44k here.
+            MMAUDIO_WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+            MMAUDIO_EXT_WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+
+            nsfw_ckpt = MMAUDIO_WEIGHTS_DIR / MMAUDIO_NSFW_FILE
+            if not nsfw_ckpt.exists():
+                print(f"[MMAudio] Downloading NSFW large_44k weights ({MMAUDIO_NSFW_FILE}) ...")
+                _dl = hf_hub_download(
+                    repo_id=MMAUDIO_NSFW_REPO,
+                    filename=MMAUDIO_NSFW_FILE,
+                    local_dir=str(MMAUDIO_WEIGHTS_DIR),
+                    token=MMAUDIO_HF_TOKEN,
+                )
+                # hf_hub_download may nest under local_dir; ensure the file is at the expected path.
+                if not nsfw_ckpt.exists() and os.path.exists(_dl):
+                    try:
+                        shutil.copy(_dl, nsfw_ckpt)
+                    except Exception:
+                        pass
+                print("[MMAudio] NSFW weights ready.")
+
+            _mmaudio_ready = True
+            print("[MMAudio] Ready.")
+            return True
+        except Exception as _e:
+            print(f"[MMAudio] _ensure_mmaudio failed (non-fatal): {_e}")
+            import traceback; traceback.print_exc()
+            return False
+
+
+def _run_mmaudio(video_path: str, sfx_prompt: str, output_wav: str,
+                 negative_prompt: str = "", duration_sec: float = 8.0) -> bool:
+    """Generate an SFX/ambience wav for video_path using MMAudio (NSFW large_44k)
+    via its isolated venv. Chains 8s segments for longer videos, then concatenates.
+    Returns True on success. Ensures MMAudio is installed first (lazy)."""
+    if not _ensure_mmaudio():
+        print("[MMAudio] not available — skipping SFX track.")
+        return False
+
+    # Always (re)write the worker so fixes take effect without a restart.
+    MMAUDIO_INFER_SCRIPT.write_text(_MMAUDIO_INFER_WORKER_SOURCE)
+
+    # Probe duration.
+    try:
+        dur_str = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            capture_output=True, text=True, timeout=10).stdout.strip()
+        video_duration = float(dur_str)
+    except Exception:
+        video_duration = float(duration_sec) if duration_sec else 8.0
+
+    _env = {k: v for k, v in os.environ.items()}
+    _env["MMAUDIO_NSFW_CKPT"] = str(MMAUDIO_WEIGHTS_DIR / MMAUDIO_NSFW_FILE)
+    _env["HF_TOKEN"] = MMAUDIO_HF_TOKEN
+    _env["TOKENIZERS_PARALLELISM"] = "false"
+
+    import tempfile
+
+    def _one(video_in, wav_out, dur):
+        payload = {"video": video_in, "prompt": sfx_prompt or "",
+                   "negative_prompt": negative_prompt or "",
+                   "out_wav": wav_out, "duration": float(dur)}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tf:
+            json.dump(payload, tf); pj = tf.name
+        try:
+            r = subprocess.run(
+                [str(MMAUDIO_VENV_PY), str(MMAUDIO_INFER_SCRIPT), pj],
+                capture_output=True, text=True, timeout=600, cwd=str(MMAUDIO_REPO_DIR), env=_env,
+            )
+            if r.returncode != 0:
+                print(f"[MMAudio] worker stderr: {r.stderr[-2000:]}")
+                return False
+            return os.path.exists(wav_out) and os.path.getsize(wav_out) > 0
+        except subprocess.TimeoutExpired:
+            print("[MMAudio] worker timed out."); return False
+        finally:
+            try: os.unlink(pj)
+            except Exception: pass
+
+    max_chunk = 8.0  # MMAudio's trained duration
+    if video_duration <= max_chunk + 0.5:
+        return _one(video_path, output_wav, max(1.0, video_duration))
+
+    # Chain for long videos.
+    print(f"[MMAudio] chaining {video_duration:.1f}s into {max_chunk}s chunks...")
+    chunk_dir = tempfile.mkdtemp(prefix="mmaudio_chain_")
+    chunk_wavs = []
+    try:
+        n_chunks = int(np.ceil(video_duration / max_chunk))
+        for i in range(n_chunks):
+            start_t = i * max_chunk
+            this_dur = min(max_chunk, video_duration - start_t)
+            cvid = os.path.join(chunk_dir, f"chunk_{i}.mp4")
+            cwav = os.path.join(chunk_dir, f"chunk_{i}.wav")
+            # RE-ENCODE each chunk (do NOT use -c copy): stream-copy chunking
+            # can produce a file with no decodable video stream at the seek
+            # point, which makes MMAudio's pyav reader raise
+            # "IndexError: container.streams.video[0]". A clean libx264 re-encode
+            # (input-seek before -i for speed, accurate enough here) guarantees
+            # every chunk has a readable video stream. Drop audio (-an).
+            _r = subprocess.run(
+                ["ffmpeg", "-y", "-ss", str(start_t), "-i", video_path,
+                 "-t", str(this_dur), "-an",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+                 cvid],
+                capture_output=True, text=True, timeout=120,
+            )
+            if _r.returncode != 0 or not (os.path.exists(cvid) and os.path.getsize(cvid) > 0):
+                print(f"[MMAudio] chunk {i} ffmpeg failed: {_r.stderr[-400:]}")
+                continue
+            if _one(cvid, cwav, this_dur):
+                chunk_wavs.append(cwav)
+            else:
+                print(f"[MMAudio] chunk {i} failed, skipping.")
+        if not chunk_wavs:
+            return False
+        if len(chunk_wavs) == 1:
+            shutil.copy(chunk_wavs[0], output_wav)
+        else:
+            concat_list = os.path.join(chunk_dir, "concat.txt")
+            with open(concat_list, "w") as f:
+                for w in chunk_wavs:
+                    f.write(f"file '{w}'\n")
+            subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                            "-i", concat_list, "-c", "copy", output_wav],
+                           capture_output=True, timeout=60, check=True)
+        return os.path.exists(output_wav) and os.path.getsize(output_wav) > 0
+    except Exception as e:
+        print(f"[MMAudio] chaining error: {e}"); return False
+    finally:
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+
+
 def _run_foley(video_path: str, sfx_prompt: str, output_wav: str) -> bool:
     """
     Call HunyuanVideo-Foley's infer.py via subprocess, chaining for long videos.
@@ -2042,8 +2459,9 @@ def add_audio_to_video(
 ) -> bytes:
     """Dual-engine audio synthesis for a generated video.
 
-    Branch A (Foley)  — HunyuanVideo-Foley reads the video frames and
-                        generates synchronized physical sound effects / ambience.
+    Branch A (SFX)    — MMAudio (NSFW large_44k) reads the video frames and
+                        generates synchronized sound effects / ambience.
+                        Installed lazily on first use (only when audio is on).
     Branch B (Voice)  — F5-TTS clones the supplied reference voice and speaks
                         the dialogue_text. Skipped when either field is empty.
 
@@ -2053,7 +2471,8 @@ def add_audio_to_video(
     Accepts and returns raw MP4 bytes. Temp files are created in /dev/shm/newgen
     (RAM disk) and deleted before this function returns.
     """
-    if not _AUDIO_ENGINE_AVAILABLE:
+    # Vidgen-only feature: never do anything when the video tab is disabled.
+    if VIDGEN_DISABLED:
         return video_buf
 
     # Release Wan VRAM before loading Foley/F5-TTS models.
@@ -2099,13 +2518,18 @@ def add_audio_to_video(
         has_foley = False
         has_voice = False
 
-        # ---- Branch A: Foley / SFX -----------------------------------
-        print("[AudioEngine] Running HunyuanVideo-Foley...")
-        has_foley = _run_foley(vid_tmp, sfx_prompt, foley_wav)
+        # ---- Branch A: MMAudio / SFX ---------------------------------
+        # (Variable kept as has_foley/foley_wav to avoid churn in the mixer
+        #  logic below; the engine is now MMAudio, installed lazily on demand.)
+        print("[AudioEngine] Running MMAudio (SFX/ambience)...")
+        has_foley = _run_mmaudio(
+            vid_tmp, sfx_prompt, foley_wav,
+            negative_prompt=audio_negative_prompt, duration_sec=duration_sec,
+        )
         if has_foley:
-            print("[AudioEngine] Foley track generated.")
+            print("[AudioEngine] MMAudio SFX track generated.")
         else:
-            print("[AudioEngine] Foley failed — continuing without SFX track.")
+            print("[AudioEngine] MMAudio failed/unavailable — continuing without SFX track.")
 
         # ---- Branch B: Voice cloning ---------------------------------
         # gr.File (Gradio 3.x) returns an object with .name; gr.Audio returns a path string.
@@ -2125,6 +2549,15 @@ def add_audio_to_video(
         )
         if voice_active:
             try:
+                # Lazily ensure the F5-TTS voice-cloning venv exists (builds it
+                # on first use, same as MMAudio). Only runs when voice is
+                # actually requested; respects the --novidgen gate above.
+                if not F5_VENV_PY.exists():
+                    print("[AudioEngine] F5-TTS venv missing — setting up on demand...")
+                    try:
+                        _ensure_audio_engines()
+                    except Exception as _e:
+                        print(f"[AudioEngine] F5-TTS setup failed (non-fatal): {_e}")
                 print(f"[AudioEngine] Running F5-TTS voice clone... (speed={voice_speed:.2f})")
                 has_voice = _run_f5tts(_ref_path, dialogue_text.strip(), voice_wav, speed=voice_speed)
                 if has_voice:
@@ -2661,22 +3094,58 @@ def _ensure_musetalk():
                 print(f"[LipSync] OpenMMLab stack already installed "
                       f"({_mmpose_check.stdout.strip()}) — skipping install.")
             else:
-                # Install mmengine, mmcv, mmdet normally (no xtcocotools dependency).
-                # mmpose is installed with --no-deps to completely bypass its
-                # xtcocotools install_requires — that's the only dep that can't
-                # be resolved (version conflict) or built (C extension / no headers).
-                # pycocotools (already installed above) provides the identical API.
-                for _pkg in ["mmengine", "mmcv>=2.0.1", "mmdet>=3.1.0"]:
-                    _r = subprocess.run(
+                # Install mmengine first (pure python, always fine).
+                _r = subprocess.run(
+                    [str(MUSETALK_VENV_PY), "-m", "pip", "install",
+                     "--no-build-isolation"] + _MT_PIP_QUIET + ["mmengine"],
+                    capture_output=True, text=True, env=_mmcv_env,
+                )
+                print(f"[LipSync] mmengine "
+                      f"{'installed OK.' if _r.returncode == 0 else 'failed (non-fatal).'}")
+
+                # mmcv is the problem child: the latest mmcv has NO prebuilt wheel
+                # for this venv's bleeding-edge torch (cu128/cu130 on sm_120
+                # Blackwell), so a plain `pip install mmcv` falls back to compiling
+                # its CUDA ops from source — which fails ("Error compiling objects
+                # for extension"). Try, in order:
+                #   1. A prebuilt wheel from the official OpenMMLab wheel index.
+                #   2. CPU-ops-only build (MMCV_WITH_OPS=0) — imports cleanly without
+                #      any CUDA compile. MuseTalk's face/landmark path via mmpose
+                #      does not require mmcv's compiled CUDA ops, so lip-sync still
+                #      works; this just avoids the broken source build.
+                _mmcv_ok = False
+                _r = subprocess.run(
+                    [str(MUSETALK_VENV_PY), "-m", "pip", "install"] + _MT_PIP_QUIET +
+                    ["mmcv>=2.0.1", "-f",
+                     "https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html"],
+                    capture_output=True, text=True, env=_mt_env,
+                )
+                if _r.returncode == 0:
+                    _mmcv_ok = True
+                    print("[LipSync] mmcv installed OK (prebuilt OpenMMLab wheel).")
+                else:
+                    print("[LipSync] mmcv prebuilt wheel unavailable — installing "
+                          "CPU-ops-only (MMCV_WITH_OPS=0) to skip the CUDA compile...")
+                    _cpu_ops_env = {**_mt_env, "MMCV_WITH_OPS": "0"}
+                    _r2 = subprocess.run(
                         [str(MUSETALK_VENV_PY), "-m", "pip", "install",
-                         "--no-build-isolation"] + _MT_PIP_QUIET + [_pkg],
-                        capture_output=True, text=True, env=_mmcv_env,
+                         "--no-build-isolation"] + _MT_PIP_QUIET + ["mmcv>=2.0.1"],
+                        capture_output=True, text=True, env=_cpu_ops_env,
                     )
-                    if _r.returncode != 0:
-                        print(f"[LipSync] pip install {_pkg} failed (non-fatal): "
-                              f"{_r.stderr[-500:]}")
+                    if _r2.returncode == 0:
+                        _mmcv_ok = True
+                        print("[LipSync] mmcv installed OK (CPU-ops-only, no CUDA compile).")
                     else:
-                        print(f"[LipSync] {_pkg} installed OK.")
+                        print(f"[LipSync] mmcv install failed (non-fatal): {_r2.stderr[-500:]}")
+
+                # mmdet (pure-python at import; safe).
+                _r = subprocess.run(
+                    [str(MUSETALK_VENV_PY), "-m", "pip", "install",
+                     "--no-build-isolation"] + _MT_PIP_QUIET + ["mmdet>=3.1.0"],
+                    capture_output=True, text=True, env=_mmcv_env,
+                )
+                print(f"[LipSync] mmdet "
+                      f"{'installed OK.' if _r.returncode == 0 else 'failed (non-fatal).'}")
 
                 # mmpose: install without deps so pip never tries to resolve or
                 # build xtcocotools (which has conflicting version pins across
@@ -3666,6 +4135,45 @@ SEGMENT_DURATION = round(MAX_FRAMES_MODEL / FIXED_FPS, 1)   # ~6.1s per segment
 MIN_DURATION = round(MIN_FRAMES_MODEL / FIXED_FPS, 1)
 MAX_DURATION = 600.0        # 10 minutes max via chaining
 
+# ---------------------------------------------------------------------------
+# FAST MODE (user toggle, off by default).
+#
+# When ON, Wan generates HALF the frames (~8 fps of real motion) — roughly
+# HALVING the denoise cost, the dominant time sink — and RIFE then interpolates
+# x2 back to the full 16 fps so the output plays at the same length and
+# smoothness. Net: ~2x (or more) faster video generation. This is a speed/
+# quality tradeoff: interpolated in-between frames are RIFE-synthesized rather
+# than natively generated, so very fast motion / occlusions can show mild
+# interpolation artifacts. Hence OFF by default; the UI checkbox flips this
+# module-wide flag the instant it's toggled, so it applies on the next Generate.
+#
+# _FAST_MODE_FPS is the reduced native rate we generate at; RIFE multiplies it
+# back up to FIXED_FPS for playback.
+# ---------------------------------------------------------------------------
+_FAST_MODE = False
+_FAST_MODE_FPS = 8
+_FAST_RIFE_FACTOR = max(1, FIXED_FPS // _FAST_MODE_FPS)   # 16 // 8 = 2
+
+
+def _set_fast_mode(enabled: bool):
+    """UI handler: toggle fast video generation. Effective immediately for the
+    next Generate press (the generators read _FAST_MODE at run time)."""
+    global _FAST_MODE
+    _FAST_MODE = bool(enabled)
+    print(f"[FastMode] {'ENABLED — generating at ~%d fps + RIFE x%d to %d fps (faster).' % (_FAST_MODE_FPS, _FAST_RIFE_FACTOR, FIXED_FPS) if _FAST_MODE else 'disabled — native 16 fps generation.'}")
+    return None
+
+
+def _fast_num_frames(duration_seconds: float) -> int:
+    """Fast-mode frame count for a segment: ~half the native frames (generate
+    at _FAST_MODE_FPS instead of FIXED_FPS), snapped to Wan's 4n+1 VAE layout,
+    capped so peak stays within the model's quality window."""
+    raw = int(round(float(duration_seconds) * _FAST_MODE_FPS))
+    raw = int(np.clip(raw, MIN_FRAMES_MODEL, MAX_FRAMES_MODEL))
+    n = round((raw - 1) / 4)
+    frames = int(n) * 4 + 1
+    return max(9, min(MAX_FRAMES_MODEL, frames))
+
 AREA_1080P = 1920 * 1080
 AREA_720P  = 1280 * 720
 AREA_600P  = 1024 * 576   # in-between: ~16:9 at ~600p
@@ -3932,8 +4440,35 @@ def _build_wan_pipeline(target_device="cpu"):
         print(f" WAMU v2 loaded fully on {target_device} ({GPU_VRAM_GB:.0f} GB VRAM) - Ready!")
 
     _wan_scheduler_config = dict(pipeline.scheduler.config)
-    pipeline.vae.enable_slicing()
-    pipeline.vae.enable_tiling()
+
+    # Wan VAE tiling policy.
+    #   Tiling drastically lowers decode VRAM BUT (per diffusers/Wan docs) it
+    #   introduces seams at tile-stride boundaries and has known tiled-decode
+    #   bugs on Wan 2.2. On a big card we have the memory to decode the whole
+    #   latent in one pass, which is BOTH faster AND cleaner (no seams). On
+    #   smaller cards we keep tiling on so the decode fits.
+    #   animate_frame() has a runtime fallback that re-enables tiling and
+    #   retries if a full-frame decode ever OOMs / errors, so this is safe.
+    _wan_dev_vram = _device_total_vram_gb(WAN_DEVICE)
+    try:
+        if _wan_dev_vram >= FULL_RESIDENCY_VRAM_GB:
+            pipeline.vae.disable_tiling()
+            pipeline.vae.disable_slicing()
+            print(f" WAN VAE: full-frame decode (card {_wan_dev_vram:.0f} GB — "
+                  f"tiling off: faster + no tile seams).")
+        else:
+            pipeline.vae.enable_slicing()
+            pipeline.vae.enable_tiling()
+            print(f" WAN VAE: tiled decode (card {_wan_dev_vram:.0f} GB — "
+                  f"tiling on to fit decode in VRAM).")
+    except Exception as _e:
+        # If disable_* isn't available, fall back to the safe tiled path.
+        try:
+            pipeline.vae.enable_slicing()
+            pipeline.vae.enable_tiling()
+        except Exception:
+            pass
+        print(f" WAN VAE: defaulting to tiled decode ({_e}).")
 
     wan_pipe = pipeline
     _wan_loaded = True
@@ -4941,15 +5476,47 @@ def animate_frame(
 
             kwargs["callback_on_step_end"] = _step_cb
 
+        def _call_pipe(**kw):
+            # bf16 autocast + fused SDPA backend: quality-neutral speedups for
+            # the Wan denoise loop (exact math, faster attention/matmul kernels
+            # on Blackwell). Both are guarded and fall back cleanly.
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with _fused_sdpa_backend():
+                    try:
+                        return wan_pipe(**kw).frames[0]
+                    except TypeError as e:
+                        # Older pipeline without callback_on_step_end support:
+                        # retry without the callback rather than failing.
+                        if "callback_on_step_end" in str(e) and "callback_on_step_end" in kw:
+                            kw.pop("callback_on_step_end", None)
+                            return wan_pipe(**kw).frames[0]
+                        raise
+
         def _run(**kw):
             try:
-                return wan_pipe(**kw).frames[0]
-            except TypeError as e:
-                # Older pipeline without callback_on_step_end support: retry
-                # without the callback rather than failing.
-                if "callback_on_step_end" in str(e) and "callback_on_step_end" in kw:
-                    kw.pop("callback_on_step_end", None)
-                    return wan_pipe(**kw).frames[0]
+                return _call_pipe(**kw)
+            except Exception as e:
+                # Safety net: if a full-frame VAE decode ran out of memory or hit
+                # a CUDA error, re-enable VAE tiling and retry ONCE. This lets us
+                # default to the faster/cleaner full-frame decode on big cards
+                # while never hard-failing a generation if it doesn't fit.
+                _msg = str(e).lower()
+                _oom = ("out of memory" in _msg or "illegal memory access" in _msg
+                        or "cuda error" in _msg or isinstance(e, torch.cuda.OutOfMemoryError))
+                _tiled_already = _offload_state.get("_wan_vae_tiled", False)
+                if _oom and not _tiled_already:
+                    print(f"[2/2] Wan full-frame decode failed ({type(e).__name__}) — "
+                          f"re-enabling VAE tiling and retrying once...")
+                    try:
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        wan_pipe.vae.enable_tiling()
+                        wan_pipe.vae.enable_slicing()
+                        _offload_state["_wan_vae_tiled"] = True
+                    except Exception:
+                        pass
+                    return _call_pipe(**kw)
                 raise
 
         if last_frame is None:
@@ -5372,13 +5939,18 @@ def generate_video(
 
         while remaining > 0.01:
             seg_duration = min(remaining, SEGMENT_DURATION)
-            num_frames = get_num_frames(seg_duration)
+            # Fast mode: generate ~half the frames (native ~8 fps), then RIFE x2
+            # back to 16 fps below. The segment's real playback length must be
+            # measured at the rate we GENERATED (8 fps) so the chain accounts
+            # for the true duration and the total video length is preserved.
+            _gen_fps = _FAST_MODE_FPS if _FAST_MODE else FIXED_FPS
+            num_frames = _fast_num_frames(seg_duration) if _FAST_MODE else get_num_frames(seg_duration)
             # Actual playback length of this segment once snapped to the 4n+1
             # frame grid -- this is what actually ends up in the video, so the
             # chain must account for THIS, not the requested seg_duration, or
             # the accumulated rounding makes the final video come up short
             # (e.g. asking for 18s and getting ~15s).
-            actual_seg_duration = num_frames / FIXED_FPS
+            actual_seg_duration = num_frames / _gen_fps
             seg_index += 1
             is_last_segment = (remaining - actual_seg_duration) <= 0.01
 
@@ -5408,17 +5980,24 @@ def generate_video(
                 _seg_progress,
             )
 
-            factor = max(1, int(frame_multiplier) // FIXED_FPS)
-            if factor > 1:
-                seg_frames = interpolate_bits(raw_frames, multiplier=factor)
+            if _FAST_MODE:
+                # RIFE-interpolate the ~8 fps frames back up to 16 fps so the
+                # clip plays at full smoothness and correct length.
+                seg_frames = interpolate_bits(raw_frames, multiplier=_FAST_RIFE_FACTOR)
+                seg_fps = _FAST_MODE_FPS * _FAST_RIFE_FACTOR   # == FIXED_FPS (16)
             else:
-                seg_frames = list(raw_frames)
-            seg_fps = FIXED_FPS * factor
+                factor = max(1, int(frame_multiplier) // FIXED_FPS)
+                if factor > 1:
+                    seg_frames = interpolate_bits(raw_frames, multiplier=factor)
+                else:
+                    seg_frames = list(raw_frames)
+                seg_fps = FIXED_FPS * factor
 
             seg_buf = encode_frames_to_bytes(seg_frames, fps=seg_fps, quality=int(export_quality))
             segment_bufs.append(seg_buf)
             print(f"Segment {seg_index} complete ({actual_seg_duration:.2f}s, "
-                  f"{len(seg_frames)} frames @ {seg_fps} fps)")
+                  f"{len(seg_frames)} frames @ {seg_fps} fps"
+                  f"{' [FAST]' if _FAST_MODE else ''})")
 
             # --- STREAMING: yield a growing preview after every segment ------
             # Concatenate all segments so far into a tmp file and yield it so
@@ -5643,8 +6222,9 @@ def generate_sequence(
 
             while remaining > 0.01:
                 seg_duration = min(remaining, SEGMENT_DURATION)
-                num_frames = get_num_frames(seg_duration)
-                actual_seg_duration = num_frames / FIXED_FPS
+                _gen_fps = _FAST_MODE_FPS if _FAST_MODE else FIXED_FPS
+                num_frames = _fast_num_frames(seg_duration) if _FAST_MODE else get_num_frames(seg_duration)
+                actual_seg_duration = num_frames / _gen_fps
                 part_seg_index += 1
                 seg_counter += 1
                 is_last_segment_of_part = (remaining - actual_seg_duration) <= 0.01
@@ -5660,17 +6240,22 @@ def generate_sequence(
                     lora_selections, selected_loras_info, progress,
                 )
 
-                factor = max(1, int(frame_multiplier) // FIXED_FPS)
-                if factor > 1:
-                    seg_frames = interpolate_bits(raw_frames, multiplier=factor)
+                if _FAST_MODE:
+                    seg_frames = interpolate_bits(raw_frames, multiplier=_FAST_RIFE_FACTOR)
+                    seg_fps = _FAST_MODE_FPS * _FAST_RIFE_FACTOR
                 else:
-                    seg_frames = list(raw_frames)
-                seg_fps = FIXED_FPS * factor
+                    factor = max(1, int(frame_multiplier) // FIXED_FPS)
+                    if factor > 1:
+                        seg_frames = interpolate_bits(raw_frames, multiplier=factor)
+                    else:
+                        seg_frames = list(raw_frames)
+                    seg_fps = FIXED_FPS * factor
 
                 seg_buf = encode_frames_to_bytes(seg_frames, fps=seg_fps, quality=int(export_quality))
                 all_segment_bufs.append(seg_buf)
                 print(f"Sequence part {slot_idx + 1}/{n_slots} segment {part_seg_index} "
-                      f"complete ({actual_seg_duration:.2f}s, {len(seg_frames)} frames @ {seg_fps} fps)")
+                      f"complete ({actual_seg_duration:.2f}s, {len(seg_frames)} frames @ {seg_fps} fps"
+                      f"{' [FAST]' if _FAST_MODE else ''})")
 
                 remaining -= actual_seg_duration
                 if remaining <= 0.01:
@@ -5865,8 +6450,9 @@ def generate_custom_edit_sequence(
 
             while remaining > 0.01:
                 seg_duration = min(remaining, SEGMENT_DURATION)
-                num_frames = get_num_frames(seg_duration)
-                actual_seg_duration = num_frames / FIXED_FPS
+                _gen_fps = _FAST_MODE_FPS if _FAST_MODE else FIXED_FPS
+                num_frames = _fast_num_frames(seg_duration) if _FAST_MODE else get_num_frames(seg_duration)
+                actual_seg_duration = num_frames / _gen_fps
                 part_seg_index += 1
                 seg_counter += 1
                 is_last_segment_of_part = (remaining - actual_seg_duration) <= 0.01
@@ -5884,17 +6470,22 @@ def generate_custom_edit_sequence(
                     lora_selections, selected_loras_info, progress,
                 )
 
-                factor = max(1, int(frame_multiplier) // FIXED_FPS)
-                if factor > 1:
-                    seg_frames = interpolate_bits(raw_frames, multiplier=factor)
+                if _FAST_MODE:
+                    seg_frames = interpolate_bits(raw_frames, multiplier=_FAST_RIFE_FACTOR)
+                    seg_fps = _FAST_MODE_FPS * _FAST_RIFE_FACTOR
                 else:
-                    seg_frames = list(raw_frames)
-                seg_fps = FIXED_FPS * factor
+                    factor = max(1, int(frame_multiplier) // FIXED_FPS)
+                    if factor > 1:
+                        seg_frames = interpolate_bits(raw_frames, multiplier=factor)
+                    else:
+                        seg_frames = list(raw_frames)
+                    seg_fps = FIXED_FPS * factor
 
                 seg_buf = encode_frames_to_bytes(seg_frames, fps=seg_fps, quality=int(export_quality))
                 all_segment_bufs.append(seg_buf)
                 print(f"Custom seq {slot_idx + 1}/{n_slots} vidgen seg {part_seg_index} "
-                      f"complete ({actual_seg_duration:.2f}s, {len(seg_frames)} frames @ {seg_fps} fps)")
+                      f"complete ({actual_seg_duration:.2f}s, {len(seg_frames)} frames @ {seg_fps} fps"
+                      f"{' [FAST]' if _FAST_MODE else ''})")
 
                 remaining -= actual_seg_duration
                 if remaining <= 0.01:
@@ -6240,9 +6831,26 @@ def _try_enable_qwen_fa3(pipe):
     transformer = getattr(pipe, "transformer", None)
     if transformer is None or not hasattr(transformer, "set_attn_processor"):
         return False
+    # NOTE: we deliberately do NOT auto-install the `kernels` package here.
+    # A `pip install kernels` can pull a version incompatible with this venv's
+    # pinned huggingface_hub, and because `kernels` is imported transitively by
+    # diffusers' Wan pipeline path, a broken `kernels` then crashes the ENTIRE
+    # app at import (StrictDataclassFieldValidationError). So FA3 is enabled
+    # ONLY if a compatible `kernels` is already importable; otherwise we quietly
+    # use fast SDPA (exact, plenty fast). To enable FA3, install a matching
+    # `kernels` manually alongside a compatible huggingface_hub.
     try:
-        # Importing this triggers the one-time FA3 kernel fetch/compile. If the
-        # kernel is unavailable it raises here and we fall back to SDPA.
+        import importlib
+        try:
+            importlib.import_module("kernels")
+        except Exception:
+            # kernels not present (or broken) — do not touch it, use SDPA.
+            _qwen_fa3_state["active"] = False
+            _qwen_fa3_state["attempted"] = True
+            print("    [fa3] 'kernels' not available — using fast SDPA attention "
+                  "(exact, non-fatal).")
+            return False
+
         from qwenimage.qwen_fa3_processor import QwenDoubleStreamAttnProcessorFA3
         transformer.set_attn_processor(QwenDoubleStreamAttnProcessorFA3())
         _qwen_fa3_state["active"] = True
@@ -6251,51 +6859,36 @@ def _try_enable_qwen_fa3(pipe):
         return True
     except Exception as _e:
         _qwen_fa3_state["active"] = False
-        print(f"    [fa3] FlashAttention-3 unavailable — keeping default SDPA "
-              f"attention (non-fatal): {type(_e).__name__}: {_e}")
+        print(f"    [fa3] FlashAttention-3 not enabled — using fast SDPA instead "
+              f"(non-fatal: {type(_e).__name__}).")
         return False
     finally:
         _qwen_fa3_state["attempted"] = True
 
 
 def _apply_qwen_vae_memory_policy(pipe, device):
-    """Choose VAE tiling/slicing based on the picgen device's VRAM.
+    """Always keep VAE tiling+slicing ON.
 
-    VAE tiling+slicing trade decode speed for lower peak VRAM. On a big card
-    (>=40 GB, e.g. the Blackwell 6000) there is plenty of memory, so we turn
-    BOTH OFF and decode the whole latent in one pass — that is faster and, if
-    anything, cleaner (no tile seams). On smaller cards we KEEP tiling+slicing
-    on (the safe default) so the decode never OOMs. Quality-neutral either way.
+    We tried full-frame decode on big (>=40 GB) cards for speed, but on the
+    cu128/cu130 + sm_120 (Blackwell) stack the whole-latent VAE decoder conv3d
+    triggers a CUDA "illegal memory access" crash. Tiling+slicing decodes in
+    safe-sized chunks and avoids that, on every card size. Quality-neutral
+    (tiling only affects peak memory / tile seams, not the pixels materially).
     Never raises.
     """
     try:
         vae = getattr(pipe, "vae", None)
         if vae is None:
             return
-        total_vram = _device_total_vram_gb(device)
-        if total_vram >= FULL_RESIDENCY_VRAM_GB:
-            # Big card: full-frame decode (faster). disable_* exist on the
-            # diffusers VAE; guard each call independently.
-            try:
-                vae.disable_tiling()
-            except Exception:
-                pass
-            try:
-                vae.disable_slicing()
-            except Exception:
-                pass
-            print(f"    [vae] full-frame decode on {device} "
-                  f"(card {total_vram:.0f} GB — tiling/slicing off for speed).")
-        else:
-            # Small card: keep the memory-safe path.
-            try:
-                vae.enable_tiling()
-            except Exception:
-                pass
-            try:
-                vae.enable_slicing()
-            except Exception:
-                pass
+        try:
+            vae.enable_tiling()
+        except Exception:
+            pass
+        try:
+            vae.enable_slicing()
+        except Exception:
+            pass
+        print("    [vae] tiling+slicing ON (safe conv3d decode).")
     except Exception as _e:
         print(f"    [vae] memory policy skipped (non-fatal): {_e}")
 
@@ -8414,7 +9007,19 @@ with gr.Blocks(css=css) as demo:
             gr.Markdown(model_title())
 
             with gr.Row(elem_id="vidgen-autodownload-row"):
-                gr.HTML("<div style='flex:1'></div>")  # spacer pushes checkbox right
+                gr.HTML("<div style='flex:1'></div>")  # spacer pushes checkboxes right
+                fast_mode_cb = gr.Checkbox(
+                    label="⚡ Fast Mode (~2x)",
+                    value=False,
+                    info=(
+                        "OFF by default. When checked, video is generated at half the "
+                        "frames (~8 fps) and RIFE-interpolated back to 16 fps — roughly "
+                        "2x faster. Tradeoff: in-between frames are interpolated, so fast "
+                        "motion may show mild artifacts. Takes effect on the next Generate."
+                    ),
+                    elem_id="fast-mode-cb",
+                    scale=0,
+                )
                 auto_download_cb = gr.Checkbox(
                     label="Auto-Download Videos",
                     value=True,
@@ -8426,6 +9031,15 @@ with gr.Blocks(css=css) as demo:
                     elem_id="auto-download-cb",
                     scale=0,
                 )
+
+            # Toggle the module-wide fast-mode flag the instant the box changes,
+            # so it applies on the next Generate without threading a param
+            # through every generator signature.
+            fast_mode_cb.change(
+                fn=_set_fast_mode,
+                inputs=[fast_mode_cb],
+                outputs=[],
+            )
 
             with gr.Row():
                 with gr.Column(scale=1):
@@ -8655,11 +9269,11 @@ with gr.Blocks(css=css) as demo:
                         )
 
             with gr.Group():
-                add_audio_cb = gr.Checkbox(label="Add Audio (F5-TTS + HunyuanVideo-Foley)", value=False)
+                add_audio_cb = gr.Checkbox(label="Add Audio (F5-TTS voice + MMAudio SFX)", value=False)
                 # -- Top row: all four panels side-by-side ----------------------
                 with gr.Row():
                     audio_prompt_tb = gr.Textbox(
-                        label="Sound Effects / Foley Prompt", value="quiet ambience, soft room tone",
+                        label="Sound Effects / SFX Prompt (MMAudio)", value="quiet ambience, soft room tone",
                         lines=4, scale=1,
                     )
                     audio_negative_prompt_tb = gr.Textbox(
@@ -8829,8 +9443,8 @@ with gr.Blocks(css=css) as demo:
                     "with audio-driven synthesis locked to your Dialogue Script. "
                     "Requires a Voice Reference Clip + Dialogue Script in the Sound section above. "
                     "MuseTalk downloads automatically (several GB) on first use.\n\n"
-                    "Pipeline: Wan generates video ? F5-TTS generates voice WAV ? "
-                    "MuseTalk drives mouth ? Foley SFX mixed on top."
+                    "Pipeline: Wan generates video -> F5-TTS generates voice WAV -> "
+                    "MuseTalk drives mouth -> MMAudio SFX mixed on top."
                 )
                 with gr.Row():
                     lipsync_steps_sl = gr.Slider(
@@ -11281,6 +11895,41 @@ async def _logs_stream(request: _FastAPIRequest):
 
 if __name__ == "__main__":
     _start_push_api()
+
+    # Print the clickable Cloudflare access-URL banner at the TRUE end — once
+    # the web server answers AND the primary model for this mode is loaded —
+    # so the last thing shown is always the URL to open. Runs in a daemon
+    # thread because demo.launch() below blocks for the process lifetime.
+    def _ready_banner_watcher():
+        import urllib.request as _u
+        _deadline = time.time() + 900
+        _http_ok = False
+        while time.time() < _deadline:
+            time.sleep(1.0)
+            if not _http_ok:
+                try:
+                    with _u.urlopen("http://127.0.0.1:7860/", timeout=2) as _r:
+                        _http_ok = _r.status < 500
+                except Exception:
+                    _http_ok = False
+            if not _http_ok:
+                continue
+            # Primary model ready for this mode?
+            if DUAL_GPU:
+                ready = (pic_pipe is not None and _wan_loaded)
+            elif STARTUP_MODE == "vidgen":
+                ready = _wan_loaded
+            else:  # picgen
+                ready = (pic_pipe is not None and _active_model == "pic")
+            if ready:
+                # Small settle delay so background-load log lines finish first.
+                time.sleep(3.0)
+                _print_ready_banner("READY")
+                return
+        # Timed out waiting — still show the URL so the operator has it.
+        _print_ready_banner("STARTED")
+
+    threading.Thread(target=_ready_banner_watcher, daemon=True).start()
 
     # NOTE: In picgen mode we deliberately do NOT preload Wan (the vidgen model)
     # here. Doing it before demo.launch() (or eagerly right after) competes with
