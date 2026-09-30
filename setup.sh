@@ -172,6 +172,32 @@ if [ -n "$SYS_SITE" ] && [ -d "$SYS_SITE/torch" ]; then
 else
     echo "WARNING: Could not locate system torch in $SYS_SITE."
     echo "  Do NOT let setup.sh install torch — that would overwrite your dev build."
+    # -----------------------------------------------------------------------
+    # No system torch to symlink. On boxes like the 16 GB / Blackwell VPS the
+    # venv carries its OWN torch, and torchvision/torchaudio are then missing
+    # (setup.sh only symlinked them from a system copy that doesn't exist here).
+    # transformers' AutoVideoProcessor import then crashes the Qwen load.
+    # Install torchvision+torchaudio INTO THE VENV, matched to the venv torch's
+    # CUDA build tag, with --no-deps so the venv torch is never disturbed.
+    # (This folds in fix.sh item 1 so fix.sh never needs to run again.)
+    # -----------------------------------------------------------------------
+    if "$APP_PY" -c "import torch" >/dev/null 2>&1; then
+        if "$APP_PY" -c "import torchvision, torchaudio; torchvision.ops.nms" >/dev/null 2>&1; then
+            echo "  venv already has working torchvision + torchaudio — nothing to do."
+        else
+            VENV_TORCH_VER="$("$APP_PY" -c 'import torch; print(torch.__version__)' 2>/dev/null || echo '')"
+            CU_TAG="$(printf '%s' "$VENV_TORCH_VER" | sed -n 's/.*+\(cu[0-9]\+\).*/\1/p')"
+            [ -z "$CU_TAG" ] && CU_TAG="$("$APP_PY" -c 'import torch; print("cu"+torch.version.cuda.replace(".",""))' 2>/dev/null || echo cu128)"
+            echo "  Installing torchvision+torchaudio into venv (torch=$VENV_TORCH_VER, $CU_TAG, --no-deps)..."
+            "$APP_PIP" install --no-cache-dir --no-deps torchvision torchaudio \
+                --index-url "https://download.pytorch.org/whl/${CU_TAG}" \
+                && echo "  Installed torchvision+torchaudio into venv." \
+                || echo "  WARNING: venv torchvision/torchaudio install failed — match versions manually."
+            # Verify the exact import that crashes the Qwen load if it's broken.
+            "$APP_PY" -c "import torchvision; torchvision.ops.nms; from transformers import AutoVideoProcessor; print('  OK: venv torchvision + AutoVideoProcessor import cleanly')" \
+                || echo "  WARNING: torchvision/transformers still broken in venv."
+        fi
+    fi
 fi
 
 echo "Installing Python application dependencies into isolated venv..."

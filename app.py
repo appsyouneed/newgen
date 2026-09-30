@@ -49,9 +49,39 @@ class _TorchaoFilter(logging.Filter):
             return False
         if "negative_prompt is passed but classifier-free guidance" in msg:
             return False
+        if "guidance_scale is passed as" in msg:
+            return False
         return True
 
-logging.getLogger().addFilter(_TorchaoFilter())
+_NOISE_FILTER = _TorchaoFilter()
+logging.getLogger().addFilter(_NOISE_FILTER)
+
+def _silence_pipeline_loggers():
+    """Attach the noise filter directly to the diffusers / qwenimage loggers and
+    every handler they carry. Diffusers loggers use propagate=False and their own
+    StreamHandler, so a filter on the ROOT logger alone never sees these records —
+    the filter must live on the emitting logger and on its handler. Called again
+    after the pipeline import so nothing re-adds an unfiltered handler."""
+    for _name in ("diffusers", "transformers", "qwenimage",
+                  "qwenimage.pipeline_qwenimage_edit_plus"):
+        _lg = logging.getLogger(_name)
+        _lg.addFilter(_NOISE_FILTER)
+        for _h in list(getattr(_lg, "handlers", [])):
+            try:
+                _h.addFilter(_NOISE_FILTER)
+            except Exception:
+                pass
+    # Also filter diffusers' own top-level handler if present.
+    try:
+        from diffusers.utils import logging as _dl
+        _root = _dl.get_logger()
+        _root.addFilter(_NOISE_FILTER)
+        for _h in list(getattr(_root, "handlers", [])):
+            _h.addFilter(_NOISE_FILTER)
+    except Exception:
+        pass
+
+_silence_pipeline_loggers()
 
 
 # ---------------------------------------------------------------------------
@@ -197,8 +227,15 @@ def _gated_selfheal_musetalk_weights():
     _selfheal_musetalk_weights()
 
 
+# Eager pre-download of vidgen-only audio/lipsync assets (MuseTalk, F5-TTS,
+# Foley) is OFF by default: those engines are set up lazily, only when the user
+# actually enables/uses them (each job calls _ensure_musetalk()/
+# _ensure_audio_engines() on demand). Set NEWGEN_EAGER_VIDGEN_ASSETS=1 to
+# restore the old behavior of pre-downloading everything at startup.
+_EAGER_VIDGEN_ASSETS = os.environ.get("NEWGEN_EAGER_VIDGEN_ASSETS", "0") == "1"
+
 # In --novidgen mode we never even start the MuseTalk self-heal thread.
-if not VIDGEN_DISABLED:
+if not VIDGEN_DISABLED and _EAGER_VIDGEN_ASSETS:
     threading.Thread(target=_gated_selfheal_musetalk_weights, daemon=True).start()
 
 
@@ -646,7 +683,12 @@ os.environ.update({
     "ABSL_MIN_LOG_LEVEL": "3",
     "GRPC_VERBOSITY": "ERROR",
     "TOKENIZERS_PARALLELISM": "true",
-    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,backend:cudaMallocAsync",
+    # NOTE: intentionally NO backend:cudaMallocAsync here. On sm_120 (Blackwell)
+    # + cu130 torch, the cudaMallocAsync allocator backend triggers a CUDA
+    # "illegal memory access" during model load / VAE decode. expandable_segments
+    # alone gives the fragmentation benefit without that crash, and is safe on
+    # every card. (This is fix.sh item 2, folded in so it never needs re-running.)
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
     "HF_HUB_DISABLE_EXPERIMENTAL_WARNING": "1",
     "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1",
@@ -895,6 +937,13 @@ try:
     from diffusers import QwenImageEditPlusPipeline
 except ImportError:
     from qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
+
+# Re-apply the noise filter now that diffusers/qwenimage are imported (import
+# time is when diffusers installs its own StreamHandler on its logger).
+try:
+    _silence_pipeline_loggers()
+except Exception:
+    pass
 
 sys.path.insert(0, SCRIPT_DIR)
 
@@ -1391,7 +1440,17 @@ def interpolate_bits(frames_np, multiplier=2, scale=1.0):
         # Offloading a pipeline for RIFE MUST also invalidate _active_model,
         # otherwise the next activate_wan()/activate_pic() sees the stale marker,
         # returns early, and runs inference on a pipeline that is now on CPU.
-        if not DUAL_GPU:
+        # Only free the GPU for RIFE on cards too small to hold a diffusion
+        # model AND RIFE at once. RIFE needs ~1-2 GB; on a >=40 GB card the
+        # resident Wan/Qwen pipeline coexists with it easily, so offloading
+        # (and then reloading the whole model afterwards — ~10s for Wan's 64 GB)
+        # is pure wasted time. On big cards we keep the model resident and let
+        # RIFE run alongside it. Small cards keep the original offload behavior.
+        _rife_needs_gpu_alone = (
+            not DUAL_GPU
+            and _device_total_vram_gb(device) < FULL_RESIDENCY_VRAM_GB
+        )
+        if _rife_needs_gpu_alone:
             # Free whichever diffusion model owns the GPU so RIFE has room.
             # _disable_offload handles both the offload-hook case and the
             # full-residency case, and invalidates _active_model so the next
@@ -1565,14 +1624,23 @@ MMAUDIO_VENV_PY    = MMAUDIO_VENV_DIR / "bin" / "python"
 # MMAudio resolves weights relative to its own cwd: weights/ and ext_weights/.
 MMAUDIO_WEIGHTS_DIR     = MMAUDIO_REPO_DIR / "weights"
 MMAUDIO_EXT_WEIGHTS_DIR = MMAUDIO_REPO_DIR / "ext_weights"
-# NSFW large_44k finetune (fp16 safetensors) — used as the large_44k model.
-MMAUDIO_NSFW_REPO   = "phazei/NSFW_MMaudio"
-MMAUDIO_NSFW_FILE   = "mmaudio_large_44k_nsfw_gold_8.5k_final_fp16.safetensors"
+# NSFW large_44k finetune — used as the large_44k model. The old phazei/ repo
+# was removed (404/401); the live copy is cloud19/NSFW_MMaudio, which ships the
+# checkpoint as a .pth (the worker's _load_ckpt handles .pth via torch.load and
+# .safetensors via load_file, so either format works).
+MMAUDIO_NSFW_REPO   = "cloud19/NSFW_MMaudio"
+MMAUDIO_NSFW_FILE   = "nsfw_gold_8.5k_final.pth"
 # HF token for gated/NSFW model access (used verbatim as requested).
-MMAUDIO_HF_TOKEN    = "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"
+MMAUDIO_HF_TOKEN    = "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"
 
 _mmaudio_ready = False
 _mmaudio_lock  = threading.Lock()
+
+# Persistent MMAudio daemon: one long-lived worker process that loads the model
+# once (on first use) and stays resident, so subsequent SFX jobs skip the
+# Python+CUDA startup and the 4 GB model reload. Guarded by its own lock.
+_mmaudio_daemon = None          # subprocess.Popen handle, or None
+_mmaudio_daemon_lock = threading.Lock()
 
 _AUDIO_ENGINE_AVAILABLE = False   # set True once both engines verified usable
 
@@ -1804,6 +1872,25 @@ def _ensure_audio_engines():
     print("[AudioEngine] Voice engine ready (F5-TTS). SFX via MMAudio (lazy).")
 
 
+def _audio_engine_ready_for(add_audio_cb):
+    """Return True if audio was requested AND the engine is usable.
+
+    Audio-engine setup is lazy (not pre-downloaded at startup), so if the user
+    checked the audio box but the engine isn't built yet, build it now on
+    demand. This keeps 'nothing loads unless enabled' while ensuring checked
+    audio still works. Never raises."""
+    if not add_audio_cb:
+        return False
+    if _AUDIO_ENGINE_AVAILABLE:
+        return True
+    try:
+        print("[AudioEngine] Audio requested — setting up engine on demand...")
+        _ensure_audio_engines()
+    except Exception as _e:
+        print(f"[AudioEngine] on-demand setup failed (non-fatal): {_e}")
+    return _AUDIO_ENGINE_AVAILABLE
+
+
 F5_INFER_SCRIPT = Path(SCRIPT_DIR) / ".f5tts_infer_worker.py"
 
 _F5_INFER_WORKER_SOURCE = '''\
@@ -2014,25 +2101,30 @@ MMAUDIO_INFER_SCRIPT = Path(SCRIPT_DIR) / ".mmaudio_infer_worker.py"
 # NSFW large_44k finetune. Runs ONLY inside MMAUDIO_VENV_PY. Keeps its own copy
 # of the model config so it can register the NSFW safetensors as large_44k.
 _MMAUDIO_INFER_WORKER_SOURCE = '''\
-"""MMAudio SFX inference worker. Run inside MMAUDIO_VENV_PY only.
-Args: <json_payload_file>
-JSON keys: video (path), prompt, negative_prompt, out_wav, duration (sec)
-Writes a mono/stereo wav at out_wav (via soundfile/torchaudio).
+"""MMAudio SFX inference worker — PERSISTENT DAEMON. Run inside MMAUDIO_VENV_PY.
+
+Loads the model + aux weights ONCE, then loops forever reading one JSON job per
+line from stdin and writing one JSON result line to stdout. This removes the
+per-chunk / per-generation cost of Python+CUDA startup and the 4 GB model reload
+(the big MMAudio bottleneck) — the model stays resident for the process lifetime.
+
+Protocol:
+  in  (stdin, one line):  {"video": path, "prompt": str, "negative_prompt": str,
+                           "out_wav": path, "duration": float}
+  out (stdout, one line): {"ok": true, "out_wav": path}  or  {"ok": false, "error": str}
+Readiness: prints a line  {"ready": true}  on stdout once the model is loaded.
+All human-readable logs go to stderr so they never corrupt the stdout protocol.
 """
 import sys, json, os
 from pathlib import Path
 import torch
 
-@torch.inference_mode()
-def main():
-    with open(sys.argv[1], "r", encoding="utf-8") as fh:
-        p = json.load(fh)
-    video   = p["video"]
-    prompt  = p.get("prompt", "") or ""
-    neg     = p.get("negative_prompt", "") or ""
-    out_wav = p["out_wav"]
-    dur     = float(p.get("duration", 8.0))
+def _log(*a):
+    print("[MMAudioWorker]", *a, file=sys.stderr, flush=True)
 
+@torch.inference_mode()
+def _build():
+    """Load model + feature utils ONCE. Returns (net, feat, fm, seq_cfg, device, sr, generate, load_video)."""
     from mmaudio.eval_utils import (ModelConfig, all_model_cfg, generate,
                                     load_video, make_video)
     from mmaudio.model.flow_matching import FlowMatching
@@ -2042,34 +2134,20 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16
 
-    # Use the standard large_44k config, but point its model_path at the NSFW
-    # finetune we downloaded (registered by the app in weights/).
     cfg = all_model_cfg["large_44k"]
     nsfw = os.environ.get("MMAUDIO_NSFW_CKPT", "")
     if nsfw and Path(nsfw).exists():
         cfg.model_path = Path(nsfw)
 
-    # Download ONLY the aux weights (VAE + synchformer) via MMAudio's own
-    # helper. We must NOT call cfg.download_if_needed() because the NSFW model
-    # filename isn't in MMAudio's download table (it would raise "No link
-    # found"). The base large_44k model is replaced by the NSFW checkpoint.
     from mmaudio.utils.download_utils import download_model_if_needed as _dl_if_needed
-    try:
-        _dl_if_needed(cfg.vae_path)
-    except Exception as _e:
-        print(f"[MMAudioWorker] VAE download note: {_e}")
-    try:
-        _dl_if_needed(cfg.synchformer_ckpt)
-    except Exception as _e:
-        print(f"[MMAudioWorker] synchformer download note: {_e}")
-    if cfg.bigvgan_16k_path is not None:
-        try:
-            _dl_if_needed(cfg.bigvgan_16k_path)
-        except Exception as _e:
-            print(f"[MMAudioWorker] bigvgan download note: {_e}")
+    for _p in (cfg.vae_path, cfg.synchformer_ckpt, cfg.bigvgan_16k_path):
+        if _p is not None:
+            try:
+                _dl_if_needed(_p)
+            except Exception as _e:
+                _log(f"aux download note: {_e}")
 
     seq_cfg = cfg.seq_cfg
-
     net = get_my_mmaudio(cfg.model_name).to(device, dtype).eval()
 
     def _load_ckpt(path):
@@ -2080,13 +2158,13 @@ def main():
         return torch.load(path, map_location=device, weights_only=True)
 
     sd = _load_ckpt(cfg.model_path)
-    # MMAudio checkpoints may wrap weights under a key; unwrap common cases.
     if isinstance(sd, dict) and "weights" in sd and isinstance(sd["weights"], dict):
         sd = sd["weights"]
     try:
         net.load_weights(sd)
     except Exception:
         net.load_state_dict(sd, strict=False)
+    del sd
 
     fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=25)
     feat = FeaturesUtils(
@@ -2098,8 +2176,18 @@ def main():
         need_vae_encoder=False,
     ).to(device, dtype).eval()
 
-    # Load video, then set duration from the ACTUAL loaded length and update
-    # sequence lengths — same ordering as MMAudio's demo.py.
+    sr = int(seq_cfg.sampling_rate)
+    return net, feat, fm, seq_cfg, device, sr, generate, load_video
+
+@torch.inference_mode()
+def _run_job(state, p):
+    net, feat, fm, seq_cfg, device, sr, generate, load_video = state
+    video   = p["video"]
+    prompt  = p.get("prompt", "") or ""
+    neg     = p.get("negative_prompt", "") or ""
+    out_wav = p["out_wav"]
+    dur     = float(p.get("duration", 8.0))
+
     video_info = load_video(Path(video), dur)
     clip_frames = video_info.clip_frames.unsqueeze(0)
     sync_frames = video_info.sync_frames.unsqueeze(0)
@@ -2113,37 +2201,70 @@ def main():
         negative_text=[neg],
         feature_utils=feat, net=net, fm=fm, rng=rng, cfg_strength=4.5,
     )
-    audio = audios.float().cpu()[0]  # (channels, samples) or (samples,)
+    audio = audios.float().cpu()[0]
     if audio.dim() == 1:
         audio = audio.unsqueeze(0)
-    sr = int(seq_cfg.sampling_rate)
 
-    # Write the wav WITHOUT torchaudio.save(): torchaudio 2.6+ routes save()
-    # through torchcodec, whose native lib (libtorchcodec_image.so) fails to
-    # load in this venv (ABI/ffmpeg mismatch) and crashes. soundfile (libsndfile)
-    # and scipy write plain wavs directly, no torchcodec involved.
     import numpy as _np
-    wav = audio.transpose(0, 1).contiguous().numpy().astype(_np.float32)  # (samples, channels)
+    wav = audio.transpose(0, 1).contiguous().numpy().astype(_np.float32)
     _written = False
     try:
         import soundfile as _sf
         _sf.write(out_wav, wav, sr)
         _written = True
     except Exception as _e_sf:
-        print(f"[MMAudioWorker] soundfile write failed ({_e_sf}); trying scipy...")
+        _log(f"soundfile write failed ({_e_sf}); trying scipy...")
         try:
             from scipy.io import wavfile as _wf
-            # scipy wants int16 or float32; write float32 PCM.
             _wf.write(out_wav, sr, wav)
             _written = True
         except Exception as _e_sp:
-            print(f"[MMAudioWorker] scipy write also failed: {_e_sp}")
+            _log(f"scipy write also failed: {_e_sp}")
     if not _written:
         raise RuntimeError("could not write output wav with soundfile or scipy")
-    print(f"[MMAudioWorker] wrote {out_wav} ({wav.shape[0]} samples @ {sr} Hz)")
+    _log(f"wrote {out_wav} ({wav.shape[0]} samples @ {sr} Hz)")
+
+def _daemon():
+    _log("loading model (one-time)...")
+    state = _build()
+    _log("model ready — entering job loop.")
+    # Signal readiness to the parent on stdout.
+    sys.stdout.write(json.dumps({"ready": True}) + "\\n")
+    sys.stdout.flush()
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            p = json.loads(line)
+        except Exception as _e:
+            sys.stdout.write(json.dumps({"ok": False, "error": f"bad json: {_e}"}) + "\\n")
+            sys.stdout.flush()
+            continue
+        if p.get("cmd") == "shutdown":
+            _log("shutdown requested."); break
+        try:
+            _run_job(state, p)
+            ok = os.path.exists(p.get("out_wav", "")) and os.path.getsize(p["out_wav"]) > 0
+            sys.stdout.write(json.dumps({"ok": bool(ok), "out_wav": p.get("out_wav", "")}) + "\\n")
+        except Exception as _e:
+            import traceback; _log(traceback.format_exc())
+            sys.stdout.write(json.dumps({"ok": False, "error": str(_e)}) + "\\n")
+        sys.stdout.flush()
+
+# One-shot mode (legacy): a single JSON payload file arg. Kept as a fallback.
+@torch.inference_mode()
+def _one_shot(payload_file):
+    with open(payload_file, "r", encoding="utf-8") as fh:
+        p = json.load(fh)
+    state = _build()
+    _run_job(state, p)
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] not in ("--daemon", "-d"):
+        _one_shot(sys.argv[1])
+    else:
+        _daemon()
 '''
 
 
@@ -2273,14 +2394,28 @@ def _ensure_mmaudio() -> bool:
             nsfw_ckpt = MMAUDIO_WEIGHTS_DIR / MMAUDIO_NSFW_FILE
             if not nsfw_ckpt.exists():
                 print(f"[MMAudio] Downloading NSFW large_44k weights ({MMAUDIO_NSFW_FILE}) ...")
-                _dl = hf_hub_download(
-                    repo_id=MMAUDIO_NSFW_REPO,
-                    filename=MMAUDIO_NSFW_FILE,
-                    local_dir=str(MMAUDIO_WEIGHTS_DIR),
-                    token=MMAUDIO_HF_TOKEN,
-                )
+                # The repo is public, so download WITHOUT a token first — passing
+                # a stale/expired token makes HF return 401 even for public repos.
+                # Only retry with the token if the anonymous fetch fails (e.g. the
+                # repo later becomes gated).
+                _dl = None
+                try:
+                    _dl = hf_hub_download(
+                        repo_id=MMAUDIO_NSFW_REPO,
+                        filename=MMAUDIO_NSFW_FILE,
+                        local_dir=str(MMAUDIO_WEIGHTS_DIR),
+                        token=None,
+                    )
+                except Exception as _e_anon:
+                    print(f"[MMAudio] anonymous download failed ({_e_anon}); retrying with token...")
+                    _dl = hf_hub_download(
+                        repo_id=MMAUDIO_NSFW_REPO,
+                        filename=MMAUDIO_NSFW_FILE,
+                        local_dir=str(MMAUDIO_WEIGHTS_DIR),
+                        token=MMAUDIO_HF_TOKEN or None,
+                    )
                 # hf_hub_download may nest under local_dir; ensure the file is at the expected path.
-                if not nsfw_ckpt.exists() and os.path.exists(_dl):
+                if not nsfw_ckpt.exists() and _dl and os.path.exists(_dl):
                     try:
                         shutil.copy(_dl, nsfw_ckpt)
                     except Exception:
@@ -2296,17 +2431,166 @@ def _ensure_mmaudio() -> bool:
             return False
 
 
+def _mmaudio_env():
+    _env = {k: v for k, v in os.environ.items()}
+    _env["MMAUDIO_NSFW_CKPT"] = str(MMAUDIO_WEIGHTS_DIR / MMAUDIO_NSFW_FILE)
+    _env["HF_TOKEN"] = MMAUDIO_HF_TOKEN
+    _env["TOKENIZERS_PARALLELISM"] = "false"
+    # Unbuffered so the readiness line + per-job replies arrive immediately.
+    _env["PYTHONUNBUFFERED"] = "1"
+    return _env
+
+
+def _mmaudio_daemon_alive():
+    return _mmaudio_daemon is not None and _mmaudio_daemon.poll() is None
+
+
+def _start_mmaudio_daemon():
+    """Start (or reuse) the persistent MMAudio worker, blocking until it reports
+    the model is loaded. Returns True if a live, ready daemon is available."""
+    global _mmaudio_daemon
+    with _mmaudio_daemon_lock:
+        if _mmaudio_daemon_alive():
+            return True
+        # (Re)write the worker script so fixes take effect without a restart.
+        MMAUDIO_INFER_SCRIPT.write_text(_MMAUDIO_INFER_WORKER_SOURCE)
+        print("[MMAudio] starting persistent worker (loads model once, stays resident)...")
+        try:
+            _mmaudio_daemon = subprocess.Popen(
+                [str(MMAUDIO_VENV_PY), "-u", str(MMAUDIO_INFER_SCRIPT), "--daemon"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
+                cwd=str(MMAUDIO_REPO_DIR), env=_mmaudio_env(), text=True, bufsize=1,
+            )
+        except Exception as _e:
+            print(f"[MMAudio] failed to start daemon: {_e}")
+            _mmaudio_daemon = None
+            return False
+        # Wait for the readiness line (model load can take ~30-60s the first time).
+        import time as _t
+        _deadline = _t.time() + 600
+        while _t.time() < _deadline:
+            if _mmaudio_daemon.poll() is not None:
+                print("[MMAudio] daemon exited during startup.")
+                _mmaudio_daemon = None
+                return False
+            line = _mmaudio_daemon.stdout.readline()
+            if not line:
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except Exception:
+                # Non-JSON stray line — ignore.
+                continue
+            if msg.get("ready"):
+                print("[MMAudio] persistent worker ready (model resident).")
+                return True
+        print("[MMAudio] daemon did not report ready in time.")
+        return False
+
+
+def _mmaudio_daemon_job(payload, timeout=600):
+    """Send one job to the persistent daemon and wait for its reply.
+    Returns True on success. Restarts the daemon once if it has died."""
+    global _mmaudio_daemon
+    for _attempt in range(2):
+        if not _start_mmaudio_daemon():
+            return False
+        with _mmaudio_daemon_lock:
+            try:
+                _mmaudio_daemon.stdin.write(json.dumps(payload) + "\n")
+                _mmaudio_daemon.stdin.flush()
+            except Exception as _e:
+                print(f"[MMAudio] write to daemon failed ({_e}); restarting...")
+                try:
+                    _mmaudio_daemon.kill()
+                except Exception:
+                    pass
+                _mmaudio_daemon = None
+                continue  # retry with a fresh daemon
+            # Read reply lines until we get a JSON object with "ok".
+            import time as _t
+            _deadline = _t.time() + timeout
+            reply = None
+            while _t.time() < _deadline:
+                if _mmaudio_daemon.poll() is not None:
+                    print("[MMAudio] daemon died mid-job.")
+                    _mmaudio_daemon = None
+                    break
+                line = _mmaudio_daemon.stdout.readline()
+                if not line:
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    continue
+                if "ok" in msg:
+                    reply = msg
+                    break
+            if reply is None:
+                # Timed out or daemon died — restart once and retry.
+                if _mmaudio_daemon is not None:
+                    try:
+                        _mmaudio_daemon.kill()
+                    except Exception:
+                        pass
+                    _mmaudio_daemon = None
+                continue
+            if not reply.get("ok"):
+                print(f"[MMAudio] job failed: {reply.get('error', 'unknown')}")
+                return False
+            return True
+    return False
+
+
+def _shutdown_mmaudio_daemon():
+    """Stop the persistent MMAudio worker (called at process exit)."""
+    global _mmaudio_daemon
+    with _mmaudio_daemon_lock:
+        if _mmaudio_daemon is None:
+            return
+        try:
+            if _mmaudio_daemon.poll() is None:
+                try:
+                    _mmaudio_daemon.stdin.write(json.dumps({"cmd": "shutdown"}) + "\n")
+                    _mmaudio_daemon.stdin.flush()
+                except Exception:
+                    pass
+                try:
+                    _mmaudio_daemon.wait(timeout=5)
+                except Exception:
+                    _mmaudio_daemon.kill()
+        except Exception:
+            try:
+                _mmaudio_daemon.kill()
+            except Exception:
+                pass
+        _mmaudio_daemon = None
+
+
+import atexit as _atexit
+_atexit.register(_shutdown_mmaudio_daemon)
+
+
 def _run_mmaudio(video_path: str, sfx_prompt: str, output_wav: str,
                  negative_prompt: str = "", duration_sec: float = 8.0) -> bool:
     """Generate an SFX/ambience wav for video_path using MMAudio (NSFW large_44k)
-    via its isolated venv. Chains 8s segments for longer videos, then concatenates.
-    Returns True on success. Ensures MMAudio is installed first (lazy)."""
+    via a PERSISTENT worker process (model loaded once, stays resident). Chains
+    8s segments for longer videos, then concatenates. Ensures MMAudio is
+    installed and the worker is running (lazy, on first use)."""
     if not _ensure_mmaudio():
         print("[MMAudio] not available — skipping SFX track.")
         return False
 
-    # Always (re)write the worker so fixes take effect without a restart.
-    MMAUDIO_INFER_SCRIPT.write_text(_MMAUDIO_INFER_WORKER_SOURCE)
+    # Start the persistent worker on first use; it stays loaded afterwards.
+    if not _start_mmaudio_daemon():
+        print("[MMAudio] persistent worker unavailable — skipping SFX track.")
+        return False
 
     # Probe duration.
     try:
@@ -2318,33 +2602,13 @@ def _run_mmaudio(video_path: str, sfx_prompt: str, output_wav: str,
     except Exception:
         video_duration = float(duration_sec) if duration_sec else 8.0
 
-    _env = {k: v for k, v in os.environ.items()}
-    _env["MMAUDIO_NSFW_CKPT"] = str(MMAUDIO_WEIGHTS_DIR / MMAUDIO_NSFW_FILE)
-    _env["HF_TOKEN"] = MMAUDIO_HF_TOKEN
-    _env["TOKENIZERS_PARALLELISM"] = "false"
-
     import tempfile
 
     def _one(video_in, wav_out, dur):
         payload = {"video": video_in, "prompt": sfx_prompt or "",
                    "negative_prompt": negative_prompt or "",
                    "out_wav": wav_out, "duration": float(dur)}
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tf:
-            json.dump(payload, tf); pj = tf.name
-        try:
-            r = subprocess.run(
-                [str(MMAUDIO_VENV_PY), str(MMAUDIO_INFER_SCRIPT), pj],
-                capture_output=True, text=True, timeout=600, cwd=str(MMAUDIO_REPO_DIR), env=_env,
-            )
-            if r.returncode != 0:
-                print(f"[MMAudio] worker stderr: {r.stderr[-2000:]}")
-                return False
-            return os.path.exists(wav_out) and os.path.getsize(wav_out) > 0
-        except subprocess.TimeoutExpired:
-            print("[MMAudio] worker timed out."); return False
-        finally:
-            try: os.unlink(pj)
-            except Exception: pass
+        return _mmaudio_daemon_job(payload)
 
     max_chunk = 8.0  # MMAudio's trained duration
     if video_duration <= max_chunk + 0.5:
@@ -2750,6 +3014,12 @@ def add_audio_to_video(
 #     vidgen-assets gate, so it only begins after picgen is fully up and idle.
 if VIDGEN_DISABLED:
     print("[AudioEngine] skipped — vidgen disabled (--novidgen).")
+elif not _EAGER_VIDGEN_ASSETS:
+    # Lazy by default: don't build the audio engines at startup. The first
+    # video generation with the audio box checked calls _audio_engine_ready_for()
+    # which sets them up on demand, so nothing downloads unless audio is used.
+    print("[AudioEngine] lazy — will set up on first use (audio box checked). "
+          "Set NEWGEN_EAGER_VIDGEN_ASSETS=1 to pre-download at startup.")
 elif STARTUP_MODE == "picgen":
     def _gated_ensure_audio_engines():
         if not _await_vidgen_assets_gate("audio engines setup (F5-TTS + HunyuanVideo-Foley)"):
@@ -3728,8 +3998,11 @@ def _gated_ensure_musetalk():
         print(f"[LipSync] gated MuseTalk pre-download failed (non-fatal): {_e}")
 
 
-# In --novidgen mode we never start the MuseTalk pre-download thread at all.
-if not VIDGEN_DISABLED:
+# Lazy by default: only pre-download MuseTalk at startup if eager assets are
+# explicitly enabled. Otherwise the first lip-sync job builds it on demand
+# (_run_musetalk -> _ensure_musetalk waits/builds as needed), so nothing is
+# downloaded unless the user actually uses lip-sync.
+if not VIDGEN_DISABLED and _EAGER_VIDGEN_ASSETS:
     threading.Thread(target=_gated_ensure_musetalk, daemon=True).start()
 
 
@@ -6111,7 +6384,7 @@ def generate_video(
 
         final_buf = concatenate_videos(segment_bufs)
 
-        if add_audio_cb and _AUDIO_ENGINE_AVAILABLE:
+        if _audio_engine_ready_for(add_audio_cb):
             try:
                 final_buf = add_audio_to_video(
                     final_buf, audio_prompt_tb, float(duration_seconds),
@@ -6352,7 +6625,7 @@ def generate_sequence(
         final_buf = concatenate_videos(all_segment_bufs)
 
         total_duration = sum(s["duration"] for s in slots)
-        if add_audio_cb and _AUDIO_ENGINE_AVAILABLE:
+        if _audio_engine_ready_for(add_audio_cb):
             try:
                 final_buf = add_audio_to_video(final_buf, audio_prompt_tb, float(total_duration),
                                                audio_negative_prompt_tb, ref_audio_path, dialogue_text,
@@ -6585,7 +6858,7 @@ def generate_custom_edit_sequence(
         final_buf = concatenate_videos(all_segment_bufs)
 
         total_duration = sum(s["duration"] for s in slots)
-        if add_audio_cb and _AUDIO_ENGINE_AVAILABLE:
+        if _audio_engine_ready_for(add_audio_cb):
             try:
                 final_buf = add_audio_to_video(final_buf, audio_prompt_tb, float(total_duration),
                                                audio_negative_prompt_tb, ref_audio_path, dialogue_text,
@@ -6836,6 +7109,291 @@ def _safe_offload_to_cpu(pipe, label="pipeline"):
 _QWEN_FP8_ENABLED = os.environ.get("NEWGEN_QWEN_FP8", "1") == "1"
 
 
+def _is_fp8_dtype(dt):
+    for _n in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"):
+        if hasattr(torch, _n) and dt == getattr(torch, _n):
+            return True
+    return False
+
+
+def _te_key_variants(k):
+    """Candidate diffusers/transformers key names for a Qwen2.5-VL text-encoder
+    key, covering both the old (model.layers / visual) and new
+    (model.language_model / model.visual) transformers layouts."""
+    yield k
+    for a, b in (("model.layers.", "model.language_model.layers."),
+                 ("model.embed_tokens.", "model.language_model.embed_tokens."),
+                 ("model.norm.", "model.language_model.norm."),
+                 ("visual.", "model.visual."),
+                 ("model.language_model.", "model."),
+                 ("model.visual.", "visual.")):
+        if k.startswith(a):
+            yield b + k[len(a):]
+
+
+def _merge_nsfw_into_qwen(pipe, state_dict):
+    """Merge the Rapid-AIO NSFW checkpoint into the bf16 base pipeline, verified.
+
+    Replaces the old silent `load_state_dict(strict=False)` merge, which could
+    drop weights whose names didn't match without any warning. Now:
+      * routes every checkpoint key to transformer / vae / text_encoder,
+        including ComfyUI-style prefixes and both transformers text-encoder
+        layouts;
+      * checks name AND shape against the real module and LOGS coverage plus
+        any unmatched keys, so a partial merge is visible;
+      * dequantizes ComfyUI "scaled fp8" weights (weight * scale_weight)
+        instead of loading raw scaled values;
+      * keeps the full-precision base weight wherever the checkpoint tensor is
+        just the fp8-rounded copy of that same base weight (bit-exact test).
+        The merge left those weights unchanged, so the base bf16 value is the
+        more accurate one. This costs no memory at merge time (modules stay
+        bf16). On <40 GB cards the later full fp8 cast rounds them exactly as
+        before, so small-card results are unaffected; on >=40 GB cards they stay
+        full precision.
+    Never raises on a single bad tensor; logs and continues.
+    """
+    # Work purely off KEYS here and fetch each tensor on demand from state_dict
+    # (which may be a memory-mapped lazy view on low-RAM boxes). Storing tensors
+    # in the routing dicts would pull the whole ~15 GB checkpoint into RAM and
+    # defeat the low-RAM streaming path.
+    all_keys = list(state_dict.keys())
+
+    # Scale tensors are tiny; fetch only those.
+    scales = {}
+    for k in all_keys:
+        if k.endswith(".scale_weight") or k.endswith(".weight_scale"):
+            scales[k.rsplit(".", 1)[0]] = state_dict.get(k)
+
+    groups = {"transformer": {}, "vae": {}, "text_encoder": {}}  # sub_key -> orig_key
+    unrouted = []
+    for k in all_keys:
+        if (k.endswith(".scale_weight") or k.endswith(".weight_scale")
+                or k.endswith(".scale_input") or k.endswith(".input_scale")
+                or k.endswith("scaled_fp8")):
+            continue
+        routed = False
+        for p in ("model.diffusion_model.", "diffusion_model.", "transformer."):
+            if k.startswith(p):
+                groups["transformer"][k[len(p):]] = k
+                routed = True
+                break
+        if not routed:
+            for p in ("first_stage_model.", "vae."):
+                if k.startswith(p):
+                    groups["vae"][k[len(p):]] = k
+                    routed = True
+                    break
+        if not routed:
+            for p in ("text_encoders.qwen25_7b.transformer.", "text_encoders.qwen25_7b.",
+                      "conditioner.embedders.0.", "text_encoder."):
+                i = k.find(p)
+                if i >= 0:
+                    groups["text_encoder"][k[i + len(p):]] = k
+                    routed = True
+                    break
+        if not routed:
+            unrouted.append(k)
+
+    with torch.no_grad():
+        for comp_name, entries in groups.items():
+            module = getattr(pipe, comp_name, None)
+            if module is None:
+                continue
+            if not entries:
+                print(f"    [nsfw] {comp_name}: no checkpoint tensors — base weights kept.")
+                continue
+            target = module.state_dict()  # shares storage with the live params
+            loaded = kept_base = 0
+            unmatched = []
+            covered = set()
+            for sub, orig_k in entries.items():
+                variants = _te_key_variants(sub) if comp_name == "text_encoder" else (sub,)
+                tk = next((c for c in variants if c in target), None)
+                if tk is None:
+                    unmatched.append(orig_k)
+                    continue
+                t = target[tk]
+                v = state_dict[orig_k]  # fetch on demand (mmap-friendly)
+                if tuple(t.shape) != tuple(v.shape):
+                    unmatched.append(f"{orig_k} (shape {tuple(v.shape)} vs {tuple(t.shape)})")
+                    del v
+                    continue
+                covered.add(tk)
+                try:
+                    scale = scales.get(orig_k.rsplit(".", 1)[0]) if orig_k.endswith(".weight") else None
+                    if scale is not None:
+                        s = scale.to(torch.float32)
+                        if s.numel() > 1 and s.dim() == 1 and v.dim() > 1:
+                            s = s.view(-1, *([1] * (v.dim() - 1)))
+                        src = v.to(torch.float32) * s
+                    else:
+                        if _is_fp8_dtype(v.dtype) and not _is_fp8_dtype(t.dtype):
+                            # Is the checkpoint value just round(base)? Then the
+                            # merge didn't change it — keep the exact base value.
+                            if torch.equal(t.to(v.dtype).view(torch.uint8), v.view(torch.uint8)):
+                                kept_base += 1
+                                continue
+                        src = v
+                    t.copy_(src.to(t.dtype))
+                    loaded += 1
+                except Exception as _e:
+                    unmatched.append(f"{orig_k} (error: {_e})")
+            print(f"    [nsfw] {comp_name}: {loaded} merged, {kept_base} kept at full base "
+                  f"precision (checkpoint held only an fp8-rounded copy), "
+                  f"{len(unmatched)} unmatched; {len(covered)}/{len(target)} model tensors covered.")
+            for _u in unmatched[:8]:
+                print(f"        unmatched: {_u}")
+            if len(unmatched) > 8:
+                print(f"        ... and {len(unmatched) - 8} more unmatched")
+    if unrouted:
+        print(f"    [nsfw] {len(unrouted)} checkpoint keys not routed to any component "
+              f"(e.g. {unrouted[:3]}).")
+
+    # ----- VAE coverage diagnostic ------------------------------------------
+    # The checkpoint stores VAE weights under the ORIGINAL Qwen/WAN VAE naming
+    # (vae.conv1, vae.decoder.head.0.gamma, ...), while diffusers'
+    # AutoencoderKLQwenImage uses renamed modules — so a straight name match
+    # covers 0/194 tensors. That is only SAFE if the checkpoint VAE is identical
+    # to the base VAE (many Rapid-AIO merges ship the stock VAE unchanged). We
+    # verify that here by matching each checkpoint VAE tensor to a base VAE
+    # tensor of the SAME SHAPE and comparing values. If they match, the base VAE
+    # already is the checkpoint VAE and 0-merged is correct. If they differ, we
+    # WARN loudly (color/detail could differ) so it can be mapped explicitly.
+    try:
+        vae_mod = getattr(pipe, "vae", None)
+        vae_ck_keys = [k for k in all_keys
+                       if (k.startswith("first_stage_model.") or k.startswith("vae."))
+                       and not (k.endswith(".scale_weight") or k.endswith(".weight_scale"))]
+        if vae_mod is not None and vae_ck_keys:
+            base_sd = vae_mod.state_dict()
+            # Bucket base VAE tensors by shape for shape-based matching.
+            from collections import defaultdict as _dd
+            base_by_shape = _dd(list)
+            for _bk, _bt in base_sd.items():
+                base_by_shape[tuple(_bt.shape)].append((_bk, _bt))
+            same = diff = noshape = 0
+            diff_examples = []
+            for _ck in vae_ck_keys:
+                _cv = state_dict[_ck]
+                cands = base_by_shape.get(tuple(_cv.shape), [])
+                if not cands:
+                    noshape += 1
+                    continue
+                # Consider it "present in base" if ANY same-shape base tensor is
+                # numerically equal (allclose in fp32) to this checkpoint tensor.
+                cvf = _cv.to(torch.float32)
+                hit = False
+                for _bk, _bt in cands:
+                    try:
+                        if torch.allclose(_bt.to(torch.float32), cvf, atol=1e-4, rtol=1e-3):
+                            hit = True
+                            break
+                    except Exception:
+                        pass
+                if hit:
+                    same += 1
+                else:
+                    diff += 1
+                    if len(diff_examples) < 5:
+                        diff_examples.append(_ck)
+                del _cv
+            total = same + diff + noshape
+            if diff == 0 and noshape == 0:
+                print(f"    [nsfw] VAE check: all {total} checkpoint VAE tensors are "
+                      f"IDENTICAL to the base VAE — base VAE is already correct, "
+                      f"0-merged is safe (no quality impact).")
+            else:
+                print(f"    [nsfw] VAE check: {same} identical, {diff} DIFFERENT, "
+                      f"{noshape} no-shape-match out of {total}.")
+                if diff:
+                    print(f"    [nsfw] WARNING: {diff} checkpoint VAE tensors differ from "
+                          f"the base VAE and were NOT applied (naming mismatch). Image "
+                          f"color/detail may not match the checkpoint's intended VAE. "
+                          f"Examples: {diff_examples}")
+    except Exception as _e:
+        print(f"    [nsfw] VAE diagnostic skipped (non-fatal): {_e}")
+
+
+class _LazySafetensors:
+    """Dict-like, read-on-demand view over a safetensors file (memory-mapped).
+
+    Lets _merge_nsfw_into_qwen consume the NSFW checkpoint WITHOUT loading the
+    whole ~15 GB tensor dict into CPU RAM at once — essential on low-RAM boxes
+    (e.g. 16 GB). Only .keys(), .items() and .get() are used by the merge; each
+    .items()/.get() reads a single tensor via mmap, then it can be freed.
+    This is fix.sh item 3, folded in so fix.sh never needs to run again."""
+    def __init__(self, path):
+        from safetensors import safe_open
+        self._f = safe_open(path, framework="pt", device="cpu")
+        self._keys = list(self._f.keys())
+
+    def keys(self):
+        return list(self._keys)
+
+    def __contains__(self, k):
+        return k in self._keys
+
+    def get(self, k, default=None):
+        if k not in self._keys:
+            return default
+        return self._f.get_tensor(k)
+
+    def __getitem__(self, k):
+        return self._f.get_tensor(k)
+
+    def items(self):
+        for k in self._keys:
+            yield k, self._f.get_tensor(k)
+
+
+def _available_ram_gb():
+    """Best-effort available system RAM in GB. Returns a large number if it
+    can't be determined (so the normal full-RAM path is chosen)."""
+    try:
+        # Linux: read MemAvailable from /proc/meminfo (no psutil dependency).
+        with open("/proc/meminfo", "r") as _mf:
+            for _line in _mf:
+                if _line.startswith("MemAvailable:"):
+                    return int(_line.split()[1]) / (1024 * 1024)  # kB -> GB
+    except Exception:
+        pass
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 1024**3
+    except Exception:
+        return 1e9  # unknown — assume plenty, use normal path
+
+
+# Below this much available RAM we stream the NSFW checkpoint tensor-by-tensor
+# (mmap) instead of loading the whole ~15 GB dict, to avoid an OOM on small
+# boxes. The checkpoint file itself is ~15 GB, so we need comfortably more than
+# that free to load it whole.
+_NSFW_LOWRAM_THRESHOLD_GB = float(os.environ.get("NEWGEN_NSFW_LOWRAM_GB", "24"))
+
+
+def _load_and_merge_nsfw(pipe, v23_path):
+    """Load the NSFW checkpoint and merge it into the pipe with the verified,
+    quality-preserving merge — choosing a low-RAM (mmap streaming) or normal
+    (whole-file) load automatically based on free system RAM. Either way the
+    SAME _merge_nsfw_into_qwen logic runs, so quality/adherence is identical."""
+    avail = _available_ram_gb()
+    if avail < _NSFW_LOWRAM_THRESHOLD_GB:
+        print(f"    [nsfw] low RAM ({avail:.1f} GB free) — streaming checkpoint "
+              f"tensor-by-tensor (mmap) to avoid OOM.")
+        sd = _LazySafetensors(v23_path)
+        try:
+            _merge_nsfw_into_qwen(pipe, sd)
+        finally:
+            del sd
+    else:
+        sd = load_file(v23_path)
+        try:
+            _merge_nsfw_into_qwen(pipe, sd)
+        finally:
+            del sd
+    gc.collect()
+
+
 def _cast_transformer_to_fp8(pipe):
     """Cast the transformer's large Linear weights to float8_e4m3fn.
 
@@ -6853,15 +7411,28 @@ def _cast_transformer_to_fp8(pipe):
     transformer = getattr(pipe, "transformer", None)
     if transformer is None:
         return None
+
+    # >=40 GB cards: LOSSLESS mode. A weight is stored as fp8 only if its
+    # bf16 values are EXACTLY representable in fp8 (i.e. it came from the fp8
+    # NSFW checkpoint), verified by a bit-exact round trip. Anything that would
+    # lose precision stays bf16. Result: numerically identical output to a full
+    # bf16 transformer — zero quality / prompt-adherence change — while still
+    # using ~19 GB instead of ~38 GB where that is free.
+    # <40 GB cards: cast everything (required to fit; unchanged behaviour).
+    lossless = _device_total_vram_gb(PIC_DEVICE) >= FULL_RESIDENCY_VRAM_GB
     cast_count = 0
+    kept_bf16 = 0
     for module in transformer.modules():
         w = getattr(module, "weight", None)
         # Only cast 2D Linear-style weight matrices — the bulk of the size.
         if isinstance(module, torch.nn.Linear) and w is not None and w.dim() == 2:
             if w.dtype != fp8:
-                module.weight = torch.nn.Parameter(
-                    w.data.to(fp8), requires_grad=False
-                )
+                w8 = w.data.to(fp8)
+                if lossless and not torch.equal(w8.to(w.dtype), w.data):
+                    kept_bf16 += 1
+                    del w8
+                    continue
+                module.weight = torch.nn.Parameter(w8, requires_grad=False)
                 cast_count += 1
     gc.collect()
     nbytes = 0
@@ -6869,8 +7440,9 @@ def _cast_transformer_to_fp8(pipe):
         nbytes += p.numel() * p.element_size()
     for b in transformer.buffers():
         nbytes += b.numel() * b.element_size()
-    print(f"    [fp8] cast {cast_count} Linear weights to float8_e4m3fn — "
-          f"transformer now ~{nbytes / 1024**3:.1f} GB resident")
+    mode = "lossless (bit-exact only)" if lossless else "full"
+    print(f"    [fp8] {mode}: cast {cast_count} Linear weights to float8_e4m3fn, "
+          f"kept {kept_bf16} in bf16 — transformer now ~{nbytes / 1024**3:.1f} GB resident")
     return nbytes
 
 
@@ -7035,6 +7607,12 @@ def _optimize_qwen_pipe(pipe, device=None):
         print(f"    [optimize] text-encoder attn setup skipped (non-fatal): {_e}")
     if device is not None:
         _apply_qwen_vae_memory_policy(pipe, device)
+    # Silence the pipeline's own tqdm "Step x/N" bar in the terminal; picgen
+    # progress is shown in the output area instead.
+    try:
+        pipe.set_progress_bar_config(disable=True)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -7158,12 +7736,29 @@ def _enable_offload(pipe, device, label):
     label is 'pic' or 'wan'. Returns nothing; records state in _offload_state.
     """
     total_vram = _device_total_vram_gb(device)
-    # Big card: keep everything resident, fastest path, no hooks.
-    if total_vram >= FULL_RESIDENCY_VRAM_GB:
+    # Big card: keep everything resident, fastest path, no hooks — provided
+    # the whole pipeline (plus ~6 GB activation headroom) actually fits. If it
+    # doesn't (e.g. some transformer weights kept in bf16 by the lossless fp8
+    # pass), fall through to model-CPU-offload: same numerics, just streams.
+    _pipe_gb = 0.0
+    for _attr in ("transformer", "transformer_2", "text_encoder",
+                  "text_encoder_2", "vae", "image_encoder"):
+        _comp = getattr(pipe, _attr, None)
+        if _comp is not None and hasattr(_comp, "parameters"):
+            try:
+                _pipe_gb += sum(p.numel() * p.element_size() for p in _comp.parameters()) / 1024**3
+                _pipe_gb += sum(b.numel() * b.element_size() for b in _comp.buffers()) / 1024**3
+            except Exception:
+                pass
+    if total_vram >= FULL_RESIDENCY_VRAM_GB and _pipe_gb + 6.0 <= total_vram:
         _safe_move_to_device(pipe, device)
         _offload_state[label] = False
-        print(f"    [{label}] full residency on {device} (card {total_vram:.0f} GB).")
+        print(f"    [{label}] full residency on {device} (card {total_vram:.0f} GB, "
+              f"pipeline {_pipe_gb:.1f} GB).")
         return
+    if total_vram >= FULL_RESIDENCY_VRAM_GB:
+        print(f"    [{label}] pipeline {_pipe_gb:.1f} GB + headroom exceeds "
+              f"{total_vram:.0f} GB card — using offload instead of full residency.")
     # Small card: stream components on demand.
     try:
         pipe.to("cpu")
@@ -7303,36 +7898,15 @@ if DUAL_GPU:
             )
         else:
             v23_path = NSFW_WEIGHTS_LOCAL_PATH
-        state_dict = load_file(v23_path)
-        transformer_weights, vae_weights, text_encoder_weights = {}, {}, {}
-        for k, v in state_dict.items():
-            if k.startswith("model.diffusion_model."):
-                transformer_weights[k.replace("model.diffusion_model.", "")] = v
-            elif k.startswith("transformer."):
-                transformer_weights[k.replace("transformer.", "")] = v
-            elif k.startswith("first_stage_model."):
-                vae_weights[k.replace("first_stage_model.", "")] = v
-            elif k.startswith("vae."):
-                vae_weights[k.replace("vae.", "")] = v
-            elif "text_encoder" in k or "conditioner" in k:
-                if "conditioner.embedders.0." in k:
-                    text_encoder_weights[k.replace("conditioner.embedders.0.", "")] = v
-                elif "text_encoder." in k:
-                    text_encoder_weights[k.replace("text_encoder.", "")] = v
-        if transformer_weights:
-            pipe.transformer.load_state_dict(transformer_weights, strict=False)
-        if vae_weights:
-            pipe.vae.load_state_dict(vae_weights, strict=False)
-        if text_encoder_weights:
-            pipe.text_encoder.load_state_dict(text_encoder_weights, strict=False)
-        del state_dict, transformer_weights, vae_weights, text_encoder_weights
+        _load_and_merge_nsfw(pipe, v23_path)
         gc.collect()
-        # Cast transformer to fp8 (checkpoint's native precision) so it is
-        # ~19 GB resident instead of ~38 GB bf16 and fits on a 32 GB card.
+        # Cast transformer to fp8 (checkpoint's native precision): full cast on
+        # <40 GB cards, bit-exact-only (lossless) on >=40 GB cards.
         _cast_transformer_to_fp8(pipe)
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
-        pipe.to(PIC_DEVICE)
+        # Full residency if it fits, else offload — never OOM on placement.
+        _enable_offload(pipe, PIC_DEVICE, "pic")
         # Quality-neutral speedups: FA3 attention (fallback SDPA) + VAE policy.
         _optimize_qwen_pipe(pipe, PIC_DEVICE)
         pic_pipe = pipe
@@ -7397,34 +7971,7 @@ elif STARTUP_MODE == "vidgen":
             else:
                 v23_path = NSFW_WEIGHTS_LOCAL_PATH
 
-            state_dict = load_file(v23_path)
-            transformer_weights = {}
-            vae_weights = {}
-            text_encoder_weights = {}
-
-            for k, v in state_dict.items():
-                if k.startswith("model.diffusion_model."):
-                    transformer_weights[k.replace("model.diffusion_model.", "")] = v
-                elif k.startswith("transformer."):
-                    transformer_weights[k.replace("transformer.", "")] = v
-                elif k.startswith("first_stage_model."):
-                    vae_weights[k.replace("first_stage_model.", "")] = v
-                elif k.startswith("vae."):
-                    vae_weights[k.replace("vae.", "")] = v
-                elif "text_encoder" in k or "conditioner" in k:
-                    if "conditioner.embedders.0." in k:
-                        text_encoder_weights[k.replace("conditioner.embedders.0.", "")] = v
-                    elif "text_encoder." in k:
-                        text_encoder_weights[k.replace("text_encoder.", "")] = v
-
-            if transformer_weights:
-                pipe.transformer.load_state_dict(transformer_weights, strict=False)
-            if vae_weights:
-                pipe.vae.load_state_dict(vae_weights, strict=False)
-            if text_encoder_weights:
-                pipe.text_encoder.load_state_dict(text_encoder_weights, strict=False)
-
-            del state_dict, transformer_weights, vae_weights, text_encoder_weights
+            _load_and_merge_nsfw(pipe, v23_path)
             gc.collect()
 
             # Cast transformer to fp8 while still on CPU so the later GPU swap
@@ -7453,22 +8000,32 @@ else:
     print(" AGGRESSIVE LOADING: Qwen Image Edit pipeline...")
     start_qwen = time.time()
 
+    # Low-RAM boxes (e.g. 16 GB) can't hold the ~40 GB bf16 base model in CPU
+    # RAM before the GPU move. When free RAM is low, load the base model
+    # straight onto the GPU (device_map="cuda", low_cpu_mem_usage=True) so it
+    # never lands in CPU RAM. On normal boxes, keep the plain CPU load (the
+    # subsequent fp8 cast + _enable_pic_offload path is unchanged). This folds
+    # in fix.sh item 3 so fix.sh never needs to run again.
+    _lowram = _available_ram_gb() < _NSFW_LOWRAM_THRESHOLD_GB
+    _base_kwargs = dict(torch_dtype=torch.bfloat16, use_safetensors=True)
+    if _lowram:
+        _base_kwargs.update(low_cpu_mem_usage=True, device_map="cuda")
+        print(f"    [picgen] low RAM — loading base model directly onto GPU.")
+
     model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
     if not os.path.exists(model_index_path):
         print(f"Downloading Qwen base model to {BASE_MODEL_LOCAL_PATH}...")
         os.makedirs(PICGEN_MODELS_DIR, exist_ok=True)
         pic_pipe = QwenImageEditPlusPipeline.from_pretrained(
             "Qwen/Qwen-Image-Edit-2511",
-            torch_dtype=torch.bfloat16,
             cache_dir=BASE_MODEL_LOCAL_PATH,
-            use_safetensors=True
+            **_base_kwargs,
         )
     else:
         pic_pipe = QwenImageEditPlusPipeline.from_pretrained(
             BASE_MODEL_LOCAL_PATH,
-            torch_dtype=torch.bfloat16,
             local_files_only=True,
-            use_safetensors=True
+            **_base_kwargs,
         )
 
     print("Loading NSFW weights for Qwen...")
@@ -7485,35 +8042,7 @@ else:
         v23_path = NSFW_WEIGHTS_LOCAL_PATH
 
     print("Loading NSFW state dict...")
-    state_dict = load_file(v23_path)
-
-    transformer_weights = {}
-    vae_weights = {}
-    text_encoder_weights = {}
-
-    for k, v in state_dict.items():
-        if k.startswith("model.diffusion_model."):
-            transformer_weights[k.replace("model.diffusion_model.", "")] = v
-        elif k.startswith("transformer."):
-            transformer_weights[k.replace("transformer.", "")] = v
-        elif k.startswith("first_stage_model."):
-            vae_weights[k.replace("first_stage_model.", "")] = v
-        elif k.startswith("vae."):
-            vae_weights[k.replace("vae.", "")] = v
-        elif "text_encoder" in k or "conditioner" in k:
-            if "conditioner.embedders.0." in k:
-                text_encoder_weights[k.replace("conditioner.embedders.0.", "")] = v
-            elif "text_encoder." in k:
-                text_encoder_weights[k.replace("text_encoder.", "")] = v
-
-    if transformer_weights:
-        pic_pipe.transformer.load_state_dict(transformer_weights, strict=False)
-    if vae_weights:
-        pic_pipe.vae.load_state_dict(vae_weights, strict=False)
-    if text_encoder_weights:
-        pic_pipe.text_encoder.load_state_dict(text_encoder_weights, strict=False)
-
-    del state_dict, transformer_weights, vae_weights, text_encoder_weights
+    _load_and_merge_nsfw(pic_pipe, v23_path)
     # Full reclaim: Python GC + CUDA allocator flush + sync before the large move.
     gc.collect()
     torch.cuda.empty_cache()
@@ -7715,14 +8244,90 @@ _picgen_cache = {
 _picgen_cache_lock = threading.Lock()
 MAX_CACHE_ENTRIES = 20  # Keep last 20 to avoid memory bloat
 
+# Shared live-progress state for picgen. The pipeline step callback (which runs
+# inside the blocking pic_pipe(...) call) writes the current step here; the
+# streaming generator handler reads it and yields UI updates so the output box
+# shows real-time "Step x/N" instead of just Gradio's generic spinner.
+_picgen_progress = {"step": 0, "total": 1, "running": False, "desc": ""}
+_picgen_progress_lock = threading.Lock()
+
+# Per-session cache stats for diagnostics: track hit/miss rates per cache type.
+_picgen_cache_stats = {"prompt_hits": 0, "prompt_misses": 0, "vae_hits": 0, "vae_misses": 0}
+_picgen_cache_stats_lock = threading.Lock()
+
+
+def _record_cache_hit(cache_type):
+    """Record a cache hit for statistics."""
+    with _picgen_cache_stats_lock:
+        _picgen_cache_stats[f"{cache_type}_hits"] += 1
+
+
+def _record_cache_miss(cache_type):
+    """Record a cache miss for statistics."""
+    with _picgen_cache_stats_lock:
+        _picgen_cache_stats[f"{cache_type}_misses"] += 1
+
+
+def _get_cache_stats():
+    """Return a copy of cache statistics."""
+    with _picgen_cache_stats_lock:
+        return dict(_picgen_cache_stats)
+
+
+# Cancellation flag for a running picgen generation. Set by the Cancel button;
+# checked in the pipeline step callback, which flips the pipeline's native
+# _interrupt so the denoise loop stops at the next step. Cleared at the start of
+# every generation. A threading.Event is safe to set/clear across threads.
+_picgen_cancel = threading.Event()
+
+# Tracks the live pic pipeline currently running, so cancel can set its native
+# interrupt flag immediately (not only at the next callback tick).
+_picgen_active_pipe = {"pipe": None}
+
+
+def _cancel_picgen():
+    """Immediately request cancellation of any running picgen generation.
+
+    Sets the cancel flag AND flips the active pipeline's native interrupt so the
+    denoise loop bails at the next step. Also clears the progress state so the
+    on-page bar hides. Safe to click when nothing is running (no-op). Returns a
+    small status update for the UI."""
+    _picgen_cancel.set()
+    try:
+        _p = _picgen_active_pipe.get("pipe")
+        if _p is not None:
+            # Native Qwen interrupt: checked at the top of each denoise step.
+            _p._interrupt = True
+    except Exception:
+        pass
+    _set_picgen_progress(0, 1, "", running=False)
+    return gr.update(visible=True, value="Generation cancelled.")
+
+
+def _set_picgen_progress(step, total, desc, running=True):
+    with _picgen_progress_lock:
+        _picgen_progress["step"] = int(step)
+        _picgen_progress["total"] = max(1, int(total))
+        _picgen_progress["desc"] = desc
+        _picgen_progress["running"] = running
+
+
+def _get_picgen_progress():
+    with _picgen_progress_lock:
+        return dict(_picgen_progress)
+
 
 def _hash_images(images):
     """Create a stable hash from a list of PIL images."""
-    hasher = hashlib.sha256()
-    for img in images:
-        hasher.update(f"{img.size}".encode())
-        img_array = np.array(img.resize((64, 64), Image.LANCZOS))
-        hasher.update(img_array.tobytes())
+    # Hash EVERY pixel at full resolution (plus mode/size/order). The old 64x64
+    # downsample could map a slightly edited image (e.g. a face tweak fed back
+    # via "Use as input") to the same hash and reuse stale embeddings, so the
+    # edit would be ignored. Full-res hashing makes a false match impossible
+    # in practice; cost is a few ms.
+    hasher = hashlib.blake2b(digest_size=32)
+    for idx, img in enumerate(images):
+        hasher.update(f"{idx}|{img.mode}|{img.size}|".encode())
+        hasher.update(img.tobytes())
     return hasher.hexdigest()
 
 
@@ -7757,38 +8362,58 @@ def _clear_picgen_cache():
 
 
 def _get_cached_vae_latents(images):
-    """Return a device copy while retaining cache data on CPU only."""
+    """Return a device copy while retaining cache data on CPU only. LRU: update timestamp on hit."""
     img_hash = _hash_images(images)
     with _picgen_cache_lock:
-        value = _picgen_cache["vae_latents"].get(img_hash)
-    return _device_tree(value, PIC_DEVICE) if value is not None else None
+        entry = _picgen_cache["vae_latents"].get(img_hash)
+        if entry is not None:
+            # LRU: update timestamp on hit
+            _picgen_cache["vae_latents"][img_hash] = (entry[0], time.time())
+            _record_cache_hit("vae")
+            return _device_tree(entry[0], PIC_DEVICE)
+    _record_cache_miss("vae")
+    return None
 
 
 def _cache_vae_latents(images, latents):
+    """Cache VAE latents with LRU eviction (oldest-accessed entry removed when full)."""
     img_hash = _hash_images(images)
     with _picgen_cache_lock:
         cache = _picgen_cache["vae_latents"]
         if len(cache) >= MAX_CACHE_ENTRIES:
-            cache.pop(next(iter(cache)))
-        cache[img_hash] = _cpu_detach_tree(latents)
+            # LRU: evict entry with oldest timestamp
+            oldest_key = min(cache.keys(), key=lambda k: cache[k][1])
+            cache.pop(oldest_key)
+        cache[img_hash] = (_cpu_detach_tree(latents), time.time())
 
 
 def _get_cached_prompt_embeds(prompt, negative_prompt, images, num_images_per_prompt):
+    """Get cached prompt embeddings if available, otherwise return None.
+    Cache is stored as (embeds_dict, timestamp) tuples; accessing updates timestamp (LRU)."""
     img_hash = _hash_images(images)
     key = (prompt, negative_prompt or "", img_hash, num_images_per_prompt)
     with _picgen_cache_lock:
-        value = _picgen_cache["prompt_embeds"].get(key)
-    return _device_tree(value, PIC_DEVICE) if value is not None else None
+        entry = _picgen_cache["prompt_embeds"].get(key)
+        if entry is not None:
+            # LRU: update timestamp on hit
+            _picgen_cache["prompt_embeds"][key] = (entry[0], time.time())
+            _record_cache_hit("prompt")
+            return _device_tree(entry[0], PIC_DEVICE)
+    _record_cache_miss("prompt")
+    return None
 
 
 def _cache_prompt_embeds(prompt, negative_prompt, images, num_images_per_prompt, embeds_data):
+    """Cache prompt embeddings with LRU eviction (oldest-accessed entry removed when full)."""
     img_hash = _hash_images(images)
     key = (prompt, negative_prompt or "", img_hash, num_images_per_prompt)
     with _picgen_cache_lock:
         cache = _picgen_cache["prompt_embeds"]
         if len(cache) >= MAX_CACHE_ENTRIES:
-            cache.pop(next(iter(cache)))
-        cache[key] = _cpu_detach_tree(embeds_data)
+            # LRU: evict the entry with the oldest timestamp
+            oldest_key = min(cache.keys(), key=lambda k: cache[k][1])
+            cache.pop(oldest_key)
+        cache[key] = (_cpu_detach_tree(embeds_data), time.time())
 
 
 def _find_starter_path(starter_num: int):
@@ -8073,10 +8698,9 @@ def infer_with_preclear(
             pass
 
     try:
-        n = _do_clear_storage()
-        print(f"[picgen pre-clear] cleared {n} item(s)")
-    except Exception as _e:
-        print(f"[picgen pre-clear] storage clear failed (non-fatal): {_e}")
+        _do_clear_storage()
+    except Exception:
+        pass
 
     try:
         filepaths, seed_out, urls_json = infer(
@@ -8106,7 +8730,7 @@ def infer(
     height=None,
     width=None,
     num_images_per_prompt=1,
-    progress=gr.Progress(track_tqdm=True),
+    progress=None,  # Disabled — all progress flows through streaming generator only
 ):
     if randomize_seed:
         seed = random.randint(0, PICGEN_MAX_SEED)
@@ -8125,15 +8749,7 @@ def infer(
     if height == 256 and width == 256:
         height, width = None, None
 
-    print(f"Seed: {seed} | Steps: {num_inference_steps}")
-    print(f"  input images: {[im.size for im in pil_images]}")
-    
     cached_embeds = _get_cached_prompt_embeds(prompt, negative_prompt, pil_images, num_images_per_prompt)
-    cache_status = "cached" if cached_embeds is not None else "computing"
-    
-    print(f"  timing: activate {_t_active - _t_enter:.2f}s, "
-          f"decode {_t_decoded - _t_active:.2f}s, embeds: {cache_status} "
-          f"(active model: {_active_model}, dual_gpu: {DUAL_GPU})")
     _t_pipe = time.time()
 
     original_encode_prompt = pic_pipe.encode_prompt
@@ -8196,17 +8812,23 @@ def infer(
         key = _vae_image_cache_key(image)
         if key is not None:
             with _picgen_cache_lock:
-                cached = _picgen_cache["vae_latents"].get(key)
-            if cached is not None:
-                return _device_tree(cached, PIC_DEVICE)
+                entry = _picgen_cache["vae_latents"].get(key)
+                if entry is not None:
+                    # LRU: refresh timestamp on hit. Entries are (value, ts).
+                    _picgen_cache["vae_latents"][key] = (entry[0], time.time())
+            if entry is not None:
+                _record_cache_hit("vae")
+                return _device_tree(entry[0], PIC_DEVICE)
+            _record_cache_miss("vae")
         result = original_encode_vae_image(image, generator)
         if key is not None:
             try:
                 with _picgen_cache_lock:
                     cache = _picgen_cache["vae_latents"]
                     if len(cache) >= MAX_CACHE_ENTRIES:
-                        cache.pop(next(iter(cache)))
-                    cache[key] = _cpu_detach_tree(result)
+                        oldest_key = min(cache.keys(), key=lambda k: cache[k][1])
+                        cache.pop(oldest_key)
+                    cache[key] = (_cpu_detach_tree(result), time.time())
             except Exception:
                 pass
         return result
@@ -8214,6 +8836,14 @@ def infer(
     pic_pipe.encode_prompt = cached_encode_prompt
     pic_pipe.prepare_latents = cached_prepare_latents
     pic_pipe._encode_vae_image = cached_encode_vae_image
+
+    # The "Step x/N" lines seen in the terminal come from the diffusers
+    # pipeline's own tqdm bar (self.progress_bar in the denoise loop). Disable
+    # it — progress is shown in the output area via _pic_step_cb instead.
+    try:
+        pic_pipe.set_progress_bar_config(disable=True)
+    except Exception:
+        pass
 
     # Per-step progress: drive the gr.Progress object EXPLICITLY from a
     # pipeline step callback (same pattern as vidgen's animate_frame _step_cb).
@@ -8227,14 +8857,23 @@ def infer(
     _pic_total_steps = max(1, int(num_inference_steps))
 
     def _pic_step_cb(_pipe, step_index, _timestep, cb_kwargs):
-        if callable(progress):
+        # If the user clicked Cancel, flip the pipeline's native interrupt so the
+        # denoise loop stops at the next step, and mark progress not-running.
+        if _picgen_cancel.is_set():
             try:
-                progress(
-                    (step_index + 1) / _pic_total_steps,
-                    desc=f"Step {step_index + 1}/{_pic_total_steps}",
-                )
+                _pipe._interrupt = True
             except Exception:
                 pass
+            _set_picgen_progress(0, 1, "", running=False)
+            return cb_kwargs
+        # Publish to the shared progress state (drives the on-page /picgen/progress
+        # SSE/poll display) AND print to the terminal so progress is visible there
+        # too.
+        _step = step_index + 1
+        _set_picgen_progress(_step, _pic_total_steps,
+                             f"Step {_step}/{_pic_total_steps}", running=True)
+        _pct = int(round(100 * _step / _pic_total_steps))
+        print(f"  [picgen] Step {_step}/{_pic_total_steps} ({_pct}%)", flush=True)
         return cb_kwargs
 
     _pic_call_kwargs = dict(
@@ -8279,6 +8918,9 @@ def infer(
             yield
 
     try:
+        # Register the live pipe so Cancel can flip its interrupt immediately.
+        pic_pipe._interrupt = False
+        _picgen_active_pipe["pipe"] = pic_pipe
         with torch.cuda.device(PIC_DEVICE):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 with _fast_sdpa_backend():
@@ -8296,8 +8938,27 @@ def infer(
         pic_pipe.encode_prompt = original_encode_prompt
         pic_pipe.prepare_latents = original_prepare_latents
         pic_pipe._encode_vae_image = original_encode_vae_image
+        _picgen_active_pipe["pipe"] = None
+        try:
+            pic_pipe._interrupt = False
+        except Exception:
+            pass
 
-    print(f"  pipeline call took {time.time() - _t_pipe:.2f}s")
+    # If the user cancelled, abort cleanly (don't save the partial/blank result)
+    # and reset state so the NEXT generation works without a page refresh.
+    if _picgen_cancel.is_set():
+        _picgen_cancel.clear()
+        _set_picgen_progress(0, 1, "", running=False)
+        gc.collect()
+        torch.cuda.empty_cache()
+        raise gr.Error("Generation cancelled.")
+
+    # Explicit GPU cleanup after denoising to prevent memory fragmentation
+    # from affecting subsequent generations. This is a small cost now but
+    # prevents 50-100ms slowdown on the next run due to allocator fragmentation.
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
 
     import os as _os
     _shm_dir = os.path.join(SCRIPT_DIR, "tmp", "gradio")
@@ -8312,7 +8973,7 @@ def infer(
         fpath = _os.path.join(_shm_dir, filename)
         img.save(fpath, format="PNG")
         filepaths.append(fpath)
-    print(f"  saved: {[_os.path.basename(p) for p in filepaths]}")
+
     urls_json = json.dumps(filepaths)
 
     return filepaths, seed, urls_json
@@ -8752,6 +9413,64 @@ body.hide-media #picgen-result-gallery video { visibility: hidden !important; }
    generated photos stopped showing, while also overriding Gradio's native
    centered progress layout with badly aligned text. Gradio's default status
    tracker styling is correct on its own; leave it alone. */
+/* (1) Live "Step x/N" progress: a normal block DIRECTLY UNDER the output
+   gallery. Client-side JS (fed by the /picgen/progress SSE|poll endpoint)
+   sets display:block while a generation runs and display:none when idle, so
+   it appears only during generation. Not an overlay — it flows in the page
+   right beneath the gallery. */
+#picgen-progress {
+  width: 100% !important; max-width: 100% !important;
+  margin: 8px 0 0 0 !important; padding: 12px 16px !important; box-sizing: border-box !important;
+  background: rgba(0, 0, 0, 0.82) !important; color: #fff !important;
+  border: 1px solid var(--color-accent) !important; border-radius: 10px !important;
+  text-align: center !important;
+}
+#picgen-progress * { color: #fff !important; }
+#picgen-progress code { font-size: 15px !important; letter-spacing: 1px !important;
+  background: transparent !important; color: #fff !important; }
+
+/* (2) Full uncropped images: show the WHOLE image (contain, not cover) so
+   nothing is cut off, at full quality. Applies to gallery thumbnails and the
+   selected/preview image. */
+#picgen-result-gallery img,
+#picgen-result-gallery .thumbnail-item img,
+#picgen-result-gallery .grid-wrap img,
+#picgen-result-gallery button img {
+  object-fit: contain !important;
+  width: 100% !important; height: 100% !important;
+  max-width: 100% !important; max-height: 100% !important;
+}
+
+/* (3) No horizontal scrolling in the output section: keep the gallery grid
+   within the column width and let items wrap instead of overflowing sideways. */
+#picgen-result-gallery,
+#picgen-result-gallery .grid-wrap,
+#picgen-result-gallery .grid-container {
+  width: 100% !important; max-width: 100% !important;
+  overflow-x: hidden !important;
+}
+#picgen-result-gallery .grid-container {
+  grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+}
+
+/* (4) Make the output section ~50% taller so full images fit without being
+   shrunk into a short box. Gradio's default gallery height is ~350-400px;
+   we raise it to ~600px. The big preview (selected image) gets the same
+   taller area so a single result shows large and fully. */
+#picgen-result-gallery { min-height: 600px !important; }
+#picgen-result-gallery .grid-wrap { min-height: 600px !important; }
+/* The enlarged single-image preview view inside the gallery. */
+#picgen-result-gallery .preview,
+#picgen-result-gallery .image-container {
+  min-height: 600px !important; height: 600px !important;
+}
+#picgen-result-gallery .preview img {
+  max-height: 588px !important; object-fit: contain !important;
+}
+/* Each thumbnail cell tall enough that portrait images aren't cropped. */
+#picgen-result-gallery .thumbnail-item {
+  height: 290px !important; min-height: 290px !important;
+}
 
 /* NOTE: No toast/notification hiding rules here on purpose.
    Attempts to hide Gradio's "press ESC to exit full screen" and download
@@ -9007,7 +9726,154 @@ def autorun_push_generate(
 
 
 
-with gr.Blocks(css=css) as demo:
+# ---------------------------------------------------------------------------
+# Password gate. A full-screen overlay injected into the page <head> so it
+# paints BEFORE any Gradio content is visible. The user must type the password
+# to reveal the page. On success we set a long-lived cookie so THIS browser on
+# THIS device is not prompted again; any other device/browser (no cookie) is
+# prompted.
+#
+# The plaintext password is NEVER stored in the code or sent to the browser.
+# We store only a salted SHA-256 hash. The browser hashes whatever the user
+# types (with the same salt, via the Web Crypto API) and compares to the hash.
+# A correct entry produces the matching hash; the plaintext exists only
+# momentarily in the user's own input box. To change the password, recompute:
+#   python -c "import hashlib; print(hashlib.sha256(('%s'+'NEWPW').encode()).hexdigest())"
+# using the salt below, and paste the new hex into _PAGE_PASSWORD_HASH.
+# ---------------------------------------------------------------------------
+_PAGE_PASSWORD_SALT = "newgen_v1_7c3f"
+_PAGE_PASSWORD_HASH = "5f1bd8f023663fcc1d7dc2b9b314961b7d5795e187a3e50afd09e05783012149"
+_password_gate_head = """
+<style>
+  #newgen-pwgate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    background: #0b0b0f; color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  #newgen-pwgate .pw-card {
+    width: min(92vw, 380px); padding: 28px 26px; border-radius: 16px;
+    background: #16161d; border: 1px solid #2a2a35;
+    box-shadow: 0 12px 48px rgba(0,0,0,.6); text-align: center;
+  }
+  #newgen-pwgate h2 { margin: 0 0 6px; font-size: 20px; font-weight: 700; }
+  #newgen-pwgate p  { margin: 0 0 18px; font-size: 13px; color: #9a9aa8; }
+  #newgen-pwgate input {
+    width: 100%; box-sizing: border-box; padding: 12px 14px; font-size: 18px;
+    text-align: center; letter-spacing: 4px; border-radius: 10px;
+    border: 1px solid #33333f; background: #0e0e13; color: #fff; outline: none;
+  }
+  #newgen-pwgate input:focus { border-color: #6c5ce7; }
+  #newgen-pwgate button {
+    margin-top: 14px; width: 100%; padding: 12px; font-size: 15px; font-weight: 600;
+    border: none; border-radius: 10px; cursor: pointer;
+    background: #6c5ce7; color: #fff;
+  }
+  #newgen-pwgate button:hover { background: #5a4bd4; }
+  #newgen-pwgate .pw-err { margin-top: 12px; font-size: 13px; color: #ff6b6b; min-height: 16px; }
+  /* Hide the whole app body until the gate decides, to avoid any flash. */
+  html.newgen-locked body > gradio-app,
+  html.newgen-locked gradio-app { visibility: hidden !important; }
+</style>
+<script>
+(function () {
+  // No plaintext password anywhere — only a salted SHA-256 hash. The entered
+  // password is hashed in-browser (Web Crypto) with the same salt and compared.
+  var SALT = "%SALT%";
+  var HASH = "%HASH%";
+  var COOKIE = "newgen_auth";
+  // Cookie stores the correct hash; presence + match means this device is authed.
+  var TOKEN = HASH;
+  var DAYS = 365;
+
+  async function sha256Hex(str) {
+    var buf = new TextEncoder().encode(str);
+    var digest = await crypto.subtle.digest("SHA-256", buf);
+    return Array.from(new Uint8Array(digest))
+      .map(function (b) { return b.toString(16).padStart(2, "0"); })
+      .join("");
+  }
+
+  function getCookie(name) {
+    var m = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+  function setCookie(name, value, days) {
+    var d = new Date();
+    d.setTime(d.getTime() + days * 24 * 60 * 60 * 1000);
+    document.cookie = name + "=" + encodeURIComponent(value) +
+      "; expires=" + d.toUTCString() + "; path=/; SameSite=Lax";
+  }
+
+  // Already authorized on THIS browser/device? Skip the gate entirely.
+  if (getCookie(COOKIE) === TOKEN) { return; }
+
+  // Lock the page as early as possible.
+  document.documentElement.classList.add("newgen-locked");
+
+  function buildGate() {
+    if (document.getElementById("newgen-pwgate")) return;
+    var wrap = document.createElement("div");
+    wrap.id = "newgen-pwgate";
+    wrap.innerHTML =
+      '<div class="pw-card">' +
+        '<h2>Protected</h2>' +
+        '<p>Enter the password to continue.</p>' +
+        '<input id="newgen-pw-input" type="password" inputmode="numeric" ' +
+               'autocomplete="off" placeholder="••••" />' +
+        '<button id="newgen-pw-go">Unlock</button>' +
+        '<div class="pw-err" id="newgen-pw-err"></div>' +
+      '</div>';
+    document.body.appendChild(wrap);
+
+    var input = document.getElementById("newgen-pw-input");
+    var err = document.getElementById("newgen-pw-err");
+    var go = document.getElementById("newgen-pw-go");
+
+    async function attempt() {
+      var entered;
+      try {
+        entered = await sha256Hex(SALT + input.value);
+      } catch (e) {
+        // Web Crypto requires a secure context (https/localhost). The app is
+        // served over the https Cloudflare tunnel, so this normally works.
+        err.textContent = "Secure context required to verify password.";
+        return;
+      }
+      if (entered === HASH) {
+        setCookie(COOKIE, TOKEN, DAYS);
+        var g = document.getElementById("newgen-pwgate");
+        if (g) g.remove();
+        document.documentElement.classList.remove("newgen-locked");
+      } else {
+        err.textContent = "Incorrect password.";
+        input.value = "";
+        input.focus();
+      }
+    }
+    go.addEventListener("click", attempt);
+    input.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); attempt(); }
+    });
+    setTimeout(function () { input.focus(); }, 50);
+  }
+
+  // Build the gate as soon as the body exists.
+  if (document.body) {
+    buildGate();
+  } else {
+    document.addEventListener("DOMContentLoaded", buildGate);
+    // Fallback poll in case DOMContentLoaded already fired oddly.
+    var t = setInterval(function () {
+      if (document.body) { clearInterval(t); buildGate(); }
+    }, 30);
+  }
+})();
+</script>
+""".replace("%SALT%", _PAGE_PASSWORD_SALT).replace("%HASH%", _PAGE_PASSWORD_HASH)
+
+
+with gr.Blocks(css=css, head=_password_gate_head) as demo:
     with gr.Row(elem_id="top-bar-row"):
         clear_storage_btn = gr.Button("Clear Storage", variant="secondary", size="sm")
     clear_storage_status = gr.Textbox(visible=False, label="")
@@ -10591,6 +11457,7 @@ with gr.Blocks(css=css) as demo:
                                 "Add Right To Left", variant="secondary", scale=1,
                             )
                         pic_run_button_top = gr.Button("Generate", variant="primary", size="lg")
+                        pic_cancel_button_top = gr.Button("Cancel", variant="stop", size="sm")
                         pic_num_images = gr.Slider(
                             label="Number of images", minimum=1, maximum=4, step=1, value=1,
                         )
@@ -10613,15 +11480,36 @@ with gr.Blocks(css=css) as demo:
                             interactive=False,
                             columns=2,
                             elem_id="picgen-result-gallery",
-                            # Serve full-quality PNG instead of Gradio's default
-                            # webp. Without this, right-click > "open image in
-                            # new tab" hands the browser a .webp it downloads
-                            # rather than displaying inline full size.
+                            # Serve full-quality PNG instead of Gradio's
+                            # default webp (right-click > open in new tab
+                            # then displays inline full size).
                             format="png",
+                            # Default to PREVIEW mode: big image on top with a
+                            # thumbnail strip below, instead of the 2-column grid.
+                            # preview=True makes the gallery open/stay in preview;
+                            # selected_index=0 selects the first image.
+                            preview=True,
+                            allow_preview=True,
+                            selected_index=0,
+                        )
+                        # Live per-step progress shown as a normal block DIRECTLY
+                        # UNDER the output gallery, only while generating. Its
+                        # content + show/hide is driven ENTIRELY by client-side
+                        # JS listening to our /picgen/progress SSE (or poll)
+                        # endpoint — NOT by Gradio's generator yields (which don't
+                        # stream through here). It starts visible+empty so the
+                        # DOM element always exists for the JS to target; the JS
+                        # hides it while idle and reveals it during generation.
+                        pic_progress = gr.Markdown(
+                            "", visible=True, elem_id="picgen-progress"
                         )
                         use_output_btn = gr.Button("Use as input", variant="secondary", size="sm")
                         pic_download_btn = gr.Button("Download All currently outputted Images", variant="secondary", size="sm")
                         picgen_urls = gr.Textbox(visible=False, value="", elem_id="picgen-urls")
+                        # Tracks which result-gallery image the user has selected
+                        # (0-indexed), so "Use as input" uses ONLY that one image
+                        # when several were generated. None = nothing selected yet.
+                        pic_result_selection = gr.State(value=None)
 
                         with gr.Row():
                             preset_dropdown = gr.Dropdown(
@@ -10656,6 +11544,7 @@ with gr.Blocks(css=css) as demo:
                             )
 
                         pic_run_button = gr.Button("Generate", variant="primary", size="lg")
+                        pic_cancel_button = gr.Button("Cancel", variant="stop", size="sm")
 
                 with gr.Accordion("Advanced Settings", open=False):
                     pic_seed = gr.Slider(label="Seed", minimum=0, maximum=PICGEN_MAX_SEED, step=1, value=0)
@@ -10680,6 +11569,78 @@ with gr.Blocks(css=css) as demo:
                     pic_seed, pic_randomize_seed, pic_guidance, pic_steps,
                     pic_height, pic_width, pic_num_images,
                 ]
+
+                def infer_streaming(
+                    images_b64_json, prompt, negative_prompt, seed, randomize_seed,
+                    true_guidance_scale, num_inference_steps, height, width,
+                    num_images_per_prompt,
+                ):
+                    """Generator handler that clears the gallery, runs infer() in a
+                    worker thread, and yields the final result.
+
+                    Per-step progress is NOT streamed through Gradio here (its
+                    queue does not surface intermediate generator yields to the
+                    browser in this environment). Instead, infer()'s step callback
+                    updates the shared _picgen_progress state, and the client-side
+                    JS reads it live from the dedicated /picgen/progress SSE (or
+                    poll) endpoint — a channel that is independent of Gradio's
+                    queue and guaranteed to deliver in real time. This function
+                    just marks running=True/False around the work so the JS knows
+                    when to show/hide the progress block.
+
+                    Outputs (must match the .click outputs order):
+                      pic_result, pic_seed, picgen_urls
+                    """
+                    import threading as _th
+                    _total = max(1, int(num_inference_steps))
+                    # Clear any stale cancel from a previous run so this one is
+                    # not aborted before it starts.
+                    _picgen_cancel.clear()
+                    _set_picgen_progress(0, _total, "Preparing", running=True)
+
+                    result_box = {"out": None, "err": None}
+
+                    def _work():
+                        try:
+                            _do_clear_storage()
+                        except Exception:
+                            pass
+                        try:
+                            result_box["out"] = infer(
+                                images_b64_json, prompt, negative_prompt, seed, randomize_seed,
+                                true_guidance_scale, num_inference_steps, height, width,
+                                num_images_per_prompt, None,
+                            )
+                        except Exception as _e:
+                            result_box["err"] = _e
+                        finally:
+                            # running=False tells the client JS to hide the bar.
+                            _set_picgen_progress(_total, _total, "Finalizing", running=False)
+
+                    worker = _th.Thread(target=_work, daemon=True)
+                    worker.start()
+
+                    # Immediately clear the old gallery so results/progress aren't
+                    # painted over. (The JS progress block shows via SSE.)
+                    yield [], gr.update(), ""
+
+                    # Keep the queue connection alive until the worker finishes.
+                    # We don't need to yield progress here — the SSE endpoint does
+                    # that — so just wait, then emit the final result once.
+                    while worker.is_alive():
+                        time.sleep(0.2)
+
+                    worker.join()
+                    if result_box["err"] is not None:
+                        _set_picgen_progress(_total, _total, "", running=False)
+                        raise gr.Error(f"Generation failed: {result_box['err']}")
+
+                    filepaths, seed_out, urls_json = result_box["out"]
+                    # Open the gallery in PREVIEW mode with the first image
+                    # selected (big image on top, thumbnails below) instead of
+                    # the 2-column grid. selected_index=0 is what puts a
+                    # gr.Gallery into preview mode on update.
+                    yield gr.update(value=filepaths, selected_index=0), seed_out, urls_json
                 # JS pre-hook: pull the current images from window.__uploadedImages
                 # into args[0], then return the FULL args array unchanged.
                 # Returning all inputs is the correct Gradio 4.x contract (the
@@ -10739,19 +11700,20 @@ with gr.Blocks(css=css) as demo:
                     # concurrency_id / concurrency_limit restore the dedicated
                     # picgen queue the backup used, which track_tqdm streaming
                     # relies on.
-                    trigger(
-                        fn=infer,
+                    # Use the GENERATOR handler (infer_streaming) so per-step
+                    # progress streams to the output area live. show_progress
+                    # "hidden" because we render our own "Step x/N" markdown
+                    # (Gradio's built-in tracker would just show the spinner).
+                    _ev = trigger(
+                        fn=infer_streaming,
                         inputs=_pic_infer_inputs,
                         js=_pic_infer_js,
                         outputs=[pic_result, pic_seed, picgen_urls],
-                        show_progress="full",
+                        show_progress="hidden",
                         concurrency_id=PIC_QUEUE_ID,
                         concurrency_limit=1,
-                    ).then(
-                        fn=lambda: __import__('time').sleep(2),
-                        inputs=[],
-                        outputs=[],
-                    ).then(
+                    )
+                    _ev.then(
                         fn=protect_current_inputs,
                         inputs=[reference_image, end_image, merge_img_a, merge_img_b],
                         outputs=None,
@@ -10759,11 +11721,35 @@ with gr.Blocks(css=css) as demo:
                         fn=clear_storage,
                         inputs=[],
                         outputs=[clear_storage_status],
+                    ).then(
+                        # New results just rendered — reset the "selected result"
+                        # so "Use as input" defaults to the first image until the
+                        # user clicks one (avoids a stale index from a prior run).
+                        fn=lambda: None,
+                        inputs=[],
+                        outputs=[pic_result_selection],
                     )
+                    # Return the generate event so Cancel can abort it.
+                    return _ev
 
-                _wire_picgen_btn(pic_run_button.click)
-                _wire_picgen_btn(pic_run_button_top.click)
-                _wire_picgen_btn(pic_prompt.submit)
+                _pic_gen_events = [
+                    _wire_picgen_btn(pic_run_button.click),
+                    _wire_picgen_btn(pic_run_button_top.click),
+                    _wire_picgen_btn(pic_prompt.submit),
+                ]
+
+                # Cancel buttons: (1) set the cancel flag + flip the pipeline's
+                # native interrupt so the current denoise loop bails immediately,
+                # and (2) via cancels=, tell Gradio to abort the in-flight
+                # generate events so the queue frees up and the user can start a
+                # new generation right away without refreshing the page.
+                for _cbtn in (pic_cancel_button, pic_cancel_button_top):
+                    _cbtn.click(
+                        fn=_cancel_picgen,
+                        inputs=[],
+                        outputs=[clear_storage_status],
+                        cancels=_pic_gen_events,
+                    )
 
                 # Tool buttons (Completed Body / Add L->R / Add R->L). These are
                 # just PRESET PROMPTS: each button drops its preset text into the
@@ -10801,17 +11787,13 @@ with gr.Blocks(css=css) as demo:
                         inputs=[],
                         outputs=[pic_prompt],
                     ).then(
-                        fn=infer,
+                        fn=infer_streaming,
                         inputs=_pic_infer_inputs,
                         js=_pic_infer_js,
                         outputs=[pic_result, pic_seed, picgen_urls],
-                        show_progress="full",
+                        show_progress="hidden",
                         concurrency_id=PIC_QUEUE_ID,
                         concurrency_limit=1,
-                    ).then(
-                        fn=lambda: __import__('time').sleep(2),
-                        inputs=[],
-                        outputs=[],
                     ).then(
                         fn=protect_current_inputs,
                         inputs=[reference_image, end_image, merge_img_a, merge_img_b],
@@ -10820,6 +11802,10 @@ with gr.Blocks(css=css) as demo:
                         fn=clear_storage,
                         inputs=[],
                         outputs=[clear_storage_status],
+                    ).then(
+                        fn=lambda: None,
+                        inputs=[],
+                        outputs=[pic_result_selection],
                     )
 
                 _wire_picgen_tool_preset(pic_add_l2r_btn, "add_l2r")
@@ -10837,37 +11823,74 @@ with gr.Blocks(css=css) as demo:
                 )
 
 
-                def output_to_b64(output_images):
-                    """Convert gallery items to base64 JPEG list for the input gallery.
-                    Gallery type="filepath": items are file path strings or dicts with 'name'/'path'."""
+                def _gallery_item_to_path(item):
+                    """Resolve a gr.Gallery (type='filepath') item to a file path."""
+                    if isinstance(item, dict):
+                        return item.get("name") or item.get("path") or item.get("url") or ""
+                    if isinstance(item, (list, tuple)):
+                        return item[0] if item else ""
+                    return str(item) if item else ""
+
+                def _one_image_to_b64(fpath):
+                    """Load one image path, downscale to 512, return a data URL (or None)."""
+                    try:
+                        if not fpath or not os.path.exists(fpath):
+                            return None
+                        img = Image.open(fpath).convert("RGB")
+                        max_size = 512
+                        if img.width > img.height:
+                            img = img.resize((max_size, int(img.height * max_size / img.width)), Image.LANCZOS)
+                        else:
+                            img = img.resize((int(img.width * max_size / img.height), max_size), Image.LANCZOS)
+                        buf = BytesIO()
+                        img.save(buf, format="JPEG", quality=95)
+                        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+                    except Exception as e:
+                        print(f"output_to_b64 skipped an item: {e}")
+                        return None
+
+                def output_to_b64(output_images, selection):
+                    """Convert ONLY the currently selected result image to a base64
+                    data URL for the input gallery. If several images were
+                    generated, use the one the user clicked/selected (selection
+                    index); if nothing is selected, default to the first image.
+                    Returns a single-element JSON array so the input gallery gets
+                    exactly one image, not all of them."""
                     if not output_images:
                         return "[]"
-                    b64_list = []
-                    for item in output_images:
-                        try:
-                            if isinstance(item, dict):
-                                fpath = item.get("name") or item.get("path") or item.get("url") or ""
-                            elif isinstance(item, (list, tuple)):
-                                fpath = item[0] if item else ""
-                            else:
-                                fpath = str(item)
-                            if not fpath or not os.path.exists(fpath):
-                                continue
-                            img = Image.open(fpath).convert("RGB")
-                            max_size = 512
-                            if img.width > img.height:
-                                img = img.resize((max_size, int(img.height * max_size / img.width)), Image.LANCZOS)
-                            else:
-                                img = img.resize((int(img.width * max_size / img.height), max_size), Image.LANCZOS)
-                            buf = BytesIO()
-                            img.save(buf, format="JPEG", quality=95)
-                            b64_list.append("data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode())
-                        except Exception as e:
-                            print(f"output_to_b64 skipped an item: {e}")
-                            continue
-                    return json.dumps(b64_list)
+                    # Resolve the selected index (default to 0 when unset/out of range).
+                    idx = 0
+                    try:
+                        if selection is not None:
+                            idx = int(selection)
+                    except Exception:
+                        idx = 0
+                    if idx < 0 or idx >= len(output_images):
+                        idx = 0
+                    data_url = _one_image_to_b64(_gallery_item_to_path(output_images[idx]))
+                    return json.dumps([data_url] if data_url else [])
 
-                use_output_btn.click(fn=output_to_b64, inputs=[pic_result], outputs=[hidden_images_b64])
+                # Track which result image the user is viewing/selected.
+                def _on_pic_result_select(evt: gr.SelectData):
+                    return evt.index
+
+                pic_result.select(
+                    fn=_on_pic_result_select,
+                    outputs=[pic_result_selection],
+                    # Don't jump the page to the gallery when an image is
+                    # clicked; only record the selected index. (Gradio 4.43
+                    # defaults scroll_to_output=True, which caused the page to
+                    # scroll down on every image click.) show_progress hidden so
+                    # no spinner flashes over the output on selection either.
+                    scroll_to_output=False,
+                    show_progress="hidden",
+                )
+
+                use_output_btn.click(
+                    fn=output_to_b64,
+                    inputs=[pic_result, pic_result_selection],
+                    outputs=[hidden_images_b64],
+                )
 
                 pic_download_btn.click(
                     fn=None,
@@ -10980,6 +12003,130 @@ with gr.Blocks(css=css) as demo:
 
 
     demo.load(fn=None, js=gallery_js)
+
+    # Stop the page from auto-scrolling when a result thumbnail is clicked.
+    # Clicking a thumb swaps in the large preview, which changes the DOM height;
+    # the browser then scrolls to keep the clicked element in view. We defeat
+    # that by (a) disabling scroll anchoring on the gallery and (b) snapshotting
+    # the window scroll position on click (capture phase) and restoring it for a
+    # few animation frames while the preview swaps in. The image still changes;
+    # the page just doesn't jump. Only the user's own scrolling moves the page.
+    _picgen_noscroll_js = r"""
+() => {
+    if (window.__picgenNoScrollInit) return;
+    window.__picgenNoScrollInit = true;
+
+    function attach() {
+        var gal = document.getElementById('picgen-result-gallery');
+        if (!gal) { setTimeout(attach, 500); return; }
+        gal.style.overflowAnchor = 'none';
+        // Capture-phase: runs before Gradio's own handlers, so we can lock the
+        // scroll position around the DOM swap they trigger.
+        gal.addEventListener('click', function () {
+            var x = window.scrollX, y = window.scrollY;
+            var n = 0;
+            function lock() {
+                window.scrollTo(x, y);
+                if (++n < 20) requestAnimationFrame(lock);  // ~20 frames (~0.3s)
+            }
+            requestAnimationFrame(lock);
+        }, true);
+    }
+    attach();
+}
+"""
+    demo.load(fn=None, js=_picgen_noscroll_js)
+
+    # Picgen progress display — driven by our OWN SSE/poll endpoints, NOT by
+    # Gradio's queued generator yields (which don't stream intermediate frames
+    # through here). Writes "Step x/N" + a bar into #picgen-progress under the
+    # gallery while a generation is running, and hides it when idle. SSE first;
+    # if no SSE event arrives quickly, it falls back to JSON polling so it works
+    # even behind a proxy that buffers streaming responses.
+    _picgen_progress_js = r"""
+() => {
+    if (window.__picgenProgressInit) return;
+    window.__picgenProgressInit = true;
+
+    function bar(frac) {
+        frac = Math.max(0, Math.min(1, frac));
+        var filled = Math.round(frac * 24);
+        return "\u2588".repeat(filled) + "\u2591".repeat(24 - filled);
+    }
+
+    function el() {
+        // The gr.Markdown wrapper we gave elem_id="picgen-progress".
+        return document.getElementById("picgen-progress");
+    }
+
+    function render(st) {
+        var box = el();
+        if (!box) return;
+        var step = st.step || 0, total = st.total || 1;
+        var running = !!st.running;
+        if (running) {
+            var frac = total ? (step / total) : 0;
+            var pct = Math.round(frac * 100);
+            // Write into the markdown's inner content area.
+            box.style.display = "block";
+            box.style.visibility = "visible";
+            var inner = box.querySelector(".prose") || box;
+            inner.innerHTML =
+                '<div style="font-weight:600;margin-bottom:6px;">Generating \u2014 Step ' +
+                step + '/' + total + '  (' + pct + '%)</div>' +
+                '<div style="font-family:monospace;letter-spacing:1px;">' + bar(frac) + '</div>';
+        } else {
+            // Hide when not running.
+            box.style.display = "none";
+        }
+    }
+
+    var lastEventAt = 0;
+    var pollTimer = null;
+
+    function startPolling() {
+        if (pollTimer) return;
+        pollTimer = setInterval(function () {
+            // Only poll if SSE hasn't delivered recently.
+            if (Date.now() - lastEventAt < 1500) return;
+            fetch("/picgen/progress/poll", { cache: "no-store" })
+                .then(function (r) { return r.json(); })
+                .then(function (st) { render(st); })
+                .catch(function () {});
+        }, 250);
+    }
+
+    function startSSE() {
+        try {
+            var es = new EventSource("/picgen/progress/stream");
+            es.onmessage = function (e) {
+                lastEventAt = Date.now();
+                try { render(JSON.parse(e.data)); } catch (err) {}
+            };
+            es.onerror = function () {
+                // Connection dropped/buffered — polling fallback keeps it live.
+                startPolling();
+            };
+        } catch (err) {
+            startPolling();
+        }
+    }
+
+    // Hide the (initially visible+empty) progress block until a generation
+    // actually starts. Retry briefly in case the element isn't mounted yet.
+    (function hideInit(tries) {
+        var box = el();
+        if (box) { box.style.display = "none"; }
+        else if (tries > 0) { setTimeout(function () { hideInit(tries - 1); }, 100); }
+    })(30);
+
+    startSSE();
+    // Always run the polling fallback too; it self-suppresses while SSE is live.
+    startPolling();
+}
+"""
+    demo.load(fn=None, js=_picgen_progress_js)
+
     _picgen_dl_intercept_js = """
 () => {
     async function fetchAndDownload(mediaUrl) {
@@ -11971,6 +13118,87 @@ async def _logs_stream(request: _FastAPIRequest):
         },
     )
 
+
+# ---------------------------------------------------------------------------
+# Picgen progress — GUARANTEED real-time delivery, independent of Gradio's
+# queue/generator streaming (which does not surface intermediate yields here).
+#
+# Two channels, both bypassing Gradio entirely:
+#   1. /picgen/progress/stream — SSE. Uses X-Accel-Buffering:no and a large
+#      padding comment on connect to defeat any fixed-size proxy read buffer,
+#      plus frequent flushes. This is the primary channel.
+#   2. /picgen/progress/poll  — plain JSON, one value per request. Each response
+#      closes immediately, so NO proxy can buffer it. The client falls back to
+#      polling this if it doesn't receive SSE events quickly, making the live
+#      display work even in an environment that buffers all streaming responses.
+#
+# Both read the same shared _picgen_progress dict that the pipeline step
+# callback (_pic_step_cb) already updates every denoise step.
+# ---------------------------------------------------------------------------
+async def _picgen_progress_poll():
+    """Return the current picgen progress as JSON (one shot, no streaming)."""
+    st = _get_picgen_progress()
+    return _FastAPIResponse(
+        content=json.dumps(st),
+        media_type="application/json",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _picgen_progress_stream(request: _FastAPIRequest):
+    """SSE stream of picgen progress, guaranteed to flush in real time."""
+    from fastapi.responses import StreamingResponse as _StreamingResponse
+    import asyncio as _asyncio
+
+    async def _gen():
+        # 2 KB padding comment forces any proxy holding a fixed-size buffer to
+        # flush immediately so the very first real event is delivered live.
+        yield (": " + ("x" * 2048) + "\n\n")
+        last = None
+        while True:
+            if await request.is_disconnected():
+                break
+            st = _get_picgen_progress()
+            payload = json.dumps(st)
+            # Emit on change, and at least every ~1s as a heartbeat so the
+            # connection (and any proxy) never idles long enough to buffer.
+            if payload != last:
+                yield f"data: {payload}\n\n"
+                last = payload
+            else:
+                yield ": keepalive\n\n"
+            await _asyncio.sleep(0.15)
+
+    return _StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+def _register_picgen_progress_routes():
+    """Attach the picgen-progress routes to the LIVE FastAPI app.
+
+    Must run AFTER demo.launch(): Gradio (4.43) rebuilds demo.app inside
+    launch(), so any @demo.app.get routes declared at module load are dropped
+    from the app that actually gets served (that's why they 404'd). Registering
+    here, post-launch, puts them on the running app. Idempotent + never raises."""
+    try:
+        app = demo.app
+        existing = {getattr(r, "path", None) for r in app.routes}
+        if "/picgen/progress/poll" not in existing:
+            app.add_api_route("/picgen/progress/poll", _picgen_progress_poll, methods=["GET"])
+        if "/picgen/progress/stream" not in existing:
+            app.add_api_route("/picgen/progress/stream", _picgen_progress_stream, methods=["GET"])
+        print("[Picgen] progress routes registered on live app.")
+    except Exception as _e:
+        print(f"[Picgen] failed to register progress routes (non-fatal): {_e}")
+
+
 if __name__ == "__main__":
     _start_push_api()
 
@@ -12028,6 +13256,7 @@ if __name__ == "__main__":
             share=False,
             allowed_paths=[SCRIPT_DIR, os.path.join(SCRIPT_DIR, "tmp", "gradio")],
         )
+        _register_picgen_progress_routes()
     else:
         if STARTUP_MODE == "vidgen":
             print(" GRADIO LAUNCHING  Wan on GPU, vidgen ready immediately.")
@@ -12040,6 +13269,7 @@ if __name__ == "__main__":
             share=False,
             allowed_paths=[SCRIPT_DIR, os.path.join(SCRIPT_DIR, "tmp", "gradio")],
         )
+        _register_picgen_progress_routes()
 
         def _wait_until_picgen_ready(timeout=600.0):
             """Block until picgen is actually usable in the browser.
@@ -12154,20 +13384,7 @@ if __name__ == "__main__":
                             cache_dir=PICGEN_MODELS_DIR,
                             local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
                         )
-                    sd = load_file(v23)
-                    tw, vw, ew = {}, {}, {}
-                    for k, v in sd.items():
-                        if k.startswith("model.diffusion_model."):   tw[k.replace("model.diffusion_model.", "")] = v
-                        elif k.startswith("transformer."):           tw[k.replace("transformer.", "")] = v
-                        elif k.startswith("first_stage_model."):     vw[k.replace("first_stage_model.", "")] = v
-                        elif k.startswith("vae."):                   vw[k.replace("vae.", "")] = v
-                        elif "text_encoder" in k or "conditioner" in k:
-                            if "conditioner.embedders.0." in k:      ew[k.replace("conditioner.embedders.0.", "")] = v
-                            elif "text_encoder." in k:               ew[k.replace("text_encoder.", "")] = v
-                    if tw: pipe.transformer.load_state_dict(tw, strict=False)
-                    if vw: pipe.vae.load_state_dict(vw, strict=False)
-                    if ew: pipe.text_encoder.load_state_dict(ew, strict=False)
-                    del sd, tw, vw, ew
+                    _load_and_merge_nsfw(pipe, v23)
                     torch.cuda.empty_cache()
                     # Cast transformer to fp8 (native checkpoint precision) so
                     # the later GPU swap fits on a 32 GB card (~19 GB not ~38 GB).
@@ -12332,9 +13549,16 @@ if __name__ == "__main__":
             except Exception as _e:
                 print(f"[Predownload] rembg BiRefNet failed (non-fatal): {_e}")
 
-            # 2+3. F5-TTS + HunyuanVideo-Foley weights (vidgen-only). In picgen
-            # mode this must wait until picgen is fully ready before downloading.
-            if not VIDGEN_DISABLED:
+            # 2+3. F5-TTS + HunyuanVideo-Foley weights (vidgen-only). Lazy by
+            # default — only pre-download here if eager assets are enabled.
+            # Otherwise the first audio-checked generation builds them on demand
+            # via _audio_engine_ready_for(), so nothing downloads unless used.
+            if VIDGEN_DISABLED:
+                print("[Predownload] Audio engine skipped — vidgen disabled (--novidgen).")
+            elif not _EAGER_VIDGEN_ASSETS:
+                print("[Predownload] Audio engine pre-download skipped (lazy) — "
+                      "sets up on first use with audio checked.")
+            else:
                 try:
                     if _await_vidgen_assets_gate("audio engine pre-download (F5-TTS + Foley)"):
                         if not _AUDIO_ENGINE_AVAILABLE:
@@ -12345,9 +13569,6 @@ if __name__ == "__main__":
                             print("[Predownload] Audio engine already ready — OK.")
                 except Exception as _e:
                     print(f"[Predownload] Audio engine failed (non-fatal): {_e}")
-            else:
-                print("[Predownload] Audio engine skipped — vidgen disabled (--novidgen).")
-                import traceback; traceback.print_exc()
 
             print("[Predownload] All background pre-downloads complete.")
 
