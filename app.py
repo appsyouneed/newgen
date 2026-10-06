@@ -1631,7 +1631,7 @@ MMAUDIO_EXT_WEIGHTS_DIR = MMAUDIO_REPO_DIR / "ext_weights"
 MMAUDIO_NSFW_REPO   = "cloud19/NSFW_MMaudio"
 MMAUDIO_NSFW_FILE   = "nsfw_gold_8.5k_final.pth"
 # HF token for gated/NSFW model access (used verbatim as requested).
-MMAUDIO_HF_TOKEN    = "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"
+MMAUDIO_HF_TOKEN    = "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"
 
 _mmaudio_ready = False
 _mmaudio_lock  = threading.Lock()
