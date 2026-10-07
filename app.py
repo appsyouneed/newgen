@@ -8800,8 +8800,6 @@ def infer(
     num_inference_steps   = int(num_inference_steps   or 4)
     seed                  = int(seed) if seed is not None else 0
 
-    print(f"[picgen] infer() entered — activating model...", flush=True)
-
     if randomize_seed:
         seed = random.randint(0, PICGEN_MAX_SEED)
 
@@ -8868,8 +8866,7 @@ def infer(
         _step = step_index + 1
         _set_picgen_progress(_step, _pic_total_steps,
                              f"Step {_step}/{_pic_total_steps}", running=True)
-        _pct = int(round(100 * _step / _pic_total_steps))
-        print(f"  [picgen] Step {_step}/{_pic_total_steps} ({_pct}%)", flush=True)
+        print(f"{_step}/{_pic_total_steps}", flush=True)
         return cb_kwargs
 
     _pic_call_kwargs = dict(
@@ -11616,10 +11613,7 @@ with gr.Blocks(css=css, head=_password_gate_head) as demo:
                     num_inference_steps   = int(num_inference_steps   or 4)
                     seed                  = int(seed) if seed is not None else 0
 
-                    print(f"[picgen] Generate clicked — steps={num_inference_steps} "
-                          f"images={num_images_per_prompt} seed={seed} "
-                          f"prompt={repr(prompt[:60]) if prompt else '(none)'}",
-                          flush=True)
+                    print("PEND", flush=True)
 
                     # Previous results are only removed now, when Generate is
                     # clicked again — never right after a generation finishes.
@@ -11644,7 +11638,7 @@ with gr.Blocks(css=css, head=_password_gate_head) as demo:
                         _set_picgen_progress(_total, _total, "", running=False)
                         raise gr.Error(f"Generation failed: {_e}") from None
                     _set_picgen_progress(_total, _total, "Done", running=False)
-                    print(f"[picgen] Done — {len(filepaths)} image(s) ready.", flush=True)
+                    print("DONE", flush=True)
                     # Return the raw filepath list — NOT gr.update() — so
                     # Gradio always treats this as a brand-new value and
                     # re-renders the gallery completely, replacing old images.
