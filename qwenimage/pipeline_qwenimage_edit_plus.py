@@ -320,8 +320,11 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
-        prompt_embeds_mask = prompt_embeds_mask.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds_mask = prompt_embeds_mask.view(batch_size * num_images_per_prompt, seq_len)
+        # prompt_embeds_mask is 2D (batch_size, seq_len); use a 2-arg repeat so
+        # it stays 2D after tiling, then the view is always correct regardless
+        # of batch_size. Using .repeat(1, n, 1) on a 2D tensor implicitly adds
+        # a leading dim and breaks for batch_size > 1.
+        prompt_embeds_mask = prompt_embeds_mask.repeat(num_images_per_prompt, 1)
 
         return prompt_embeds, prompt_embeds_mask
 
@@ -797,7 +800,7 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
-                    continue
+                    break
 
                 self._current_timestep = t
 
