@@ -7033,6 +7033,20 @@ def _safe_move_to_device(pipe, target_device):
             components.append((attr, getattr(pipe, attr)))
 
     for name, component in components:
+        # Already resident on the target GPU (e.g. big card, full residency,
+        # re-activated after a state reset): nothing to move. The preflight
+        # below would wrongly count the component's own VRAM as "needed" and
+        # abort with a bogus "Insufficient VRAM".
+        if target_device != "cpu":
+            try:
+                _pdev = next(component.parameters()).device
+                _tdev = torch.device(target_device)
+                if _pdev.type == "cuda" and (_tdev.index is None or _pdev.index == _tdev.index):
+                    continue
+            except StopIteration:
+                continue
+            except Exception:
+                pass
         # Preflight admission: before moving a component to GPU, verify the
         # device has enough free VRAM for its parameter+buffer bytes plus a
         # safety headroom for the transfer, activations, and allocator
