@@ -8256,7 +8256,36 @@ def activate_pic():
 
 PICGEN_MAX_SEED = np.iinfo(np.int32).max
 
-_decode_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="b64decode")
+# Input images are uploaded to the server the moment they are added in the
+# browser (POST /picgen/stash) and referenced by id ("stash:<id>") when
+# Generate is clicked, so the click request stays tiny no matter how many or
+# how large the input images are.
+_picgen_stash = {}
+_picgen_stash_lock = threading.Lock()
+_PICGEN_STASH_MAX = 64
+
+
+def _clear_previous_picgen_outputs():
+    """Delete previously generated picgen output files. Called only when the
+    user clicks Generate again, so finished images stay downloadable until then."""
+    import glob as _g
+    bases = [os.path.join(SCRIPT_DIR, "tmp", "gradio")]
+    _env = os.environ.get("GRADIO_TEMP_DIR")
+    if _env:
+        bases.append(_env)
+    for base in bases:
+        for f in _g.glob(os.path.join(base, "picgen_*.png")) + _g.glob(os.path.join(base, "*", "picgen_*.png")):
+            try:
+                parent = os.path.dirname(f)
+                os.unlink(f)
+                if os.path.abspath(parent) != os.path.abspath(base):
+                    shutil.rmtree(parent, ignore_errors=True)
+            except Exception:
+                pass
+    try:
+        _media_store_release_prefix("picgen_")
+    except Exception:
+        pass
 
 _picgen_cache = {
     "vae_latents": {},      # keyed by image hash
@@ -8357,10 +8386,14 @@ def _hash_images(images):
     """
     hasher = hashlib.blake2b(digest_size=32)
     for idx, img in enumerate(images):
-        # Level 1: exact metadata — detects resize/crop/mode changes instantly.
-        hasher.update(f"{idx}|{img.mode}|{img.size}|{len(img.tobytes())}|".encode())
-        # Level 2: 64×64 thumbnail — catches any visible pixel-level edit.
-        thumb = img.resize((64, 64), resample=Image.BILINEAR)
+        # Level 1: exact metadata — mode + dimensions uniquely identify geometry.
+        # Do NOT call img.tobytes() here: it decompresses the entire image into
+        # raw pixels just to count bytes — O(W×H) allocation thrown away instantly.
+        # img.size (width, height) already captures any crop/resize change, and
+        # the thumbnail below catches any pixel-content edit.
+        hasher.update(f"{idx}|{img.mode}|{img.size[0]}x{img.size[1]}|".encode())
+        # Level 2: 64×64 thumbnail — catches any visible pixel-level edit cheaply.
+        thumb = img.resize((64, 64), resample=Image.BILINEAR, reducing_gap=2.0)
         hasher.update(thumb.tobytes())
     return hasher.hexdigest()
 
@@ -8540,6 +8573,13 @@ def _decode_single_b64(b64_str):
     if not b64_str or not isinstance(b64_str, str):
         return None
     try:
+        # Images uploaded ahead of time via /picgen/stash are referenced by id
+        # so the Generate click only carries a few bytes per image.
+        if b64_str.startswith("stash:"):
+            with _picgen_stash_lock:
+                b64_str = _picgen_stash.get(b64_str[6:])
+            if not b64_str:
+                return None
         if b64_str.startswith("data:image"):
             _, data = b64_str.split(",", 1)
         else:
@@ -8551,37 +8591,25 @@ def _decode_single_b64(b64_str):
 
 
 def b64_to_pil_list(b64_json_str):
-    """Decode base64 JSON array to PIL images using thread pool for speedup."""
+    """Decode a base64 JSON array to a list of PIL images.
+
+    Always decodes sequentially on the calling thread. The old thread-pool
+    path (concurrent.futures) was slower for 2-3 images because PIL decode
+    is CPU-bound and Python threads share the GIL — they cannot run in
+    parallel, so the Future/as_completed overhead was pure waste.
+    """
     if not b64_json_str or b64_json_str.strip() in ("", "[]"):
         return []
     try:
         b64_list = json.loads(b64_json_str)
     except Exception:
         return []
-    
-    if len(b64_list) == 1:
-        img = _decode_single_b64(b64_list[0])
-        return [img] if img is not None else []
-    
-    try:
-        from concurrent.futures import as_completed
-        futures = {_decode_executor.submit(_decode_single_b64, b64_str): idx 
-                   for idx, b64_str in enumerate(b64_list)}
-        pil_images = [None] * len(b64_list)
-        for future in as_completed(futures):
-            idx = futures[future]
-            result = future.result()
-            if result is not None:
-                pil_images[idx] = result
-        return [img for img in pil_images if img is not None]
-    except Exception as e:
-        print(f"Thread pool decode failed, falling back to sequential: {e}")
-        pil_images = []
-        for b64_str in b64_list:
-            img = _decode_single_b64(b64_str)
-            if img is not None:
-                pil_images.append(img)
-        return pil_images
+    result = []
+    for b64_str in b64_list:
+        img = _decode_single_b64(b64_str)
+        if img is not None:
+            result.append(img)
+    return result
 
 
 def _full_gpu_cleanup(offload_pipelines=True):
@@ -8795,90 +8823,20 @@ def infer(
     _t_pipe = time.time()
 
     original_encode_prompt = pic_pipe.encode_prompt
-    original_prepare_latents = pic_pipe.prepare_latents
-    
-    encode_called = [False]
-    prepare_called = [False]
-    
+
     def cached_encode_prompt(*args, **kwargs):
-        encode_called[0] = True
+        # On a cache hit return the stored embeddings immediately; on a miss
+        # call the real encode_prompt and store the result for next time.
         if cached_embeds is not None:
             return cached_embeds["prompt_embeds"], cached_embeds["prompt_embeds_mask"]
         result = original_encode_prompt(*args, **kwargs)
-        embeds_data = {
-            "prompt_embeds": result[0],
-            "prompt_embeds_mask": result[1]
-        }
-        _cache_prompt_embeds(prompt, negative_prompt, pil_images, num_images_per_prompt, embeds_data)
-        return result
-    
-    def cached_prepare_latents(images, *args, **kwargs):
-        prepare_called[0] = True
-        result = original_prepare_latents(images, *args, **kwargs)
-        if images is not None and result[1] is not None:
-            pass
-        return result
-
-    # VAE image-latent cache: the pipeline's _encode_vae_image() runs the VAE
-    # encoder on each conditioning image every generation. That encode is fully
-    # deterministic (sample_mode="argmax", no RNG), so its result is identical
-    # for the same input tensor — meaning re-running the SAME image with a
-    # different prompt (or a different seed) can reuse it and skip the encode
-    # entirely. We wrap _encode_vae_image with a content-hash cache. This is a
-    # pure speedup with no numerical change (a cache hit returns exactly the
-    # tensor the encoder would have produced). The random initial latents are
-    # produced elsewhere in prepare_latents and are NOT cached, so seed
-    # behaviour and output variety are completely unaffected.
-    original_encode_vae_image = pic_pipe._encode_vae_image
-
-    def _vae_image_cache_key(image_tensor):
-        try:
-            t = image_tensor.detach()
-            # Hash shape + a downsampled byte view for speed; exact enough to
-            # distinguish different inputs while staying cheap. Fall back to
-            # no-cache (None) on any error.
-            meta = f"{tuple(t.shape)}|{t.dtype}".encode()
-            # Move a small strided sample to CPU for hashing to avoid copying
-            # the whole tensor every call.
-            flat = t.flatten()
-            n = flat.numel()
-            if n == 0:
-                return None
-            step = max(1, n // 4096)
-            sample = flat[::step].to("cpu", dtype=torch.float32).numpy().tobytes()
-            return hashlib.sha256(meta + sample).hexdigest()
-        except Exception:
-            return None
-
-    def cached_encode_vae_image(image, generator):
-        key = _vae_image_cache_key(image)
-        if key is not None:
-            with _picgen_cache_lock:
-                entry = _picgen_cache["vae_latents"].get(key)
-                if entry is not None:
-                    # LRU: refresh timestamp on hit. Entries are (value, ts).
-                    _picgen_cache["vae_latents"][key] = (entry[0], time.time())
-            if entry is not None:
-                _record_cache_hit("vae")
-                return _device_tree(entry[0], PIC_DEVICE)
-            _record_cache_miss("vae")
-        result = original_encode_vae_image(image, generator)
-        if key is not None:
-            try:
-                with _picgen_cache_lock:
-                    cache = _picgen_cache["vae_latents"]
-                    if len(cache) >= MAX_CACHE_ENTRIES:
-                        oldest_key = min(cache.keys(), key=lambda k: cache[k][1])
-                        cache.pop(oldest_key)
-                    cache[key] = (_cpu_detach_tree(result), time.time())
-            except Exception:
-                pass
+        _cache_prompt_embeds(prompt, negative_prompt, pil_images,
+                             num_images_per_prompt,
+                             {"prompt_embeds": result[0],
+                              "prompt_embeds_mask": result[1]})
         return result
 
     pic_pipe.encode_prompt = cached_encode_prompt
-    pic_pipe.prepare_latents = cached_prepare_latents
-    pic_pipe._encode_vae_image = cached_encode_vae_image
-
     # The "Step x/N" lines seen in the terminal come from the diffusers
     # pipeline's own tqdm bar (self.progress_bar in the denoise loop). This
     # is disabled once at load time (see _load_picgen_pipe); skip here.
@@ -8959,6 +8917,12 @@ def infer(
         # Register the live pipe so Cancel can flip its interrupt immediately.
         pic_pipe._interrupt = False
         _picgen_active_pipe["pipe"] = pic_pipe
+        # cudnn.benchmark autotunes every conv layer for every NEW input shape.
+        # Picgen shapes change with each image set (multiple images = several
+        # new VAE shapes), causing a long stall before step 1. Turn it off for
+        # picgen only; restored in the finally block for vidgen's fixed shapes.
+        _prev_cudnn_bench = torch.backends.cudnn.benchmark
+        torch.backends.cudnn.benchmark = False
         with torch.cuda.device(PIC_DEVICE):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 with _fast_sdpa_backend():
@@ -8973,9 +8937,11 @@ def infer(
                         else:
                             raise
     finally:
+        try:
+            torch.backends.cudnn.benchmark = _prev_cudnn_bench
+        except NameError:
+            pass
         pic_pipe.encode_prompt = original_encode_prompt
-        pic_pipe.prepare_latents = original_prepare_latents
-        pic_pipe._encode_vae_image = original_encode_vae_image
         _picgen_active_pipe["pipe"] = None
         try:
             pic_pipe._interrupt = False
@@ -9048,7 +9014,10 @@ function init() {
         window.__uploadedImages = images;
         window.__picgenImages = images;
         window.__picgenSelected.idx = selectedIdx;
-        const b64Array = images.map(img => img.b64);
+        // Images already uploaded to the server are referenced by id, so the
+        // Generate click request stays tiny. Not-yet-uploaded ones fall back
+        // to the full data URI so a fast click still works.
+        const b64Array = images.map(img => img.sid ? ('stash:' + img.sid) : img.b64);
         const container = document.getElementById('hidden-images-b64');
         if (!container) return;
         container.querySelectorAll('input,textarea').forEach(el => {
@@ -9062,9 +9031,23 @@ function init() {
         });
     }
 
+    function stashImage(entry) {
+        try {
+            fetch('/picgen/stash', {
+                method: 'POST',
+                headers: {'Content-Type': 'text/plain'},
+                body: entry.b64,
+            }).then(r => r.json()).then(j => {
+                if (j && j.id) { entry.sid = j.id; syncToGradio(); }
+            }).catch(() => {});
+        } catch (e) {}
+    }
+
     function addImage(b64, name) {
-        images.push({id: Date.now() + Math.random(), b64: b64, name: name});
+        const entry = {id: Date.now() + Math.random(), b64: b64, name: name};
+        images.push(entry);
         renderGallery(); syncToGradio();
+        stashImage(entry);
     }
     window.__addImage = addImage;
 
@@ -9072,10 +9055,12 @@ function init() {
     function replaceImages(b64, name) {
         images.length = 0;
         selectedIdx = -1;
-        images.push({id: Date.now() + Math.random(), b64: b64, name: name});
+        const _entry = {id: Date.now() + Math.random(), b64: b64, name: name};
+        images.push(_entry);
         window.__uploadedImages = images;
         window.__picgenImages = images;
         renderGallery(); syncToGradio();
+        stashImage(_entry);
     }
     window.__replaceImages = replaceImages;
 
@@ -11636,6 +11621,13 @@ with gr.Blocks(css=css, head=_password_gate_head) as demo:
                           f"prompt={repr(prompt[:60]) if prompt else '(none)'}",
                           flush=True)
 
+                    # Previous results are only removed now, when Generate is
+                    # clicked again — never right after a generation finishes.
+                    try:
+                        _clear_previous_picgen_outputs()
+                    except Exception:
+                        pass
+
                     _total = max(1, num_inference_steps)
                     _picgen_cancel.clear()
                     _set_picgen_progress(0, _total, "Preparing", running=True)
@@ -11653,52 +11645,25 @@ with gr.Blocks(css=css, head=_password_gate_head) as demo:
                         raise gr.Error(f"Generation failed: {_e}") from None
                     _set_picgen_progress(_total, _total, "Done", running=False)
                     print(f"[picgen] Done — {len(filepaths)} image(s) ready.", flush=True)
-                    return gr.update(value=filepaths, selected_index=0), seed_out, urls_json
-                # JS pre-hook: pull the current images from window.__uploadedImages
-                # into args[0], then return the FULL args array unchanged.
-                # Returning all inputs is the correct Gradio 4.x contract (the
-                # earlier "needed: 10, got: 0" error came from a prehook that
-                # returned the wrong number of elements — this one returns all).
-                # This prehook is REQUIRED: on a generator event it is what makes
-                # Gradio establish the streaming connection with gr.Progress
-                # (track_tqdm) attached, so the per-step progress overlay renders
-                # on the output gallery in real time. Without it, generation still
-                # works but the step progress does not stream.
-                # JS pre-hook. Besides collecting the uploaded input images, it
-                # ALSO clicks the result gallery's built-in clear/close ("X")
-                # button so any previously generated photos are wiped from the
-                # output box the instant Generate is pressed. Yielding [] from
-                # the server did NOT visually clear the gr.Gallery in this Gradio
-                # build (old thumbnails stayed painted and hid the progress
-                # overlay), so we clear it client-side here, exactly like the
-                # user clicking the X themselves.
-                _pic_infer_js = """
-(...args) => {
-    try {
-        const gal = document.getElementById('picgen-result-gallery');
-        if (gal) {
-            // Gradio renders the clear control as a button with aria-label
-            // "Clear" or "Close" (an X icon) in the gallery toolbar. Click
-            // whichever exists to empty the output box before generating.
-            let btn = gal.querySelector('button[aria-label="Clear"]')
-                   || gal.querySelector('button[aria-label="Close"]')
-                   || gal.querySelector('button[title="Clear"]')
-                   || gal.querySelector('button[title="Close"]');
-            if (btn) { btn.click(); }
-        }
-    } catch (e) { console.warn('picgen clear-on-generate failed', e); }
-    const imgs = window.__uploadedImages || [];
-    const b64 = JSON.stringify(imgs.map(i => i.b64));
-    args[0] = b64;
-    return args;
-}
-"""
+                    # Return the raw filepath list — NOT gr.update() — so
+                    # Gradio always treats this as a brand-new value and
+                    # re-renders the gallery completely, replacing old images.
+                    # gr.update(value=filepaths) with the same selected_index
+                    # as before can be a no-op if Gradio diffs the state.
+                    return filepaths, seed_out, urls_json
+                # No JS prehook needed: hidden_images_b64 is kept in sync
+                # with window.__uploadedImages by syncToGradio() (called on
+                # every add/remove/clear). Gradio reads it directly as the
+                # first input — no extra serialisation, no extra payload over
+                # the tunnel. The old prehook was re-serialising the same
+                # multi-image b64 JSON that hidden_images_b64 already held,
+                # doubling the wire payload and causing the lag with 2+ images.
+                _pic_infer_js = None
 
                 def _wire_picgen_btn(trigger):
                     _ev = trigger(
                         fn=run_picgen,
                         inputs=_pic_infer_inputs,
-                        js=_pic_infer_js,
                         outputs=[pic_result, pic_seed, picgen_urls],
                         show_progress="minimal",
                         concurrency_id=PIC_QUEUE_ID,
@@ -11708,10 +11673,6 @@ with gr.Blocks(css=css, head=_password_gate_head) as demo:
                         fn=protect_current_inputs,
                         inputs=[reference_image, end_image, merge_img_a, merge_img_b],
                         outputs=None,
-                    ).then(
-                        fn=clear_storage,
-                        inputs=[],
-                        outputs=[clear_storage_status],
                     ).then(
                         # New results just rendered — reset the "selected result"
                         # so "Use as input" defaults to the first image until the
@@ -11780,7 +11741,6 @@ with gr.Blocks(css=css, head=_password_gate_head) as demo:
                     ).then(
                         fn=run_picgen,
                         inputs=_pic_infer_inputs,
-                        js=_pic_infer_js,
                         outputs=[pic_result, pic_seed, picgen_urls],
                         show_progress="minimal",
                         concurrency_id=PIC_QUEUE_ID,
@@ -11789,10 +11749,6 @@ with gr.Blocks(css=css, head=_password_gate_head) as demo:
                         fn=protect_current_inputs,
                         inputs=[reference_image, end_image, merge_img_a, merge_img_b],
                         outputs=None,
-                    ).then(
-                        fn=clear_storage,
-                        inputs=[],
-                        outputs=[clear_storage_status],
                     ).then(
                         fn=lambda: None,
                         inputs=[],
@@ -11965,6 +11921,8 @@ with gr.Blocks(css=css, head=_password_gate_head) as demo:
                         try {
                             const incoming = JSON.parse(b64List);
                             if (!Array.isArray(incoming) || incoming.length === 0) return;
+                            // Our own sync (uploaded-image ids) — never re-add.
+                            if (incoming.some(b => typeof b === 'string' && b.startsWith('stash:'))) return;
                             // Skip if gallery already contains exactly these images
                             const cur = (window.__picgenImages || []).map(i => i.b64);
                             if (incoming.length === cur.length && incoming.every((b,i) => b === cur[i])) return;
@@ -13171,6 +13129,22 @@ async def _picgen_progress_stream(request: _FastAPIRequest):
     )
 
 
+async def _picgen_stash_put(request: _FastAPIRequest):
+    """Store one input image (base64 data URI as the raw request body)."""
+    body = await request.body()
+    data = body.decode("utf-8", "ignore")
+    sid = uuid.uuid4().hex
+    with _picgen_stash_lock:
+        while len(_picgen_stash) >= _PICGEN_STASH_MAX:
+            _picgen_stash.pop(next(iter(_picgen_stash)))
+        _picgen_stash[sid] = data
+    return _FastAPIResponse(
+        content=json.dumps({"id": sid}),
+        media_type="application/json",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def _register_picgen_progress_routes():
     """Attach the picgen-progress routes to the LIVE FastAPI app.
 
@@ -13183,6 +13157,8 @@ def _register_picgen_progress_routes():
         existing = {getattr(r, "path", None) for r in app.routes}
         if "/picgen/progress/poll" not in existing:
             app.add_api_route("/picgen/progress/poll", _picgen_progress_poll, methods=["GET"])
+        if "/picgen/stash" not in existing:
+            app.add_api_route("/picgen/stash", _picgen_stash_put, methods=["POST"])
         if "/picgen/progress/stream" not in existing:
             app.add_api_route("/picgen/progress/stream", _picgen_progress_stream, methods=["GET"])
         print("[Picgen] progress routes registered on live app.")
