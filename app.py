@@ -1100,6 +1100,7 @@ from prompts import (
     update_multiple_women_prompt, update_multiple_man_unseen_prompt, update_multiple_man_seen_prompt, update_multistep_prompt,
     update_vid_prompt1, update_vid_prompt2, update_vid_prompt3, update_vid_prompt4,
     update_vid_prompt5, update_vid_prompt6, update_vid_prompt7, update_vid_prompt8,
+    special_prompts_dict, update_special_prompt,
 )
 
 
@@ -7071,6 +7072,19 @@ def _safe_move_to_device(pipe, target_device):
                 free_bytes = torch.cuda.mem_get_info()[0]
             except Exception:
                 free_bytes = None
+            # If the first read looks short, the CUDA caching allocator may just
+            # be holding freed pages from a model we only moments ago offloaded.
+            # Force a hard reclaim and re-read BEFORE giving up — this turns a
+            # bogus "not enough memory" (that aborts a legitimate tab swap) into
+            # a clean move once the allocator actually returns the pages.
+            if free_bytes is not None and free_bytes < required:
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                try:
+                    free_bytes = torch.cuda.mem_get_info()[0]
+                except Exception:
+                    free_bytes = None
             if free_bytes is not None and free_bytes < required:
                 raise torch.cuda.OutOfMemoryError(
                     f"Insufficient VRAM on {target_device} to move '{name}': "
@@ -7755,6 +7769,21 @@ def _device_total_vram_gb(dev):
         return 0.0
 
 
+def _pipe_param_gb(pipe):
+    """Approximate resident size (params + buffers) of a pipeline in GiB."""
+    _gb = 0.0
+    for _attr in ("transformer", "transformer_2", "text_encoder",
+                  "text_encoder_2", "vae", "image_encoder"):
+        _comp = getattr(pipe, _attr, None)
+        if _comp is not None and hasattr(_comp, "parameters"):
+            try:
+                _gb += sum(p.numel() * p.element_size() for p in _comp.parameters()) / 1024**3
+                _gb += sum(b.numel() * b.element_size() for b in _comp.buffers()) / 1024**3
+            except Exception:
+                pass
+    return _gb
+
+
 def _enable_offload(pipe, device, label):
     """Place a pipeline on GPU: full residency on big cards, else model-CPU-offload.
 
@@ -7765,16 +7794,7 @@ def _enable_offload(pipe, device, label):
     # the whole pipeline (plus ~6 GB activation headroom) actually fits. If it
     # doesn't (e.g. some transformer weights kept in bf16 by the lossless fp8
     # pass), fall through to model-CPU-offload: same numerics, just streams.
-    _pipe_gb = 0.0
-    for _attr in ("transformer", "transformer_2", "text_encoder",
-                  "text_encoder_2", "vae", "image_encoder"):
-        _comp = getattr(pipe, _attr, None)
-        if _comp is not None and hasattr(_comp, "parameters"):
-            try:
-                _pipe_gb += sum(p.numel() * p.element_size() for p in _comp.parameters()) / 1024**3
-                _pipe_gb += sum(b.numel() * b.element_size() for b in _comp.buffers()) / 1024**3
-            except Exception:
-                pass
+    _pipe_gb = _pipe_param_gb(pipe)
     if total_vram >= FULL_RESIDENCY_VRAM_GB and _pipe_gb + 6.0 <= total_vram:
         _safe_move_to_device(pipe, device)
         _offload_state[label] = False
@@ -7823,23 +7843,28 @@ def _enable_offload(pipe, device, label):
           f"(card {total_vram:.0f} GB — components stream on demand).")
 
 
-def _disable_offload(pipe, label):
+def _disable_offload(pipe, label, force=False):
     """Remove model-CPU-offload hooks (if any) and return the pipeline to CPU.
 
     Must run before the other model takes the GPU, so stale hooks can't fire.
     On high-VRAM cards (>=40 GB) where full residency was used (no hooks), we
-    skip the CPU move entirely — both models fit in VRAM simultaneously and
+    normally skip the CPU move — both models fit in VRAM simultaneously and
     moving to CPU only to move back is pure wasted time that freezes the UI.
+
+    force=True overrides that optimization: the caller has determined the two
+    pipelines do NOT fit on the card at the same time, so the previously
+    resident model MUST actually be evicted to CPU before the new one loads.
+    Without this, the new model's load would preflight-fail with a bogus
+    "not enough memory" even though the swap is exactly what should happen.
     """
     if not _offload_state.get(label):
         # No offload hooks were installed (full-residency path on big card).
-        # On high-VRAM cards, keep the pipeline resident — no CPU move needed.
         _dev = PIC_DEVICE if label == "pic" else WAN_DEVICE
-        if _device_total_vram_gb(_dev) >= FULL_RESIDENCY_VRAM_GB:
-            # Nothing to do: pipeline is already GPU-resident, leave it there.
+        if not force and _device_total_vram_gb(_dev) >= FULL_RESIDENCY_VRAM_GB:
+            # Both models fit; keep this one resident — no CPU move needed.
             return
-        # Small card: no hooks were installed but we still need to free VRAM
-        # for the other model.
+        # Either a small card, or a forced swap because both models can't be
+        # co-resident: move this pipeline to CPU to free VRAM for the other.
         _safe_offload_to_cpu(pipe, label.title())
         return
     try:
@@ -8227,14 +8252,36 @@ def _activate_model(target):
             dev = PIC_DEVICE if model_name == "pic" else WAN_DEVICE
             _enable_offload(pipe, dev, model_name)
 
-        def _take_off_gpu(model_name, pipe):
-            _disable_offload(pipe, model_name)
+        def _take_off_gpu(model_name, pipe, force=False):
+            _disable_offload(pipe, model_name, force=force)
+
+        # Decide whether the previous model can stay resident alongside the
+        # target, or must be evicted to CPU first. On big cards the default is
+        # to keep both resident (fast, no CPU round-trip). But if the two
+        # pipelines don't actually fit on the card at the same time — plus a
+        # 6 GB activation headroom — leaving the previous one resident makes the
+        # target's load preflight-fail with a bogus "not enough memory". In
+        # that case we FORCE the previous model off the GPU so the swap works.
+        # On small cards (<40 GB, offload path) the previous model is always
+        # moved to CPU anyway, so force is harmless there.
+        _force_evict = False
+        if previous_pipe is not None:
+            try:
+                _dev = PIC_DEVICE if target == "pic" else WAN_DEVICE
+                _card_gb = _device_total_vram_gb(_dev)
+                _both_gb = _pipe_param_gb(previous_pipe) + _pipe_param_gb(target_pipe)
+                if _both_gb + 6.0 > _card_gb:
+                    _force_evict = True
+            except Exception:
+                # If sizing fails for any reason, err on the side of a correct
+                # swap: evict the previous model rather than risk a false OOM.
+                _force_evict = True
 
         _active_model = "transitioning"
         try:
             _release_rife()
             if previous_pipe is not None:
-                _take_off_gpu(previous, previous_pipe)
+                _take_off_gpu(previous, previous_pipe, force=_force_evict)
             _place_on_gpu(target, target_pipe)
             _active_model = target
         except Exception:
@@ -9381,6 +9428,7 @@ body.hide-media #generated-video video,
 body.hide-media #end-frame-image img,
 body.hide-media #end-frame-image video,
 body.hide-media #image-gallery-grid img,
+body.hide-media #starter-grid-container img,
 body.hide-media #picgen-result-gallery img,
 body.hide-media #picgen-result-gallery video { visibility: hidden !important; }
 /* LoRA cards grid - 3 per row, compact */
@@ -9758,154 +9806,7 @@ def autorun_push_generate(
 
 
 
-# ---------------------------------------------------------------------------
-# Password gate. A full-screen overlay injected into the page <head> so it
-# paints BEFORE any Gradio content is visible. The user must type the password
-# to reveal the page. On success we set a long-lived cookie so THIS browser on
-# THIS device is not prompted again; any other device/browser (no cookie) is
-# prompted.
-#
-# The plaintext password is NEVER stored in the code or sent to the browser.
-# We store only a salted SHA-256 hash. The browser hashes whatever the user
-# types (with the same salt, via the Web Crypto API) and compares to the hash.
-# A correct entry produces the matching hash; the plaintext exists only
-# momentarily in the user's own input box. To change the password, recompute:
-#   python -c "import hashlib; print(hashlib.sha256(('%s'+'NEWPW').encode()).hexdigest())"
-# using the salt below, and paste the new hex into _PAGE_PASSWORD_HASH.
-# ---------------------------------------------------------------------------
-_PAGE_PASSWORD_SALT = "newgen_v1_7c3f"
-_PAGE_PASSWORD_HASH = "5f1bd8f023663fcc1d7dc2b9b314961b7d5795e187a3e50afd09e05783012149"
-_password_gate_head = """
-<style>
-  #newgen-pwgate {
-    position: fixed; inset: 0; z-index: 2147483647;
-    background: #0b0b0f; color: #fff;
-    display: flex; align-items: center; justify-content: center;
-    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-  }
-  #newgen-pwgate .pw-card {
-    width: min(92vw, 380px); padding: 28px 26px; border-radius: 16px;
-    background: #16161d; border: 1px solid #2a2a35;
-    box-shadow: 0 12px 48px rgba(0,0,0,.6); text-align: center;
-  }
-  #newgen-pwgate h2 { margin: 0 0 6px; font-size: 20px; font-weight: 700; }
-  #newgen-pwgate p  { margin: 0 0 18px; font-size: 13px; color: #9a9aa8; }
-  #newgen-pwgate input {
-    width: 100%; box-sizing: border-box; padding: 12px 14px; font-size: 18px;
-    text-align: center; letter-spacing: 4px; border-radius: 10px;
-    border: 1px solid #33333f; background: #0e0e13; color: #fff; outline: none;
-  }
-  #newgen-pwgate input:focus { border-color: #6c5ce7; }
-  #newgen-pwgate button {
-    margin-top: 14px; width: 100%; padding: 12px; font-size: 15px; font-weight: 600;
-    border: none; border-radius: 10px; cursor: pointer;
-    background: #6c5ce7; color: #fff;
-  }
-  #newgen-pwgate button:hover { background: #5a4bd4; }
-  #newgen-pwgate .pw-err { margin-top: 12px; font-size: 13px; color: #ff6b6b; min-height: 16px; }
-  /* Hide the whole app body until the gate decides, to avoid any flash. */
-  html.newgen-locked body > gradio-app,
-  html.newgen-locked gradio-app { visibility: hidden !important; }
-</style>
-<script>
-(function () {
-  // No plaintext password anywhere — only a salted SHA-256 hash. The entered
-  // password is hashed in-browser (Web Crypto) with the same salt and compared.
-  var SALT = "%SALT%";
-  var HASH = "%HASH%";
-  var COOKIE = "newgen_auth";
-  // Cookie stores the correct hash; presence + match means this device is authed.
-  var TOKEN = HASH;
-  var DAYS = 365;
-
-  async function sha256Hex(str) {
-    var buf = new TextEncoder().encode(str);
-    var digest = await crypto.subtle.digest("SHA-256", buf);
-    return Array.from(new Uint8Array(digest))
-      .map(function (b) { return b.toString(16).padStart(2, "0"); })
-      .join("");
-  }
-
-  function getCookie(name) {
-    var m = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
-    return m ? decodeURIComponent(m[1]) : null;
-  }
-  function setCookie(name, value, days) {
-    var d = new Date();
-    d.setTime(d.getTime() + days * 24 * 60 * 60 * 1000);
-    document.cookie = name + "=" + encodeURIComponent(value) +
-      "; expires=" + d.toUTCString() + "; path=/; SameSite=Lax";
-  }
-
-  // Already authorized on THIS browser/device? Skip the gate entirely.
-  if (getCookie(COOKIE) === TOKEN) { return; }
-
-  // Lock the page as early as possible.
-  document.documentElement.classList.add("newgen-locked");
-
-  function buildGate() {
-    if (document.getElementById("newgen-pwgate")) return;
-    var wrap = document.createElement("div");
-    wrap.id = "newgen-pwgate";
-    wrap.innerHTML =
-      '<div class="pw-card">' +
-        '<h2>Protected</h2>' +
-        '<p>Enter the password to continue.</p>' +
-        '<input id="newgen-pw-input" type="password" inputmode="numeric" ' +
-               'autocomplete="off" placeholder="••••" />' +
-        '<button id="newgen-pw-go">Unlock</button>' +
-        '<div class="pw-err" id="newgen-pw-err"></div>' +
-      '</div>';
-    document.body.appendChild(wrap);
-
-    var input = document.getElementById("newgen-pw-input");
-    var err = document.getElementById("newgen-pw-err");
-    var go = document.getElementById("newgen-pw-go");
-
-    async function attempt() {
-      var entered;
-      try {
-        entered = await sha256Hex(SALT + input.value);
-      } catch (e) {
-        // Web Crypto requires a secure context (https/localhost). The app is
-        // served over the https Cloudflare tunnel, so this normally works.
-        err.textContent = "Secure context required to verify password.";
-        return;
-      }
-      if (entered === HASH) {
-        setCookie(COOKIE, TOKEN, DAYS);
-        var g = document.getElementById("newgen-pwgate");
-        if (g) g.remove();
-        document.documentElement.classList.remove("newgen-locked");
-      } else {
-        err.textContent = "Incorrect password.";
-        input.value = "";
-        input.focus();
-      }
-    }
-    go.addEventListener("click", attempt);
-    input.addEventListener("keydown", function (e) {
-      if (e.key === "Enter") { e.preventDefault(); attempt(); }
-    });
-    setTimeout(function () { input.focus(); }, 50);
-  }
-
-  // Build the gate as soon as the body exists.
-  if (document.body) {
-    buildGate();
-  } else {
-    document.addEventListener("DOMContentLoaded", buildGate);
-    // Fallback poll in case DOMContentLoaded already fired oddly.
-    var t = setInterval(function () {
-      if (document.body) { clearInterval(t); buildGate(); }
-    }, 30);
-  }
-})();
-</script>
-""".replace("%SALT%", _PAGE_PASSWORD_SALT).replace("%HASH%", _PAGE_PASSWORD_HASH)
-
-
-with gr.Blocks(css=css, head=_password_gate_head) as demo:
+with gr.Blocks(css=css) as demo:
     with gr.Row(elem_id="top-bar-row"):
         clear_storage_btn = gr.Button("Clear Storage", variant="secondary", size="sm")
     clear_storage_status = gr.Textbox(visible=False, label="")
@@ -11488,6 +11389,14 @@ with gr.Blocks(css=css, head=_password_gate_head) as demo:
                             pic_add_r2l_btn = gr.Button(
                                 "Add Right To Left", variant="secondary", scale=1,
                             )
+                        # Full-width "Special Prompts" dropdown sitting directly
+                        # above the Generate button (below the image input area).
+                        # Selecting an entry drops its prompt text into pic_prompt.
+                        special_prompt_dropdown = gr.Dropdown(
+                            label="Special Prompts",
+                            choices=list(special_prompts_dict.keys()),
+                            value=None, interactive=True,
+                        )
                         pic_run_button_top = gr.Button("Generate", variant="primary", size="lg")
                         pic_cancel_button_top = gr.Button("Cancel", variant="stop", size="sm")
                         pic_num_images = gr.Slider(
@@ -11597,6 +11506,7 @@ with gr.Blocks(css=css, head=_password_gate_head) as demo:
                 preset_dropdown5.change(fn=update_multiple_man_unseen_prompt, inputs=[preset_dropdown5], outputs=[pic_prompt], scroll_to_output=False)
                 preset_dropdown6.change(fn=update_multiple_man_seen_prompt, inputs=[preset_dropdown6], outputs=[pic_prompt], scroll_to_output=False)
                 preset_dropdown7.change(fn=update_multistep_prompt, inputs=[preset_dropdown7], outputs=[pic_prompt], scroll_to_output=False)
+                special_prompt_dropdown.change(fn=update_special_prompt, inputs=[special_prompt_dropdown], outputs=[pic_prompt], scroll_to_output=False)
 
                 _pic_infer_inputs = [
                     hidden_images_b64, pic_prompt, pic_negative_prompt,
