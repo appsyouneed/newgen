@@ -7505,7 +7505,125 @@ def _cast_transformer_to_fp8(pipe):
 # app keeps working exactly as before.
 # ---------------------------------------------------------------------------
 _QWEN_FA3_ENABLED = os.environ.get("NEWGEN_QWEN_FA3", "1") == "1"
-_qwen_fa3_state = {"active": False, "attempted": False}
+# Auto-install `kernels` (for FA3) when it is missing. On by default so the app
+# reaches max speed with no manual steps. Set NEWGEN_FA3_AUTOINSTALL=0 to skip
+# the install attempt (e.g. offline boxes) and just use SDPA.
+_FA3_AUTOINSTALL = os.environ.get("NEWGEN_FA3_AUTOINSTALL", "1") == "1"
+_qwen_fa3_state = {"active": False, "attempted": False, "install_tried": False}
+
+
+def _hf_hub_version_tuple():
+    """Return the installed huggingface_hub version as a (major, minor) tuple,
+    or None if it can't be determined."""
+    ver = None
+    try:
+        import huggingface_hub as _hh
+        ver = getattr(_hh, "__version__", None)
+    except Exception:
+        ver = None
+    if not ver:
+        try:
+            from importlib.metadata import version as _v
+            ver = _v("huggingface_hub")
+        except Exception:
+            return None
+    try:
+        parts = str(ver).split(".")
+        return (int(parts[0]), int(parts[1]))
+    except Exception:
+        return None
+
+
+def _ensure_kernels_installed():
+    """Best-effort, SAFE auto-install of the `kernels` package so FA3 can run.
+
+    Why this is safe (the historical fear was that `pip install kernels` pulls a
+    `kernels` requiring a newer `huggingface_hub` than this venv's pin, and
+    because diffusers' Wan path imports `kernels` transitively, a broken install
+    could crash the WHOLE app at import):
+
+      * We pin `kernels` to a version whose `huggingface_hub` requirement the
+        INSTALLED hub already satisfies (hub >=1.x -> newest kernels; hub 0.x ->
+        kernels==0.12.3, which accepts huggingface_hub>=0.26,<2.0).
+      * We install with `--no-deps` so pip CANNOT upgrade/downgrade/replace
+        huggingface_hub or anything else — only the single pure-Python `kernels`
+        wheel is added.
+      * After installing we HEALTH-CHECK: import kernels AND re-import diffusers.
+        If either fails, we immediately `pip uninstall -y kernels` and report
+        failure, leaving the environment exactly as it was (SDPA path).
+
+    Returns True if `kernels` is importable and healthy afterwards, else False.
+    Never raises.
+    """
+    import importlib
+    # Already present and importable? Nothing to do.
+    try:
+        importlib.import_module("kernels")
+        return True
+    except Exception:
+        pass
+    if not _FA3_AUTOINSTALL:
+        print("    [fa3] 'kernels' missing and auto-install disabled "
+              "(NEWGEN_FA3_AUTOINSTALL=0) — using SDPA.")
+        return False
+    if _qwen_fa3_state.get("install_tried"):
+        # Only ever attempt the install once per process.
+        return False
+    _qwen_fa3_state["install_tried"] = True
+
+    # Choose a kernels version compatible with the INSTALLED huggingface_hub so
+    # the --no-deps install can't leave an unsatisfiable requirement.
+    hub = _hf_hub_version_tuple()
+    if hub is not None and hub[0] >= 1:
+        pin = "kernels"            # modern hub: newest kernels is fine
+    else:
+        pin = "kernels==0.12.3"    # hub 0.x: last line accepting hub <2.0
+
+    print(f"    [fa3] 'kernels' not found — attempting safe auto-install "
+          f"({pin}, --no-deps) for FlashAttention-3...")
+    try:
+        import subprocess
+        res = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-deps", "--quiet", pin],
+            capture_output=True, text=True, timeout=600,
+        )
+        if res.returncode != 0:
+            print(f"    [fa3] auto-install failed (non-fatal): "
+                  f"{(res.stderr or res.stdout or '').strip()[-400:]}")
+            return False
+    except Exception as _e:
+        print(f"    [fa3] auto-install errored (non-fatal): {type(_e).__name__}: {_e}")
+        return False
+
+    # Health check: kernels must import AND diffusers must still import cleanly.
+    importlib.invalidate_caches()
+    healthy = True
+    try:
+        importlib.import_module("kernels")
+    except Exception as _e:
+        print(f"    [fa3] post-install 'import kernels' failed: {type(_e).__name__}: {_e}")
+        healthy = False
+    if healthy:
+        try:
+            importlib.import_module("diffusers")
+        except Exception as _e:
+            print(f"    [fa3] post-install diffusers import broke: "
+                  f"{type(_e).__name__}: {_e} — rolling back.")
+            healthy = False
+    if healthy:
+        print("    [fa3] 'kernels' installed and healthy.")
+        return True
+    # Roll back a bad install so the app is never left in a broken state.
+    try:
+        import subprocess
+        subprocess.run(
+            [sys.executable, "-m", "pip", "uninstall", "-y", "--quiet", "kernels"],
+            capture_output=True, text=True, timeout=300,
+        )
+        print("    [fa3] rolled back 'kernels' install — using SDPA (safe).")
+    except Exception:
+        pass
+    return False
 
 
 def _try_enable_qwen_fa3(pipe):
@@ -7520,20 +7638,12 @@ def _try_enable_qwen_fa3(pipe):
     transformer = getattr(pipe, "transformer", None)
     if transformer is None or not hasattr(transformer, "set_attn_processor"):
         return False
-    # NOTE: we deliberately do NOT auto-install the `kernels` package here.
-    # A `pip install kernels` can pull a version incompatible with this venv's
-    # pinned huggingface_hub, and because `kernels` is imported transitively by
-    # diffusers' Wan pipeline path, a broken `kernels` then crashes the ENTIRE
-    # app at import (StrictDataclassFieldValidationError). So FA3 is enabled
-    # ONLY if a compatible `kernels` is already importable; otherwise we quietly
-    # use fast SDPA (exact, plenty fast). To enable FA3, install a matching
-    # `kernels` manually alongside a compatible huggingface_hub.
+    # Ensure `kernels` is present (auto-installs it safely with --no-deps + a
+    # health check that rolls back on any breakage — see _ensure_kernels_installed).
+    # If it still isn't importable afterwards, fall back to fast SDPA (exact).
     try:
         import importlib
-        try:
-            importlib.import_module("kernels")
-        except Exception:
-            # kernels not present (or broken) — do not touch it, use SDPA.
+        if not _ensure_kernels_installed():
             _qwen_fa3_state["active"] = False
             _qwen_fa3_state["attempted"] = True
             print("    [fa3] 'kernels' not available — using fast SDPA attention "
@@ -8317,6 +8427,48 @@ def activate_pic():
 
 PICGEN_MAX_SEED = np.iinfo(np.int32).max
 
+# ---------------------------------------------------------------------------
+# Picgen working-resolution control.
+#
+# The internal working AREA (pixels) is the dominant speed knob for image-edit:
+# the pre-step VAE encode of the input AND every transformer denoise step scale
+# with the latent token count, which scales with this area. Smaller area = much
+# faster, and also avoids the upscaling that over-sharpens / alters faces.
+#
+# 512 is the fast default; 768 is sharper; 1024 is the old max-detail behaviour;
+# Auto matches the input image's own area (capped to 1024^2 so a huge upload
+# can't blow up cost).
+# ---------------------------------------------------------------------------
+# The Quality buttons at the top of the Photo Editor tab send a LONG-EDGE
+# target (one of these). It is turned into a square-equivalent pixel AREA that
+# drives the pipeline's working resolution (VAE encode + every transformer
+# step). 512 is the default; 1024 is no longer the default.
+PIC_QUALITY_DEFAULT = 512
+PIC_QUALITY_ALLOWED = (256, 512, 768, 1024, 1920)
+
+
+def _picgen_resolution_to_area(resolution, pil_images):
+    """Map the Quality selection (a long-edge target like 512) to a target
+    pixel AREA for the pipeline.
+
+    `resolution` arrives from the hidden pic_quality field as an int or a
+    string like "512". Returns an int area. Unknown/garbled/missing values fall
+    back to the fast 512 default — never the slow 1024 path.
+
+    Using area = long_edge^2 keeps the semantics simple and matches the
+    pipeline's aspect-preserving `calculate_dimensions(area, ratio)`: the long
+    edge of the generated image ends up ~= the selected number.
+    """
+    long_edge = None
+    try:
+        if resolution is not None and str(resolution).strip() != "":
+            long_edge = int(round(float(str(resolution).strip())))
+    except Exception:
+        long_edge = None
+    if long_edge not in PIC_QUALITY_ALLOWED:
+        long_edge = PIC_QUALITY_DEFAULT
+    return long_edge * long_edge
+
 # Input images are uploaded to the server the moment they are added in the
 # browser (POST /picgen/stash) and referenced by id ("stash:<id>") when
 # Generate is clicked, so the click request stays tiny no matter how many or
@@ -8850,10 +9002,11 @@ def infer(
     randomize_seed=False,
     true_guidance_scale=1.0,
     num_inference_steps=4,
-    height=None,
-    width=None,
+    resolution=None,
     num_images_per_prompt=1,
     progress=None,  # Disabled — all progress flows through streaming generator only
+    height=None,
+    width=None,
 ):
     # Gradio sliders pass floats; cast to int immediately so .repeat(),
     # randn_tensor batch dims, and cache keys all see a plain Python int.
@@ -8875,8 +9028,19 @@ def infer(
         raise gr.Error("Please upload at least one image.") from None
     _t_decoded = time.time()
 
-    if height == 256 and width == 256:
-        height, width = None, None
+    # Resolution handling. The UI passes a `resolution` choice that selects the
+    # internal working AREA (dominates both the pre-step VAE encode and every
+    # transformer step). We set the pipeline's VAE_IMAGE_SIZE global to that
+    # area and let the pipeline compute aspect-correct height/width from it, so
+    # faces are not distorted by a forced square and nothing is upscaled.
+    # Explicit height/width (passed by internal helpers) still override.
+    _target_area = _picgen_resolution_to_area(resolution, pil_images)
+    if _target_area is not None:
+        try:
+            import qwenimage.pipeline_qwenimage_edit_plus as _qpipe_mod
+            _qpipe_mod.VAE_IMAGE_SIZE = _target_area
+        except Exception as _ra_e:
+            print(f"[picgen] could not set working resolution (non-fatal): {_ra_e}")
 
     cached_embeds = _get_cached_prompt_embeds(prompt, negative_prompt, pil_images, num_images_per_prompt)
     _t_pipe = time.time()
@@ -9031,7 +9195,11 @@ def infer(
     for i, img in enumerate(image, start=1):
         filename = _media_name("picgen", ".png", index=i if multiple else None)
         fpath = _os.path.join(_shm_dir, filename)
-        img.save(fpath, format="PNG")
+        # compress_level=1: fastest PNG encode. PNG is lossless at every level,
+        # so the pixels are identical to the old default (level 6) — this only
+        # trades a slightly larger on-disk file for a faster save on the hot
+        # path. The output is only viewed on screen, so file size is irrelevant.
+        img.save(fpath, format="PNG", compress_level=1)
         filepaths.append(fpath)
 
     urls_json = json.dumps(filepaths)
@@ -9109,6 +9277,62 @@ function init() {
     }
     window.__addImage = addImage;
 
+    // Replace the image at a specific slot IN PLACE: the entry at `idx` is
+    // overwritten with the new image, every other slot keeps its exact
+    // position and number (so replacing #1 does NOT turn #2 into #1). A fresh
+    // entry object is created (new id, new stash) but spliced back at the SAME
+    // index, and the selection index is left untouched.
+    function replaceImageAt(idx, b64, name) {
+        if (idx < 0 || idx >= images.length) return;
+        const entry = {id: Date.now() + Math.random(), b64: b64, name: name};
+        images[idx] = entry;
+        renderGallery(); syncToGradio();
+        stashImage(entry);
+    }
+
+    // Dedicated hidden file input used ONLY by the per-slot Replace buttons, so
+    // it never interferes with the normal "add" file input. The target slot is
+    // stashed on the element between click and change.
+    let _replaceInput = document.getElementById('picgen-replace-input');
+    if (!_replaceInput) {
+        _replaceInput = document.createElement('input');
+        _replaceInput.type = 'file';
+        _replaceInput.accept = 'image/*';
+        _replaceInput.id = 'picgen-replace-input';
+        _replaceInput.style.display = 'none';
+        document.body.appendChild(_replaceInput);
+    }
+    _replaceInput.addEventListener('change', (e) => {
+        const files = e.target.files;
+        const targetIdx = parseInt(_replaceInput.dataset.targetIdx || '-1', 10);
+        if (files && files.length && targetIdx >= 0) {
+            const file = files[0];
+            if (file.type.startsWith('image/')) {
+                const uploadCap = window.__picgenUploadCap || 1920;
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    const im = new Image();
+                    im.onload = () => {
+                        let w = im.width, h = im.height;
+                        const longEdge = Math.max(w, h);
+                        if (longEdge > uploadCap) {
+                            if (w >= h) { h = Math.round((h * uploadCap) / w); w = uploadCap; }
+                            else { w = Math.round((w * uploadCap) / h); h = uploadCap; }
+                        }
+                        const canvas = document.createElement('canvas');
+                        canvas.width = w; canvas.height = h;
+                        canvas.getContext('2d').drawImage(im, 0, 0, w, h);
+                        replaceImageAt(targetIdx, canvas.toDataURL('image/jpeg', 0.95), file.name);
+                    };
+                    im.src = ev.target.result;
+                };
+                reader.readAsDataURL(file);
+            }
+        }
+        _replaceInput.value = '';
+        _replaceInput.dataset.targetIdx = '-1';
+    });
+
     // Replace all images with a single new one (used by outpaint popup)
     function replaceImages(b64, name) {
         images.length = 0;
@@ -9163,6 +9387,12 @@ function init() {
             html += '<div class="gallery-thumb' + sel + '" draggable="true" data-idx="' + i + '">'
                   + '<img src="' + img.b64 + '" alt="' + (img.name||'image') + '">'
                   + '<span class="thumb-badge">#' + (i+1) + '</span>'
+                  // Replace THIS slot in place — the image at this index is
+                  // overwritten without reindexing any other slot (so e.g.
+                  // replacing #1 leaves #2 as #2). Top-center so it never
+                  // overlaps the #badge (top-left) or the remove X (top-right).
+                  + '<button class="thumb-replace" data-replace="' + i + '" '
+                  + 'title="Replace this image (keeps its slot)">Replace</button>'
                   + '<button class="thumb-remove" data-remove="' + i + '" '
                   + 'style="position:absolute;top:4px;right:4px;z-index:100;'
                   + 'width:22px;height:22px;border-radius:50%;background:rgba(0,0,0,0.8);'
@@ -9196,7 +9426,12 @@ function init() {
     }
 
     function processFiles(files) {
-        const maxSize = window.__picgenMaxSize || 512;
+        // Upload fidelity is DECOUPLED from the Quality selection. We keep the
+        // uploaded image at a generous cap so the user can switch the Quality
+        // button at any time and it applies on the next Generate WITHOUT
+        // re-uploading. The chosen Quality drives the server-side generation
+        // resolution instead (sent with the Generate click), not the upload.
+        const uploadCap = window.__picgenUploadCap || 1920;
         Array.from(files).forEach(file => {
             if (!file.type.startsWith('image/')) return;
             const reader = new FileReader();
@@ -9204,8 +9439,13 @@ function init() {
                 const img = new Image();
                 img.onload = () => {
                     let width = img.width, height = img.height;
-                    if (width > height) { height = Math.round((height * maxSize) / width); width = maxSize; }
-                    else { width = Math.round((width * maxSize) / height); height = maxSize; }
+                    // Only downscale if the image exceeds the cap on its long
+                    // edge; never upscale small images.
+                    const longEdge = Math.max(width, height);
+                    if (longEdge > uploadCap) {
+                        if (width >= height) { height = Math.round((height * uploadCap) / width); width = uploadCap; }
+                        else { width = Math.round((width * uploadCap) / height); height = uploadCap; }
+                    }
                     const canvas = document.createElement('canvas');
                     canvas.width = width; canvas.height = height;
                     canvas.getContext('2d').drawImage(img, 0, 0, width, height);
@@ -9218,12 +9458,31 @@ function init() {
     }
 
     // -- Quality selector buttons ----------------------------------------------
-    if (!window.__picgenMaxSize) window.__picgenMaxSize = 512;
+    // The selected quality is the GENERATION resolution (long-edge target),
+    // read live at Generate time and written into the hidden #picgen-quality
+    // field so the server uses the CURRENT selection every click — no reupload,
+    // no refresh, no restart needed when you switch quality.
+    if (!window.__picgenQuality) window.__picgenQuality = 512;
+    function _syncQualityField() {
+        const q = document.getElementById('picgen-quality');
+        if (!q) return;
+        q.querySelectorAll('input,textarea').forEach(el => {
+            const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const ns = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (ns && ns.set) {
+                ns.set.call(el, String(window.__picgenQuality));
+                el.dispatchEvent(new Event('input',  {bubbles:true, composed:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true, composed:true}));
+            }
+        });
+    }
+    _syncQualityField();
     document.querySelectorAll('.tb-quality').forEach(btn => {
         btn.addEventListener('click', () => {
-            window.__picgenMaxSize = parseInt(btn.dataset.size, 10);
+            window.__picgenQuality = parseInt(btn.dataset.size, 10);
             document.querySelectorAll('.tb-quality').forEach(b => b.classList.remove('tb-quality-active'));
             btn.classList.add('tb-quality-active');
+            _syncQualityField();
         });
     });
 
@@ -9242,6 +9501,14 @@ function init() {
         if (removeBtn) {
             e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
             removeImage(parseInt(removeBtn.dataset.remove, 10));
+            return;
+        }
+        // Replace button — overwrite THIS slot in place (keeps slot order)
+        const replaceBtn = e.target.closest('.thumb-replace');
+        if (replaceBtn) {
+            e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+            _replaceInput.dataset.targetIdx = replaceBtn.dataset.replace;
+            _replaceInput.click();
             return;
         }
         // Add card — open file picker
@@ -9397,6 +9664,11 @@ body, .gradio-container { margin: 0 !important; padding: 0 !important; max-width
 .thumb-badge { position: absolute; top: 5px; left: 5px; background: var(--color-accent); color: #fff; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 600; display: block; text-align: left; }
 .thumb-remove { position: absolute; top: 5px; right: 5px; width: 24px; height: 24px; background: rgba(0,0,0,.75); color: #fff; border: 1px solid rgba(255,255,255,.35); border-radius: 50%; cursor: pointer; display: flex !important; align-items: center; justify-content: center; font-size: 12px; transition: background .15s; line-height: 1; z-index: 50; padding: 0; pointer-events: auto !important; }
 .gallery-thumb:hover .thumb-remove { display: flex !important; }
+/* Per-slot Replace button: top-center of each imported thumbnail. Appears on
+   hover; overwrites that slot in place without reindexing other slots. */
+.thumb-replace { position: absolute; top: 5px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,.78); color: #fff; border: 1px solid rgba(255,255,255,.4); border-radius: 5px; cursor: pointer; font-size: 10px; font-weight: 700; letter-spacing: .3px; padding: 3px 8px; line-height: 1; z-index: 60; opacity: 0; transition: opacity .15s, background .15s; pointer-events: auto !important; text-transform: uppercase; }
+.gallery-thumb:hover .thumb-replace { opacity: 1; }
+.thumb-replace:hover { background: var(--color-accent); }
 .thumb-remove:hover { background: #e53e3e !important; }
 .gallery-add-card { aspect-ratio: 1; border-radius: 8px; border: 2px dashed var(--border-color-primary); display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; transition: all .2s ease; gap: 4px; }
 .gallery-add-card:hover { border-color: var(--color-accent); }
@@ -11346,6 +11618,15 @@ with gr.Blocks(css=css) as demo:
                             value="[]", elem_id="hidden-images-b64",
                             elem_classes="hidden-input", container=False, visible=False,
                         )
+                        # Live-synced from the Quality buttons by picgen JS. Holds
+                        # the long-edge target (256/512/768/1024/1920). Read as a
+                        # Generate input so the CURRENT quality selection applies
+                        # every click — no reupload / refresh / restart needed.
+                        # Default 512 matches the active quality button.
+                        pic_quality = gr.Textbox(
+                            value="512", elem_id="picgen-quality",
+                            elem_classes="hidden-input", container=False, visible=False,
+                        )
                         gr.HTML("""
                         <div class="uploader-toolbar">
                             <button id="tb-upload" class="tb-btn">Upload</button>
@@ -11354,11 +11635,11 @@ with gr.Blocks(css=css) as demo:
                         </div>
                         <div class="quality-toolbar">
                             <span class="quality-label">Quality:</span>
-                            <button class="tb-btn tb-quality" data-size="256">256 ? Fastest</button>
-                            <button class="tb-btn tb-quality tb-quality-active" data-size="512">512 ? Default</button>
-                            <button class="tb-btn tb-quality" data-size="1024">1024 ? Better</button>
-                            <button class="tb-btn tb-quality" data-size="1920">1920 ?? High</button>
-                            <button class="tb-btn tb-quality" data-size="2560">2560 ? Max</button>
+                            <button class="tb-btn tb-quality" data-size="256">256 Fastest</button>
+                            <button class="tb-btn tb-quality tb-quality-active" data-size="512">512 Default</button>
+                            <button class="tb-btn tb-quality" data-size="768">768 Sharper</button>
+                            <button class="tb-btn tb-quality" data-size="1024">1024 Better</button>
+                            <button class="tb-btn tb-quality" data-size="1920">1920 High</button>
                         </div>
                         <div id="gallery-drop-zone">
                             <div id="upload-prompt" class="upload-prompt-modern">
@@ -11495,8 +11776,11 @@ with gr.Blocks(css=css) as demo:
                     with gr.Row():
                         pic_guidance = gr.Slider(label="True guidance scale", minimum=1.0, maximum=10.0, step=0.1, value=1.0)
                         pic_steps = gr.Slider(label="Number of inference steps", minimum=1, maximum=40, step=1, value=4)
-                        pic_height = gr.Slider(label="Height", minimum=256, maximum=2048, step=8, value=None)
-                        pic_width = gr.Slider(label="Width", minimum=256, maximum=2048, step=8, value=None)
+                        # NOTE: Resolution/quality is NOT chosen here — it is
+                        # driven solely by the "Quality" buttons at the top of
+                        # the tab (256/512/768/1024/1920), whose current value
+                        # is carried into generation via the hidden pic_quality
+                        # field. 512 is the default.
 
 
                 preset_dropdown.change(fn=update_solo_prompt, inputs=[preset_dropdown], outputs=[pic_prompt], scroll_to_output=False)
@@ -11511,12 +11795,12 @@ with gr.Blocks(css=css) as demo:
                 _pic_infer_inputs = [
                     hidden_images_b64, pic_prompt, pic_negative_prompt,
                     pic_seed, pic_randomize_seed, pic_guidance, pic_steps,
-                    pic_height, pic_width, pic_num_images,
+                    pic_quality, pic_num_images,
                 ]
 
                 def run_picgen(
                     images_b64_json, prompt, negative_prompt, seed, randomize_seed,
-                    true_guidance_scale, num_inference_steps, height, width,
+                    true_guidance_scale, num_inference_steps, resolution,
                     num_images_per_prompt,
                 ):
                     """Plain (non-generator) handler for the Generate button.
@@ -11552,7 +11836,7 @@ with gr.Blocks(css=css) as demo:
                     try:
                         filepaths, seed_out, urls_json = infer(
                             images_b64_json, prompt, negative_prompt, seed, randomize_seed,
-                            true_guidance_scale, num_inference_steps, height, width,
+                            true_guidance_scale, num_inference_steps, resolution,
                             num_images_per_prompt, None,
                         )
                     except gr.Error:
@@ -12078,10 +12362,43 @@ with gr.Blocks(css=css) as demo:
     function watchPicgenGallery() {
         const gallery = document.getElementById('picgen-result-gallery');
         if (!gallery) { setTimeout(watchPicgenGallery, 500); return; }
+
+        // Force the FIRST result image to be the shown/selected one whenever a
+        // new result set renders. Gradio's gr.Gallery (preview mode) often
+        // lands on the last image after receiving a new value list; we counter
+        // that by clicking the first thumbnail once per new result set.
+        //
+        // We key off the set of image srcs so we only re-select when the
+        // CONTENT actually changes (a brand-new generation) — never on the
+        // user's own later thumbnail clicks within the same result set.
+        let _lastResultKey = '';
+        function selectFirstResult() {
+            const thumbs = gallery.querySelectorAll('.thumbnail-item, .thumbnail-lg, button.thumbnail-item');
+            // Build a key from the current image sources to detect new content.
+            const imgs = Array.from(gallery.querySelectorAll('img'));
+            if (imgs.length === 0) { _lastResultKey = ''; return; }
+            const key = imgs.map(im => im.src).join('|');
+            if (key === _lastResultKey) return;   // same set — leave user's selection alone
+            _lastResultKey = key;
+            // Prefer clicking the first thumbnail in the strip; fall back to the
+            // first gallery image/button if the thumbnail strip isn't present
+            // (e.g. a single-image result).
+            const firstThumb = gallery.querySelector('.thumbnail-item, .thumbnail-lg, button.thumbnail-item');
+            if (firstThumb) {
+                firstThumb.click();
+            }
+        }
+
         // Watch for gallery content changes (new images rendered after generation)
-        const obs = new MutationObserver(() => patchGalleryDownloadButtons(gallery));
+        const obs = new MutationObserver(() => {
+            patchGalleryDownloadButtons(gallery);
+            // Defer slightly so Gradio finishes its own render/selection first,
+            // then we override to image #1.
+            setTimeout(selectFirstResult, 60);
+        });
         obs.observe(gallery, { childList: true, subtree: true });
         patchGalleryDownloadButtons(gallery);
+        setTimeout(selectFirstResult, 60);
     }
     setTimeout(watchPicgenGallery, 1000);
 }
