@@ -8730,43 +8730,32 @@ def _build_starter_grid_html():
     cards = []
     for n in range(1, 11):
         p = starters_dir / f"start{n}.jpg"
-        has = p.exists()
-        if has:
+        if p.exists():
             data = p.read_bytes()
             b64 = base64.b64encode(data).decode()
-            img_area = (
+            img_tag = (
                 f'<img class="starter-thumb" '
-                f'src="data:image/jpeg;base64,{b64}" alt="{n}" />'
-                # Hover-only "Replace" overlay (parallels the input-image
-                # Replace button). JS wires the click to the per-slot picker.
-                f'<button class="starter-replace" data-starter-replace="{n}" '
-                f'title="Replace starter {n}">Replace</button>'
+                f'src="data:image/jpeg;base64,{b64}" '
+                f'alt="{n}" />'
             )
         else:
-            # Empty slot: a clickable "Upload" placeholder.
-            img_area = (
-                f'<div class="starter-thumb-placeholder starter-upload" '
-                f'data-starter-upload="{n}" title="Upload starter {n}">'
-                f'<span class="starter-up-plus">+</span>'
-                f'<span class="starter-up-text">Upload</span></div>'
-            )
-        # Number button: "use as input". Reads the CURRENT <img> src so it keeps
-        # working after a replacement. Disabled only while the slot is empty.
-        if has:
-            btn_attrs = (
-                'class="starter-btn" '
-                f'onclick="(function(){{var img=this.closest(\'.starter-card\')'
-                f'.querySelector(\'img\');if(img&&window.__addImage)'
-                f'window.__addImage(img.src,\'starter{n}.jpg\');}}).call(this)"'
+            img_tag = f'<div class="starter-thumb-placeholder">{n}</div>'
+        # Button onclick: inline JS reads the pre-embedded b64 from the img src
+        # and passes it straight to __addImage — no fetch, no route, no async.
+        if p.exists():
+            onclick = (
+                f"(function(){{"
+                f"var img=this.closest('.starter-card').querySelector('img');"
+                f"if(img&&window.__addImage)window.__addImage(img.src,'starter{n}.jpg');"
+                f"}}).call(this)"
             )
         else:
-            btn_attrs = ('class="starter-btn starter-btn-empty" disabled '
-                         'style="opacity:.35;cursor:default;"')
+            onclick = ""
+        btn_attrs = f'class="starter-btn" onclick="{onclick}"' if onclick else 'class="starter-btn" disabled style="opacity:.35;cursor:default;"'
         cards.append(
-            f'<div class="starter-card" id="starter-card-{n}" data-starter-num="{n}">'
-            f'<div class="starter-img-area">{img_area}</div>'
+            f'<div class="starter-card">'
+            f'{img_tag}'
             f'<button {btn_attrs}>{n}</button>'
-            f'<div class="starter-err" id="starter-err-{n}"></div>'
             f'</div>'
         )
     grid_items = "".join(cards)
@@ -8776,32 +8765,15 @@ def _build_starter_grid_html():
       border:1px solid var(--border-color-primary);border-radius:6px;overflow:hidden;
       background:var(--background-fill-secondary);transition:border-color .15s;min-width:0;}}
     .starter-card:hover{{border-color:var(--color-accent);}}
-    .starter-card.starter-drop-over{{border-color:var(--color-accent)!important;
-      box-shadow:0 0 0 3px rgba(255,255,255,.35);}}
-    .starter-img-area{{position:relative;width:100%;aspect-ratio:1;overflow:hidden;}}
-    .starter-thumb{{width:100%;height:100%;object-fit:cover;display:block;}}
-    .starter-thumb-placeholder{{width:100%;height:100%;display:flex;flex-direction:column;
-      align-items:center;justify-content:center;font-size:12px;font-weight:600;gap:2px;
+    .starter-thumb{{width:100%;aspect-ratio:1;object-fit:cover;display:block;}}
+    .starter-thumb-placeholder{{width:100%;aspect-ratio:1;display:flex;align-items:center;
+      justify-content:center;font-size:13px;font-weight:600;
       color:var(--body-text-color-subdued);background:var(--background-fill-primary);}}
-    .starter-upload{{cursor:pointer;transition:background .15s,color .15s;}}
-    .starter-upload:hover{{background:var(--color-accent);color:#fff;}}
-    .starter-up-plus{{font-size:20px;line-height:1;}}
-    .starter-up-text{{font-size:11px;}}
-    .starter-replace{{position:absolute;top:4px;left:50%;transform:translateX(-50%);
-      background:rgba(0,0,0,.78);color:#fff;border:1px solid rgba(255,255,255,.4);
-      border-radius:5px;cursor:pointer;font-size:10px;font-weight:700;letter-spacing:.3px;
-      padding:3px 7px;line-height:1;z-index:60;opacity:0;transition:opacity .15s,background .15s;
-      text-transform:uppercase;}}
-    .starter-card:hover .starter-replace{{opacity:1;}}
-    .starter-replace:hover{{background:var(--color-accent);}}
     .starter-btn{{width:100%;border:none;border-top:1px solid var(--border-color-primary);
       background:var(--background-fill-secondary);color:var(--body-text-color);
       font-size:12px;font-weight:700;padding:4px 0;cursor:pointer;text-align:center;
       line-height:1.4;}}
     .starter-btn:hover:not([disabled]){{background:var(--color-accent);color:#fff;}}
-    .starter-err{{font-size:9px;line-height:1.2;color:#feb2b2;background:#742a2a;
-      text-align:center;padding:0;max-height:0;overflow:hidden;transition:max-height .15s,padding .15s;}}
-    .starter-err.show{{padding:2px 3px;max-height:40px;}}
     #starter-grid-container .prose{{margin:0!important;padding:0!important;}}
     #starter-grid{{display:grid;grid-template-columns:repeat(10,1fr);gap:4px;width:100%;margin-bottom:8px;}}
     </style>
@@ -12433,213 +12405,6 @@ with gr.Blocks(css=css) as demo:
 """
     demo.load(fn=None, js=_picgen_dl_intercept_js)
 
-    # Starter image upload / replace: empty slots show "Upload", filled slots
-    # show a hover "Replace" button. Both open a per-slot file picker, convert
-    # the chosen file to JPEG server-side (/picgen/starter_upload), overwrite
-    # starters/start{N}.jpg, and swap the thumbnail in place. Errors (unsupported
-    # file, etc.) show inline under the slot and never crash the app.
-    _picgen_starter_upload_js = r"""
-() => {
-    if (window.__ngStarterInit) return;
-    window.__ngStarterInit = true;
-
-    // One hidden file input reused for every slot; the target slot number is
-    // stashed on it between click and change.
-    let inp = document.getElementById('starter-upload-input');
-    if (!inp) {
-        inp = document.createElement('input');
-        inp.type = 'file';
-        inp.accept = 'image/*';
-        inp.id = 'starter-upload-input';
-        inp.style.display = 'none';
-        document.body.appendChild(inp);
-    }
-
-    function showErr(num, msg) {
-        const el = document.getElementById('starter-err-' + num);
-        if (!el) { return; }
-        el.textContent = msg || 'Upload failed.';
-        el.classList.add('show');
-        clearTimeout(el._t);
-        el._t = setTimeout(() => { el.classList.remove('show'); el.textContent = ''; }, 6000);
-    }
-
-    // After a successful upload, turn the card into a filled slot (image +
-    // Replace button + enabled number button) using the returned JPEG b64.
-    function fillCard(num, b64) {
-        const card = document.getElementById('starter-card-' + num);
-        if (!card) return;
-        const area = card.querySelector('.starter-img-area');
-        if (area) {
-            area.innerHTML =
-                '<img class="starter-thumb" src="' + b64 + '" alt="' + num + '" />' +
-                '<button class="starter-replace" data-starter-replace="' + num + '" ' +
-                'title="Replace starter ' + num + '">Replace</button>';
-        }
-        // Enable the number ("use as input") button.
-        const btn = card.querySelector('.starter-btn');
-        if (btn) {
-            btn.classList.remove('starter-btn-empty');
-            btn.removeAttribute('disabled');
-            btn.style.opacity = '';
-            btn.style.cursor = '';
-            btn.onclick = function () {
-                const img = card.querySelector('img');
-                if (img && window.__addImage) window.__addImage(img.src, 'starter' + num + '.jpg');
-            };
-        }
-    }
-
-    // Downscale any source image to a JPEG data URL (long-edge cap) so the
-    // request stays small; the server re-encodes to JPEG regardless. `src` may
-    // be a data: URL, a same-origin /media/ or blob: URL, or any loadable img
-    // src. Calls cb(err, dataUrl).
-    function srcToResizedJpeg(src, cb) {
-        const cap = 1600;
-        const im = new Image();
-        // Allow canvas export for cross-reference same-origin images.
-        try { im.crossOrigin = 'anonymous'; } catch (e) {}
-        im.onload = () => {
-            let w = im.width, h = im.height;
-            if (!w || !h) { cb(new Error('decode')); return; }
-            const le = Math.max(w, h);
-            if (le > cap) {
-                if (w >= h) { h = Math.round(h * cap / w); w = cap; }
-                else { w = Math.round(w * cap / h); h = cap; }
-            }
-            try {
-                const c = document.createElement('canvas');
-                c.width = w; c.height = h;
-                c.getContext('2d').drawImage(im, 0, 0, w, h);
-                cb(null, c.toDataURL('image/jpeg', 0.95));
-            } catch (e) { cb(e); }   // tainted canvas (cross-origin) or OOM
-        };
-        im.onerror = () => cb(new Error('decode'));
-        im.src = src;
-    }
-
-    function fileToResizedJpeg(file, cb) {
-        const reader = new FileReader();
-        reader.onload = (ev) => srcToResizedJpeg(ev.target.result, cb);
-        reader.onerror = () => cb(new Error('read'));
-        reader.readAsDataURL(file);
-    }
-
-    // Shared upload: send a JPEG data URL to the server for slot `num`, then
-    // fill the card or show an inline error. Never throws.
-    function uploadStarter(num, dataUrl) {
-        fetch('/picgen/starter_upload', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ num: num, data: dataUrl }),
-        }).then(r => r.json()).then(j => {
-            if (j && j.ok) { fillCard(num, j.b64); }
-            else { showErr(num, (j && j.error) || 'Upload failed.'); }
-        }).catch(() => { showErr(num, 'Upload failed — try again.'); });
-    }
-
-    // Resolve a drop into a JPEG data URL from ANY source: a dropped file from
-    // the PC, or an in-app dragged image (input/output gallery) exposed via the
-    // DataTransfer as a file, a data/HTML img, or a uri-list. cb(err, dataUrl).
-    function resolveDropToJpeg(dt, cb) {
-        if (!dt) { cb(new Error('nodata')); return; }
-        // 1) A real file from the OS / another app.
-        if (dt.files && dt.files.length) {
-            const f = dt.files[0];
-            if (f && f.type && f.type.startsWith('image/')) { fileToResizedJpeg(f, cb); return; }
-            if (f) { fileToResizedJpeg(f, cb); return; }  // let decode decide
-        }
-        // 2) In-app dragged <img>: dataTransfer carries text/html or a URL.
-        let src = '';
-        try {
-            const html = dt.getData('text/html');
-            if (html) {
-                const m = html.match(/<img[^>]+src=["']([^"']+)["']/i);
-                if (m && m[1]) src = m[1];
-            }
-        } catch (e) {}
-        if (!src) {
-            try {
-                const uri = dt.getData('text/uri-list') || dt.getData('text/plain') || '';
-                const first = uri.split(/\r?\n/).find(l => l && !l.startsWith('#'));
-                if (first) src = first.trim();
-            } catch (e) {}
-        }
-        if (src) { srcToResizedJpeg(src, cb); return; }
-        cb(new Error('nodata'));
-    }
-
-    inp.addEventListener('change', (e) => {
-        const num = parseInt(inp.dataset.num || '-1', 10);
-        const files = e.target.files;
-        inp.value = '';
-        if (!files || !files.length || num < 1) return;
-        fileToResizedJpeg(files[0], (err, dataUrl) => {
-            if (err || !dataUrl) { showErr(num, 'Unsupported file — try a JPG, PNG, or WebP.'); return; }
-            uploadStarter(num, dataUrl);
-        });
-    });
-
-    // Delegated click: Upload placeholder (empty slot) or Replace button
-    // (filled slot). Delegation on document survives Gradio re-rendering the
-    // starter HTML component.
-    document.addEventListener('click', (e) => {
-        const up = e.target.closest('[data-starter-upload]');
-        if (up) {
-            e.preventDefault(); e.stopPropagation();
-            inp.dataset.num = up.getAttribute('data-starter-upload');
-            inp.click();
-            return;
-        }
-        const rep = e.target.closest('[data-starter-replace]');
-        if (rep) {
-            e.preventDefault(); e.stopPropagation();
-            inp.dataset.num = rep.getAttribute('data-starter-replace');
-            inp.click();
-            return;
-        }
-    }, true);
-
-    // ---- Drag & drop onto a starter slot ---------------------------------
-    // Drop ANY image onto a starter card (empty or filled) to fill/replace it,
-    // exactly as if the user clicked Upload/Replace. Works for files dragged
-    // from the PC and for images dragged from the input or output image
-    // sections (or anywhere in the app). Delegated on document so it survives
-    // Gradio re-rendering the starter HTML.
-    function starterCardFromEvent(e) {
-        const card = e.target.closest('.starter-card');
-        if (!card) return null;
-        const num = parseInt(card.getAttribute('data-starter-num') || '-1', 10);
-        return (num >= 1 && num <= 10) ? { card, num } : null;
-    }
-    document.addEventListener('dragover', (e) => {
-        const hit = starterCardFromEvent(e);
-        if (!hit) return;
-        e.preventDefault();                 // allow drop
-        try { e.dataTransfer.dropEffect = 'copy'; } catch (err) {}
-        hit.card.classList.add('starter-drop-over');
-    }, true);
-    document.addEventListener('dragleave', (e) => {
-        const hit = starterCardFromEvent(e);
-        if (hit) hit.card.classList.remove('starter-drop-over');
-    }, true);
-    document.addEventListener('drop', (e) => {
-        const hit = starterCardFromEvent(e);
-        if (!hit) return;
-        e.preventDefault(); e.stopPropagation();
-        hit.card.classList.remove('starter-drop-over');
-        resolveDropToJpeg(e.dataTransfer, (err, dataUrl) => {
-            if (err || !dataUrl) {
-                showErr(hit.num, 'Could not read that image — try a JPG, PNG, or WebP.');
-                return;
-            }
-            uploadStarter(hit.num, dataUrl);
-        });
-    }, true);
-}
-"""
-    demo.load(fn=None, js=_picgen_starter_upload_js)
-
     # NOTE: The starter grid is built ONCE at UI construction time via
     # _build_starter_grid_html() as the initial value of starter_grid_html.
     # It is deliberately NOT wired to demo.load here — a queued Python
@@ -13616,113 +13381,6 @@ async def _picgen_stash_put(request: _FastAPIRequest):
     )
 
 
-_starter_upload_lock = threading.Lock()
-
-
-async def _picgen_starter_upload(request: _FastAPIRequest):
-    """Replace/create a starter image (starters/start{N}.jpg) from an uploaded
-    file, converting ANY Pillow-decodable image to JPEG.
-
-    Request body is JSON: {"num": 1..10, "data": "<data URI or base64>"}.
-
-    Always returns HTTP 200 with JSON:
-      success -> {"ok": true,  "num": N, "b64": "data:image/jpeg;base64,..."}
-      failure -> {"ok": false, "error": "<message>"}
-    so an unsupported/corrupt file shows a message in the UI WITHOUT crashing
-    the app and the user can immediately try another file.
-    """
-    try:
-        raw = await request.body()
-        try:
-            payload = json.loads(raw.decode("utf-8", "ignore") or "{}")
-        except Exception:
-            return _FastAPIResponse(
-                content=json.dumps({"ok": False, "error": "Bad request."}),
-                media_type="application/json", headers={"Cache-Control": "no-store"},
-            )
-
-        num = payload.get("num")
-        data = payload.get("data") or ""
-        try:
-            num = int(num)
-        except Exception:
-            num = 0
-        if num < 1 or num > 10:
-            return _FastAPIResponse(
-                content=json.dumps({"ok": False, "error": "Invalid starter slot."}),
-                media_type="application/json", headers={"Cache-Control": "no-store"},
-            )
-
-        # Accept either a full data URI ("data:...;base64,XXXX") or bare base64.
-        if "," in data and data.strip().lower().startswith("data:"):
-            data = data.split(",", 1)[1]
-        try:
-            img_bytes = base64.b64decode(data, validate=False)
-        except Exception:
-            return _FastAPIResponse(
-                content=json.dumps({"ok": False, "error": "Could not read the file data."}),
-                media_type="application/json", headers={"Cache-Control": "no-store"},
-            )
-        if not img_bytes:
-            return _FastAPIResponse(
-                content=json.dumps({"ok": False, "error": "Empty file."}),
-                media_type="application/json", headers={"Cache-Control": "no-store"},
-            )
-
-        # Decode with Pillow. Any format Pillow can open (jpg/png/webp/gif/bmp/
-        # tiff/...) is converted to RGB JPEG. Undecodable files (pdf, heic w/o
-        # plugin, corrupt) raise here and are reported as a clean error.
-        try:
-            pil = Image.open(BytesIO(img_bytes))
-            pil.load()
-            pil = pil.convert("RGB")
-        except Exception as _dec:
-            return _FastAPIResponse(
-                content=json.dumps({
-                    "ok": False,
-                    "error": "Unsupported or unreadable image file — try a JPG, PNG, or WebP.",
-                }),
-                media_type="application/json", headers={"Cache-Control": "no-store"},
-            )
-
-        starters_dir = os.path.join(SCRIPT_DIR, "starters")
-        os.makedirs(starters_dir, exist_ok=True)
-        jpg_path = os.path.join(starters_dir, f"start{num}.jpg")
-        with _starter_upload_lock:
-            # Write the JPEG, then remove any stale same-slot png/webp so the
-            # .jpg is authoritative (_find_starter_path checks .jpg first, but
-            # clearing the others avoids confusion/stale serving).
-            try:
-                pil.save(jpg_path, format="JPEG", quality=92)
-            except Exception as _wr:
-                return _FastAPIResponse(
-                    content=json.dumps({"ok": False, "error": f"Could not save image: {_wr}"}),
-                    media_type="application/json", headers={"Cache-Control": "no-store"},
-                )
-            for _stale_ext in (".png", ".webp"):
-                _sp = os.path.join(starters_dir, f"start{num}{_stale_ext}")
-                try:
-                    if os.path.exists(_sp):
-                        os.unlink(_sp)
-                except Exception:
-                    pass
-
-        out_b64 = base64.b64encode(open(jpg_path, "rb").read()).decode()
-        return _FastAPIResponse(
-            content=json.dumps({
-                "ok": True, "num": num,
-                "b64": f"data:image/jpeg;base64,{out_b64}",
-            }),
-            media_type="application/json", headers={"Cache-Control": "no-store"},
-        )
-    except Exception as _e:
-        # Last-resort guard: never 500 / crash — report and let the user retry.
-        return _FastAPIResponse(
-            content=json.dumps({"ok": False, "error": f"Upload failed: {type(_e).__name__}"}),
-            media_type="application/json", headers={"Cache-Control": "no-store"},
-        )
-
-
 def _register_picgen_progress_routes():
     """Attach the picgen-progress routes to the LIVE FastAPI app.
 
@@ -13737,8 +13395,6 @@ def _register_picgen_progress_routes():
             app.add_api_route("/picgen/progress/poll", _picgen_progress_poll, methods=["GET"])
         if "/picgen/stash" not in existing:
             app.add_api_route("/picgen/stash", _picgen_stash_put, methods=["POST"])
-        if "/picgen/starter_upload" not in existing:
-            app.add_api_route("/picgen/starter_upload", _picgen_starter_upload, methods=["POST"])
         if "/picgen/progress/stream" not in existing:
             app.add_api_route("/picgen/progress/stream", _picgen_progress_stream, methods=["GET"])
         print("[Picgen] progress routes registered on live app.")
