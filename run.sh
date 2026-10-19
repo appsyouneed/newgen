@@ -147,17 +147,20 @@ do_stop() {
 # Args = any combination of mode/option flags, forwarded to app.py:
 #   picgen / -picgen / --picgen   -> picgen mode (else vidgen default)
 #   novidgen / -novidgen / --novidgen -> hard-disable the vidgen tab this session
+#   nofp8 / -nofp8 / --nofp8      -> disable fp8 quantization (pure bf16, fastest on 64GB+ Blackwell)
 do_start() {
     local MODE_ARG=""
     local mode_display="vidgen (default)"
     local want_picgen=0
     local want_novidgen=0
+    local want_nofp8=0
     local a flag
     for a in "$@"; do
         flag="${a#-}"; flag="${flag#-}"
         case "${flag,,}" in
             picgen)   want_picgen=1 ;;
             novidgen) want_novidgen=1 ;;
+            nofp8)    want_nofp8=1 ;;
         esac
     done
     if [[ "$want_picgen" == "1" ]]; then
@@ -167,6 +170,10 @@ do_start() {
     if [[ "$want_novidgen" == "1" ]]; then
         MODE_ARG="$MODE_ARG --novidgen"
         mode_display="$mode_display, no-vidgen (video tab disabled)"
+    fi
+    if [[ "$want_nofp8" == "1" ]]; then
+        export NEWGEN_QWEN_FP8=0
+        mode_display="$mode_display, pure bf16 (no fp8)"
     fi
 
     if is_running; then
@@ -181,6 +188,16 @@ do_start() {
 
     echo "[run] Starting app.py in $mode_display mode..."
     echo "[run] Log  -> $LOG"
+
+    # Auto-detect VRAM and enable pure bf16 on 64GB+ cards (faster on Blackwell)
+    if [[ "$want_nofp8" == "0" ]] && command -v nvidia-smi &>/dev/null; then
+        VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+        if [[ -n "$VRAM_MB" ]] && [[ "$VRAM_MB" -ge 61440 ]]; then  # 60GB threshold (64GB cards show ~63GB)
+            export NEWGEN_QWEN_FP8=0
+            echo "[run] Auto-detected ${VRAM_MB}MB VRAM (>=60GB) — enabling pure bf16 (fastest on big cards)."
+            mode_display="$mode_display, pure bf16 (auto)"
+        fi
+    fi
 
     # Start Cloudflare Tunnel first so the URL is ready by the time the app loads
     ensure_cloudflared
@@ -239,7 +256,7 @@ for _arg in "$@"; do
         start|stop|restart|status|logs|url)
             CMD="${_f,,}"
             ;;
-        picgen|novidgen|vidgen)
+        picgen|novidgen|vidgen|nofp8)
             MODE_FLAGS+=("$_arg")
             ;;
         *)
@@ -278,8 +295,9 @@ case "$CMD" in
         fi
         ;;
     *)
-        echo "Usage: bash run.sh [start|stop|restart|status|logs|url] [picgen] [novidgen]"
+        echo "Usage: bash run.sh [start|stop|restart|status|logs|url] [picgen] [novidgen] [nofp8]"
         echo "       bash run.sh -picgen              # start in picgen mode"
+        echo "       bash run.sh -picgen -nofp8       # picgen mode, pure bf16 (fastest on 64GB+ Blackwell)"
         echo "       bash run.sh -picgen -novidgen    # picgen only; video tab disabled, no vidgen downloads"
         echo "       bash run.sh restart -picgen      # restart in picgen mode (with vidgen)"
         echo "       bash run.sh url                  # print current HTTPS URL"

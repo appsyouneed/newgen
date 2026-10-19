@@ -7021,6 +7021,26 @@ def _safe_move_to_device(pipe, target_device):
     (RTX 5090) where the transformer alone is ~16-18 GB and leftover
     allocator fragmentation can push the peak over the limit.
     """
+    # Fast path for big cards: all components fit simultaneously,
+    # no need for inter-component GC/sync/empty_cache stalls.
+    if target_device != "cpu":
+        try:
+            _card_gb = _device_total_vram_gb(target_device)
+            _pipe_gb = _pipe_param_gb(pipe)
+            _free_gb = torch.cuda.mem_get_info(
+                torch.device(target_device).index or 0)[0] / 1024**3
+            # Move everything at once if the whole pipeline fits comfortably
+            if _card_gb >= 64.0 and _free_gb >= _pipe_gb + 4.0:
+                pipe.to(target_device, non_blocking=True)
+                torch.cuda.synchronize(target_device)
+                free_gb = torch.cuda.mem_get_info(
+                    torch.device(target_device).index or 0)[0] / 1024**3
+                print(f"    [{target_device}] fast-moved entire pipeline "
+                      f"({_pipe_gb:.1f} GB) — {free_gb:.1f} GB free")
+                return
+        except Exception:
+            pass  # fall through to conservative per-component path
+    
     components = []
     if hasattr(pipe, 'transformer'):
         components.append(('transformer', pipe.transformer))
@@ -7094,11 +7114,11 @@ def _safe_move_to_device(pipe, target_device):
                     f"Aborting move before OOM so the previous model can be restored."
                 )
         print(f"    [{target_device}] moving {name}...")
-        component.to(target_device)
+        component.to(target_device, non_blocking=True)
+        torch.cuda.synchronize(target_device)
         gc.collect()
         torch.cuda.empty_cache()
         if target_device != "cpu":
-            torch.cuda.synchronize()
             free_gb = torch.cuda.mem_get_info()[0] / 1024**3
             print(f"    [{target_device}] {name} moved — {free_gb:.1f} GB free")
 
@@ -7439,10 +7459,12 @@ def _cast_transformer_to_fp8(pipe):
     if not hasattr(torch, "float8_e4m3fn"):
         print("    [fp8] torch has no float8_e4m3fn — keeping bf16 (may not fit <40 GB cards).")
         return None
-    # High-VRAM cards (>=80 GB): skip ALL fp8 casting — pipeline fits fully in
+    # High-VRAM cards (>=64 GB): skip ALL fp8 casting — pipeline fits fully in
     # bf16, no quantization or precision reduction of any kind.
+    # On Blackwell specifically, bf16 tensor cores (and FA3) are heavily
+    # optimized, making pure bf16 faster than mixed-precision fp8/bf16.
     _vram = _device_total_vram_gb(PIC_DEVICE)
-    if _vram >= 80.0:
+    if _vram >= 64.0:
         print(f"    [fp8] {_vram:.0f} GB card — skipping fp8 cast entirely; "
               f"pipeline runs at full bf16 precision.")
         return None
@@ -7666,28 +7688,25 @@ def _try_enable_qwen_fa3(pipe):
 
 
 def _apply_qwen_vae_memory_policy(pipe, device):
-    """Always keep VAE tiling+slicing ON.
-
-    We tried full-frame decode on big (>=40 GB) cards for speed, but on the
-    cu128/cu130 + sm_120 (Blackwell) stack the whole-latent VAE decoder conv3d
-    triggers a CUDA "illegal memory access" crash. Tiling+slicing decodes in
-    safe-sized chunks and avoids that, on every card size. Quality-neutral
-    (tiling only affects peak memory / tile seams, not the pixels materially).
-    Never raises.
-    """
+    """Full-frame decode on >=64 GB cards (enough VRAM headroom, faster).
+    Tiling on smaller cards to avoid OOM. Falls back to tiling on any error."""
     try:
         vae = getattr(pipe, "vae", None)
         if vae is None:
             return
-        try:
-            vae.enable_tiling()
-        except Exception:
-            pass
-        try:
-            vae.enable_slicing()
-        except Exception:
-            pass
-        print("    [vae] tiling+slicing ON (safe conv3d decode).")
+        _card_vram = _device_total_vram_gb(device or PIC_DEVICE)
+        if _card_vram >= 64.0:
+            # Enough headroom for full-frame decode — faster, no tile seams.
+            try:
+                vae.disable_tiling()
+                vae.disable_slicing()
+                print(f"    [vae] full-frame decode on {_card_vram:.0f} GB card (faster).")
+                return
+            except Exception as _e:
+                print(f"    [vae] disable_tiling/slicing failed ({_e}) — falling back to tiled.")
+        vae.enable_tiling()
+        vae.enable_slicing()
+        print("    [vae] tiling+slicing ON.")
     except Exception as _e:
         print(f"    [vae] memory policy skipped (non-fatal): {_e}")
 
@@ -8650,6 +8669,10 @@ def _get_cached_vae_latents(images):
             # LRU: update timestamp on hit
             _picgen_cache["vae_latents"][img_hash] = (entry[0], time.time())
             _record_cache_hit("vae")
+            # On >=40 GB cards, cache is kept on GPU — no H2D copy needed
+            _card_gb = _device_total_vram_gb(PIC_DEVICE)
+            if _card_gb >= 40.0:
+                return entry[0]  # already on GPU
             return _device_tree(entry[0], PIC_DEVICE)
     _record_cache_miss("vae")
     return None
@@ -8664,7 +8687,13 @@ def _cache_vae_latents(images, latents):
             # LRU: evict entry with oldest timestamp
             oldest_key = min(cache.keys(), key=lambda k: cache[k][1])
             cache.pop(oldest_key)
-        cache[img_hash] = (_cpu_detach_tree(latents), time.time())
+        # On >=40 GB cards keep latents on GPU — no round-trip needed on cache hit.
+        _card_gb = _device_total_vram_gb(PIC_DEVICE)
+        if _card_gb >= 40.0:
+            store = latents.detach()  # stay on GPU
+        else:
+            store = _cpu_detach_tree(latents)
+        cache[img_hash] = (store, time.time())
 
 
 def _get_cached_prompt_embeds(prompt, negative_prompt, images, num_images_per_prompt):
@@ -8678,6 +8707,10 @@ def _get_cached_prompt_embeds(prompt, negative_prompt, images, num_images_per_pr
             # LRU: update timestamp on hit
             _picgen_cache["prompt_embeds"][key] = (entry[0], time.time())
             _record_cache_hit("prompt")
+            # On >=40 GB cards, cache is kept on GPU — no H2D copy needed
+            _card_gb = _device_total_vram_gb(PIC_DEVICE)
+            if _card_gb >= 40.0:
+                return entry[0]  # already on GPU
             return _device_tree(entry[0], PIC_DEVICE)
     _record_cache_miss("prompt")
     return None
@@ -8693,7 +8726,13 @@ def _cache_prompt_embeds(prompt, negative_prompt, images, num_images_per_prompt,
             # LRU: evict the entry with the oldest timestamp
             oldest_key = min(cache.keys(), key=lambda k: cache[k][1])
             cache.pop(oldest_key)
-        cache[key] = (_cpu_detach_tree(embeds_data), time.time())
+        # On >=40 GB cards keep embeds on GPU — no round-trip needed on cache hit.
+        _card_gb = _device_total_vram_gb(PIC_DEVICE)
+        if _card_gb >= 40.0:
+            store = embeds_data  # keep on GPU (already detached by caller if needed)
+        else:
+            store = _cpu_detach_tree(embeds_data)
+        cache[key] = (store, time.time())
 
 
 def _find_starter_path(starter_num: int):
@@ -10609,7 +10648,7 @@ with gr.Blocks(css=css) as demo:
                         scale=2,
                     )
 
-            video_file = gr.File(visible=False)
+            video_file = gr.File(visible=False, type="filepath")
             
             lora_checkboxes = {}
             lora_download_btns = {}
@@ -13520,18 +13559,16 @@ if __name__ == "__main__":
             """One-time tiny inference to move first-run CUDA/attention kernel
             init off the user's first real generation.
 
-            Runs a 1-step generation on a small throwaway image so cuDNN / SDPA
-            (or FA3) kernel selection, autotuning and lazy CUDA init all happen
-            now instead of during the user's first click. Serialized through
-            _gpu_op_lock so it never races a real generation, and fully guarded
-            so any failure is non-fatal (it's purely an optimization). Quality
-            is irrelevant here — the output is discarded.
+            Runs warm-up generations at 512+768 quality levels (2 steps each) so
+            cuDNN caches both shape sets before the user's first click. This
+            eliminates the autotuning stall on first generation at each quality.
+            Serialized through _gpu_op_lock so it never races a real generation,
+            and fully guarded so any failure is non-fatal (purely optimization).
             """
             try:
                 if pic_pipe is None:
                     return
                 from PIL import Image as _PILImage
-                _dummy = _PILImage.new("RGB", (256, 256), (127, 127, 127))
                 _t0 = time.time()
                 with _gpu_op_lock:
                     # Re-check after acquiring the lock: only warm up if picgen
@@ -13542,19 +13579,27 @@ if __name__ == "__main__":
                         activate_pic()
                     except Exception:
                         return
-                    with torch.cuda.device(PIC_DEVICE):
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            _gen = torch.Generator(device=PIC_DEVICE).manual_seed(0)
-                            _ = pic_pipe(
-                                image=[_dummy],
-                                prompt=" ",
-                                negative_prompt=" ",
-                                num_inference_steps=1,
-                                true_cfg_scale=1.0,
-                                generator=_gen,
-                            )
-                print(f"[Warmup] picgen kernels warmed in {time.time()-_t0:.1f}s "
-                      f"(first real generation will be faster).")
+                    import qwenimage.pipeline_qwenimage_edit_plus as _qpipe_mod
+                    _prev_area = _qpipe_mod.VAE_IMAGE_SIZE
+                    # Warm up at the two most-used quality levels so cuDNN caches
+                    # both shape sets before the user's first click.
+                    for warmup_size in (512, 768):
+                        _dummy = _PILImage.new("RGB", (warmup_size, warmup_size), (127, 127, 127))
+                        _qpipe_mod.VAE_IMAGE_SIZE = warmup_size * warmup_size
+                        with torch.cuda.device(PIC_DEVICE):
+                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                _gen = torch.Generator(device=PIC_DEVICE).manual_seed(0)
+                                _ = pic_pipe(
+                                    image=[_dummy],
+                                    prompt=" ",
+                                    negative_prompt=" ",
+                                    num_inference_steps=2,   # 2 steps covers the scheduler path
+                                    true_cfg_scale=1.0,
+                                    generator=_gen,
+                                )
+                    _qpipe_mod.VAE_IMAGE_SIZE = _prev_area
+                print(f"[Warmup] picgen kernels warmed (512+768, 2 steps each) "
+                      f"in {time.time()-_t0:.1f}s")
             except Exception as _e:
                 print(f"[Warmup] picgen warm-up skipped (non-fatal): {_e}")
 
