@@ -1258,11 +1258,13 @@ def _heal_torchvision():
     _index = f"https://download.pytorch.org/whl/{_cu}" if _cu else None
 
     print(f"[SelfHeal] torchvision missing/broken — installing matching build "
-          f"(torch tag: {_cu or 'unknown'})...")
+          f"(torch CUDA: {_cu or 'unknown'})...")
     _cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir",
             "--force-reinstall", "--no-deps", "torchvision"]
     if _index:
         _cmd += ["--index-url", _index]
+    
+    print(f"[SelfHeal] Running: pip install torchvision (from {_index or 'PyPI'})...")
     _r = subprocess.run(_cmd, capture_output=True, text=True)
     if _r.returncode != 0 and _index:
         # Fall back to the default PyPI index (some cu tags lack a matching
@@ -1295,11 +1297,32 @@ def _heal_torchvision():
     print("[SelfHeal] torchvision installed — restarting process to load it cleanly...")
     _env2 = dict(os.environ)
     _env2["NEWGEN_TV_HEAL_REEXEC"] = "1"
-    try:
-        os.execve(sys.executable, [sys.executable] + sys.argv, _env2)
-    except Exception as _e:
-        if not _torchvision_ok():
-            raise RuntimeError(f"torchvision still not importable after install: {_e}")
+    
+    # Re-exec the process. On Unix os.execve replaces the current process.
+    # On Windows os.execve doesn't exist or doesn't work properly, so use
+    # subprocess to spawn a new process and exit the current one.
+    import platform
+    if platform.system() == "Windows":
+        try:
+            # Spawn replacement process with same stdin/stdout/stderr
+            _proc = subprocess.Popen(
+                [sys.executable] + sys.argv,
+                env=_env2,
+                stdin=sys.stdin,
+                stdout=sys.stdout,
+                stderr=sys.stderr
+            )
+            print(f"[SelfHeal] Started replacement process (PID {_proc.pid}), exiting...")
+            sys.exit(0)
+        except Exception as _e:
+            raise RuntimeError(f"Failed to restart process on Windows: {_e}")
+    else:
+        # Unix/Linux: replace current process with exec
+        try:
+            os.execve(sys.executable, [sys.executable] + sys.argv, _env2)
+        except Exception as _e:
+            if not _torchvision_ok():
+                raise RuntimeError(f"torchvision still not importable after install: {_e}")
 
 
 _heal_torchvision()
