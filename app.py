@@ -7102,7 +7102,8 @@ def autorun_generate(
 
 PICGEN_MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 BASE_MODEL_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "Qwen-Image-Edit-2511")
-NSFW_WEIGHTS_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "rapid-aio", "v23", "Qwen-Rapid-AIO-NSFW-v23.safetensors")
+# v19 has better face preservation than v23 (community consensus: less identity drift)
+NSFW_WEIGHTS_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "rapid-aio", "v19", "Qwen-Rapid-AIO-NSFW-v19.safetensors")
 
 # ---------------------------------------------------------------------------
 # OOM-safe pipeline move helpers
@@ -7243,7 +7244,7 @@ def _safe_offload_to_cpu(pipe, label="pipeline"):
 #
 # The Qwen-Image-Edit-2511 transformer is ~38 GB in bf16 — it does NOT fit on
 # a 32 GB card (RTX 5090).  But the NSFW checkpoint that is merged into it
-# (Qwen-Rapid-AIO-NSFW-v23) stores the transformer weights in fp8 (F8_E4M3):
+# (Qwen-Rapid-AIO-NSFW-v19) stores the transformer weights in fp8 (F8_E4M3):
 # that is the model author's intended runtime precision, and at fp8 the
 # transformer is ~19 GB — which fits with room for activations.
 #
@@ -8261,7 +8262,7 @@ if DUAL_GPU:
             os.makedirs(os.path.dirname(NSFW_WEIGHTS_LOCAL_PATH), exist_ok=True)
             v23_path = hf_hub_download(
                 repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
-                filename="v23/Qwen-Rapid-AIO-NSFW-v23.safetensors",
+                filename="v19/Qwen-Rapid-AIO-NSFW-v19.safetensors",
                 cache_dir=PICGEN_MODELS_DIR,
                 local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
             )
@@ -8333,7 +8334,7 @@ elif STARTUP_MODE == "vidgen":
                 os.makedirs(os.path.dirname(NSFW_WEIGHTS_LOCAL_PATH), exist_ok=True)
                 v23_path = hf_hub_download(
                     repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
-                    filename="v23/Qwen-Rapid-AIO-NSFW-v23.safetensors",
+                    filename="v19/Qwen-Rapid-AIO-NSFW-v19.safetensors",
                     cache_dir=PICGEN_MODELS_DIR,
                     local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
                 )
@@ -8403,7 +8404,7 @@ else:
         os.makedirs(os.path.dirname(NSFW_WEIGHTS_LOCAL_PATH), exist_ok=True)
         v23_path = hf_hub_download(
             repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
-            filename="v23/Qwen-Rapid-AIO-NSFW-v23.safetensors",
+            filename="v19/Qwen-Rapid-AIO-NSFW-v19.safetensors",
             cache_dir=PICGEN_MODELS_DIR,
             local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
         )
@@ -13820,7 +13821,7 @@ if __name__ == "__main__":
                     if not os.path.exists(v23):
                         v23 = hf_hub_download(
                             repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
-                            filename="v23/Qwen-Rapid-AIO-NSFW-v23.safetensors",
+                            filename="v19/Qwen-Rapid-AIO-NSFW-v19.safetensors",
                             cache_dir=PICGEN_MODELS_DIR,
                             local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
                         )

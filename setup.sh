@@ -853,11 +853,11 @@ if [ ! -d /run/systemd/system ]; then
     echo "📋 Video Tab: Qwen relocate -> Wan 2.2 merged 4-step animate"
     echo "🖼️  Image Tab: Unchanged (Qwen Image Edit)"
     echo ""
-    # Stop any old instance first, then start fresh in PICGEN-ONLY mode with the
-    # video tab disabled (no Wan / F5-TTS / Foley / MuseTalk downloads). To use
-    # vidgen, restart yourself without -novidgen, e.g. bash run.sh restart -picgen
+    # Start in PICGEN mode: Qwen loads first for immediate photo editing.
+    # Vidgen (Wan/F5-TTS/Foley/MuseTalk) downloads in background after picgen is ready.
+    # This gives fast picgen startup while still enabling the video tab automatically.
     bash /root/newgen/autorun.sh stop 2>/dev/null || true
-    exec bash /root/newgen/autorun.sh start -picgen -novidgen
+    exec bash /root/newgen/autorun.sh start -picgen
 fi
 
 echo "Setting up systemd service..."
@@ -884,8 +884,7 @@ echo ""
 # live log and startup confirmation in their current SSH session, exactly the
 # same experience as a manual launch.  The systemd unit is still registered and
 # will auto-start the app on future reboots via run_app.sh.
-# Autostart in PICGEN-ONLY mode with the video tab DISABLED (-novidgen): picgen
-# comes up fast and NOTHING for the vidgen tab is downloaded or loaded on the
-# device. To enable video generation, restart the app yourself without
-# -novidgen, e.g.  bash run.sh restart -picgen   (or edit the systemd unit).
-exec bash /root/newgen/autorun.sh start -picgen -novidgen
+# Start in PICGEN mode: Qwen loads first for immediate photo editing.
+# Vidgen (Wan/F5-TTS/Foley/MuseTalk) downloads in background after picgen is ready.
+# This gives fast picgen startup while still enabling the video tab automatically.
+exec bash /root/newgen/autorun.sh start -picgen
