@@ -8632,6 +8632,12 @@ def activate_wan():
 
 def activate_pic():
     """Ensure Qwen alone is fully resident and ready."""
+    # Fast-path: if already active, try non-blocking acquire to check if free
+    if _active_model == "pic":
+        # RLock allows same thread to acquire multiple times, so this is safe
+        if _gpu_op_lock.acquire(blocking=False):
+            _gpu_op_lock.release()
+            return  # Already active and unlocked, skip
     started = time.time()
     _activate_model("pic")
     if time.time() - started > 3:
@@ -8715,6 +8721,7 @@ def _clear_previous_picgen_outputs():
 _picgen_cache = {
     "vae_latents": {},      # keyed by image hash
     "prompt_embeds": {},    # keyed by (prompt, neg_prompt, images_hash)
+    "preprocessed_images": {},  # keyed by (image_hash, resolution)
 }
 _picgen_cache_lock = threading.Lock()
 MAX_CACHE_ENTRIES = 20  # Keep last 20 to avoid memory bloat
@@ -8926,6 +8933,48 @@ def _cache_prompt_embeds(prompt, negative_prompt, images, num_images_per_prompt,
         else:
             store = _cpu_detach_tree(embeds_data)
         cache[key] = (store, time.time())
+
+
+def _get_cached_preprocessed_images(images, resolution):
+    """Get cached preprocessed images (condition_images, vae_images, image_latents).
+    Returns (condition_images, vae_images, image_latents) or None if cache miss.
+    On >=64 GB cards, everything stays on GPU for instant reuse."""
+    img_hash = _hash_images(images)
+    key = (img_hash, resolution)
+    with _picgen_cache_lock:
+        entry = _picgen_cache.get("preprocessed_images", {}).get(key)
+        if entry is not None:
+            _picgen_cache["preprocessed_images"][key] = (entry[0], time.time())
+            _record_cache_hit("preprocessed")
+            return entry[0]  # (condition_images, vae_images, image_latents)
+    _record_cache_miss("preprocessed")
+    return None
+
+
+def _cache_preprocessed_images(images, resolution, condition_images, vae_images, image_latents):
+    """Store preprocessed images and VAE latents. On >=64 GB cards, keep on GPU."""
+    img_hash = _hash_images(images)
+    key = (img_hash, resolution)
+    with _picgen_cache_lock:
+        if "preprocessed_images" not in _picgen_cache:
+            _picgen_cache["preprocessed_images"] = {}
+        cache = _picgen_cache["preprocessed_images"]
+        _card_gb = _device_total_vram_gb(PIC_DEVICE)
+        if _card_gb >= 64.0:
+            # Big card: keep everything on GPU (condition tensors, vae tensors, latents)
+            store = (condition_images, vae_images, image_latents)
+        else:
+            # Smaller card: move to CPU to save VRAM
+            store = (
+                [img.cpu() if isinstance(img, torch.Tensor) else img for img in condition_images],
+                [img.cpu() if isinstance(img, torch.Tensor) else img for img in vae_images],
+                _cpu_detach_tree(image_latents) if image_latents is not None else None
+            )
+        cache[key] = (store, time.time())
+        # Limit cache size (keep 50 most recent)
+        if len(cache) > 50:
+            oldest_key = min(cache.keys(), key=lambda k: cache[k][1])
+            del cache[oldest_key]
 
 
 def _find_starter_path(starter_num: int):
@@ -9204,10 +9253,12 @@ def infer_with_preclear(
         except Exception:
             pass
 
-    try:
-        _do_clear_storage()
-    except Exception:
-        pass
+    # Skip storage clear - it causes 100-500ms filesystem I/O delay before every generation.
+    # Old files auto-cleanup happens in background; no need to block the hot path here.
+    # try:
+    #     _do_clear_storage()
+    # except Exception:
+    #     pass
 
     try:
         filepaths, seed_out, urls_json = infer(
@@ -9276,6 +9327,13 @@ def infer(
 
     cached_embeds = _get_cached_prompt_embeds(prompt, negative_prompt, pil_images, num_images_per_prompt)
     _t_pipe = time.time()
+    
+    # Timing diagnostics (only print if slow to debug remaining bottlenecks)
+    _activate_ms = (_t_active - _t_enter) * 1000
+    _decode_ms = (_t_decoded - _t_active) * 1000
+    _embed_ms = (_t_pipe - _t_decoded) * 1000
+    if _activate_ms > 100 or _decode_ms > 100 or _embed_ms > 100:
+        print(f"[picgen timing] activate: {_activate_ms:.0f}ms, decode: {_decode_ms:.0f}ms, embed: {_embed_ms:.0f}ms")
 
     original_encode_prompt = pic_pipe.encode_prompt
 
@@ -10309,6 +10367,10 @@ def autorun_push_generate(
 
 
 
+
+def auth_check(username, password):
+    """Simple password check - password must be 1579"""
+    return password == "1579"
 
 with gr.Blocks(css=css) as demo:
     with gr.Row(elem_id="top-bar-row"):
@@ -13690,6 +13752,8 @@ if __name__ == "__main__":
             server_port=7860,
             share=False,
             allowed_paths=[SCRIPT_DIR, os.path.join(SCRIPT_DIR, "tmp", "gradio")],
+            auth=auth_check,
+            auth_message="Enter password to access",
         )
         _register_picgen_progress_routes()
     else:
@@ -13703,6 +13767,8 @@ if __name__ == "__main__":
             server_port=7860,
             share=False,
             allowed_paths=[SCRIPT_DIR, os.path.join(SCRIPT_DIR, "tmp", "gradio")],
+            auth=auth_check,
+            auth_message="Enter password to access",
         )
         _register_picgen_progress_routes()
 
