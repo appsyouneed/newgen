@@ -667,24 +667,67 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
             batch_size = prompt_embeds.shape[0]
 
         device = self._execution_device
-        # 3. Preprocess image
+        # 3. Preprocess image - OPTIMIZED with GPU-accelerated preprocessing and caching
         if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
             if not isinstance(image, list):
                 image = [image]
-            condition_image_sizes = []
-            condition_images = []
-            vae_image_sizes = []
-            vae_images = []
-            for img in image:
-                image_width, image_height = img.size
-                condition_width, condition_height = calculate_dimensions(
-                    CONDITION_IMAGE_SIZE, image_width / image_height
-                )
-                vae_width, vae_height = calculate_dimensions(VAE_IMAGE_SIZE, image_width / image_height)
-                condition_image_sizes.append((condition_width, condition_height))
-                vae_image_sizes.append((vae_width, vae_height))
-                condition_images.append(self.image_processor.resize(img, condition_height, condition_width))
-                vae_images.append(self.image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2))
+            
+            # Try cache first - skip ALL preprocessing if cached
+            _cached_data = None
+            try:
+                from app import _get_cached_preprocessed_images
+                _cached_data = _get_cached_preprocessed_images(image, VAE_IMAGE_SIZE)
+            except Exception:
+                pass
+            
+            if _cached_data is not None:
+                condition_images, vae_images, cached_image_latents = _cached_data
+                # Move from CPU to GPU if needed (instant on >=64GB cards where cache is GPU-resident)
+                if isinstance(vae_images[0], torch.Tensor) and vae_images[0].device.type == 'cpu':
+                    vae_images = [img.to(device, non_blocking=True) for img in vae_images]
+                vae_image_sizes = [(img.shape[-1] * self.vae_scale_factor * 2, img.shape[-2] * self.vae_scale_factor * 2) for img in vae_images]
+                condition_image_sizes = [(img.width if hasattr(img, 'width') else img.shape[-1], 
+                                        img.height if hasattr(img, 'height') else img.shape[-2]) for img in condition_images]
+            else:
+                # Cache miss: do GPU-accelerated preprocessing
+                condition_image_sizes = []
+                condition_images = []
+                vae_image_sizes = []
+                vae_images = []
+                cached_image_latents = None
+                
+                # Use torchvision for GPU-accelerated resizing (10-50x faster than PIL on CPU)
+                try:
+                    import torchvision.transforms.functional as TF
+                    _use_gpu_resize = torch.cuda.is_available()
+                except ImportError:
+                    _use_gpu_resize = False
+                
+                for img in image:
+                    image_width, image_height = img.size
+                    condition_width, condition_height = calculate_dimensions(
+                        CONDITION_IMAGE_SIZE, image_width / image_height
+                    )
+                    vae_width, vae_height = calculate_dimensions(VAE_IMAGE_SIZE, image_width / image_height)
+                    condition_image_sizes.append((condition_width, condition_height))
+                    vae_image_sizes.append((vae_width, vae_height))
+                    
+                    if _use_gpu_resize and device.type == 'cuda':
+                        # GPU path: convert PIL -> tensor on GPU, resize on GPU (FAST)
+                        img_tensor = torch.from_numpy(np.array(img)).to(device, dtype=torch.float32, non_blocking=True).permute(2, 0, 1) / 255.0
+                        condition_tensor = TF.resize(img_tensor, [condition_height, condition_width], interpolation=TF.InterpolationMode.BILINEAR, antialias=True)
+                        vae_tensor = TF.resize(img_tensor, [vae_height, vae_width], interpolation=TF.InterpolationMode.BILINEAR, antialias=True)
+                        
+                        # Convert back to PIL for condition (text encoder expects PIL), keep tensor for VAE
+                        condition_img = TF.to_pil_image(condition_tensor.cpu())
+                        condition_images.append(condition_img)
+                        # VAE preprocessing: normalize to [-1, 1] and add batch/time dims
+                        vae_preprocessed = (vae_tensor * 2.0 - 1.0).unsqueeze(0).unsqueeze(2)  # [1, C, 1, H, W]
+                        vae_images.append(vae_preprocessed)
+                    else:
+                        # Fallback to CPU PIL (original slow path)
+                        condition_images.append(self.image_processor.resize(img, condition_height, condition_width))
+                        vae_images.append(self.image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2))
 
         has_neg_prompt = negative_prompt is not None or (
             negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
@@ -722,6 +765,7 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
+        
         latents, image_latents = self.prepare_latents(
             vae_images,
             batch_size * num_images_per_prompt,
@@ -733,6 +777,15 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
             generator,
             latents,
         )
+        
+        # Cache preprocessed data for next generation (GPU-resident on >=64GB cards)
+        # Only cache if we processed fresh (not from cache hit)
+        if '_cached_data' in locals() and _cached_data is None:
+            try:
+                from app import _cache_preprocessed_images
+                _cache_preprocessed_images(image, VAE_IMAGE_SIZE, condition_images, vae_images, image_latents)
+            except Exception:
+                pass  # Non-fatal
         img_shapes = [
             [
                 (1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2),
