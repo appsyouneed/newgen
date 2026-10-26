@@ -1,0 +1,175 @@
+REPLACE IN app.py:
+
+FROM line 9350 (def _blend_face_back) TO line 9565 (return gen_pil in except block)
+
+WITH THIS EXACT CODE:
+
+def _blend_face_back(orig_pil, gen_pil, blend_alpha=0.95, feather_frac=0.18):
+    """
+    Use MediaPipe Face Mesh for landmark-based face alignment and precise blending.
+    Detects 468 facial landmarks, aligns faces, and creates a perfect face mask.
+    
+    Falls back to returning gen_pil unchanged if MediaPipe unavailable or fails.
+
+    Args:
+        orig_pil:    Original input PIL image (the reference face source).
+        gen_pil:     Generated PIL image to paste the face back onto.
+        blend_alpha: Opacity of the original face (0.95 = 95% original, 5% generated).
+        feather_frac: Width of the Gaussian feather border as fraction of face size.
+
+    Returns:
+        PIL image with face aligned and blended, or gen_pil unchanged on any failure.
+    """
+    try:
+        import cv2
+        import numpy as np
+        from PIL import Image
+        
+        # ── 1. Try to import mediapipe, install if missing ─────────────────
+        try:
+            import mediapipe as mp
+        except ImportError:
+            print("[face_blend] MediaPipe not found, installing...")
+            import subprocess
+            import sys
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--no-cache-dir", "mediapipe"],
+                capture_output=True, text=True, check=False,
+            )
+            if result.returncode != 0:
+                print(f"[face_blend] MediaPipe install failed, returning original output")
+                return gen_pil
+            import mediapipe as mp
+            print("[face_blend] MediaPipe installed successfully")
+        
+        # ── 2. Initialize MediaPipe Face Mesh ───────────────────────────────
+        mp_face_mesh = mp.solutions.face_mesh
+        face_mesh = mp_face_mesh.FaceMesh(
+            static_image_mode=True,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5
+        )
+        
+        # ── 3. Convert images to numpy arrays ──────────────────────────────
+        orig_np = np.array(orig_pil.convert("RGB"))
+        gen_np = np.array(gen_pil.convert("RGB"))
+        
+        # ── 4. Detect landmarks in both images ─────────────────────────────
+        orig_results = face_mesh.process(orig_np)
+        gen_results = face_mesh.process(gen_np)
+        
+        if not orig_results.multi_face_landmarks or not gen_results.multi_face_landmarks:
+            print("[face_blend] No face detected in one or both images, returning original output")
+            return gen_pil
+        
+        orig_landmarks = orig_results.multi_face_landmarks[0]
+        gen_landmarks = gen_results.multi_face_landmarks[0]
+        
+        # ── 5. Extract key landmark points for alignment ───────────────────
+        # Key points: left eye, right eye, nose tip, mouth corners
+        # These landmarks are consistent across all faces
+        key_indices = [33, 263, 1, 61, 291]  # left_eye, right_eye, nose, left_mouth, right_mouth
+        
+        orig_h, orig_w = orig_np.shape[:2]
+        gen_h, gen_w = gen_np.shape[:2]
+        
+        orig_points = np.array([
+            [lm.x * orig_w, lm.y * orig_h]
+            for idx, lm in enumerate(orig_landmarks.landmark)
+            if idx in key_indices
+        ], dtype=np.float32)
+        
+        gen_points = np.array([
+            [lm.x * gen_w, lm.y * gen_h]
+            for idx, lm in enumerate(gen_landmarks.landmark)
+            if idx in key_indices
+        ], dtype=np.float32)
+        
+        # ── 6. Compute similarity transform (rotation + scale + translation) ─
+        transform_matrix, _ = cv2.estimateAffinePartial2D(orig_points, gen_points)
+        
+        if transform_matrix is None:
+            print("[face_blend] Could not compute transform, returning original output")
+            return gen_pil
+        
+        # ── 7. Warp original face to match generated face pose ─────────────
+        aligned_orig = cv2.warpAffine(
+            orig_np,
+            transform_matrix,
+            (gen_w, gen_h),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE
+        )
+        
+        # ── 8. Create precise face mask from facial contour landmarks ──────
+        # Face oval contour indices in MediaPipe Face Mesh
+        face_oval_indices = [
+            10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+            397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+            172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109
+        ]
+        
+        mask_points = np.array([
+            [int(lm.x * gen_w), int(lm.y * gen_h)]
+            for idx, lm in enumerate(gen_landmarks.landmark)
+            if idx in face_oval_indices
+        ], dtype=np.int32)
+        
+        # Create mask from convex hull of face contour
+        mask = np.zeros((gen_h, gen_w), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, mask_points, 255)
+        
+        # ── 9. Apply Gaussian blur for smooth feathering ───────────────────
+        # Compute feather size based on face dimensions
+        face_bbox = cv2.boundingRect(mask_points)
+        feather_px = max(10, int(min(face_bbox[2], face_bbox[3]) * feather_frac))
+        # Ensure odd kernel size for GaussianBlur
+        feather_px = feather_px if feather_px % 2 == 1 else feather_px + 1
+        
+        mask_float = mask.astype(np.float32) / 255.0
+        mask_blurred = cv2.GaussianBlur(mask_float, (feather_px, feather_px), 0)
+        
+        # ── 10. Color correction: match histogram of aligned face to generated ─
+        # This ensures lighting and color tone match seamlessly
+        aligned_face_region = cv2.bitwise_and(aligned_orig, aligned_orig, mask=mask)
+        gen_face_region = cv2.bitwise_and(gen_np, gen_np, mask=mask)
+        
+        # Simple color correction: match mean and std per channel
+        for channel in range(3):
+            aligned_channel = aligned_face_region[:, :, channel]
+            gen_channel = gen_face_region[:, :, channel]
+            
+            # Only compute stats where mask is non-zero
+            mask_bool = mask > 0
+            if np.any(mask_bool):
+                aligned_mean = aligned_channel[mask_bool].mean()
+                aligned_std = aligned_channel[mask_bool].std() + 1e-6
+                gen_mean = gen_channel[mask_bool].mean()
+                gen_std = gen_channel[mask_bool].std() + 1e-6
+                
+                # Normalize aligned to match generated
+                aligned_orig[:, :, channel] = np.clip(
+                    (aligned_orig[:, :, channel] - aligned_mean) * (gen_std / aligned_std) + gen_mean,
+                    0, 255
+                ).astype(np.uint8)
+        
+        # ── 11. Alpha blend with feathered mask ────────────────────────────
+        # Apply blend_alpha to the mask
+        mask_alpha = mask_blurred * blend_alpha
+        mask_alpha_3ch = mask_alpha[:, :, np.newaxis]
+        
+        # Blend: result = aligned * mask_alpha + generated * (1 - mask_alpha)
+        result = (
+            aligned_orig.astype(np.float32) * mask_alpha_3ch +
+            gen_np.astype(np.float32) * (1.0 - mask_alpha_3ch)
+        ).astype(np.uint8)
+        
+        # ── 12. Convert back to PIL and return ─────────────────────────────
+        print("[face_blend] MediaPipe face alignment successful")
+        return Image.fromarray(result)
+        
+    except Exception as e:
+        # Any failure → return original model output unchanged
+        print(f"[face_blend] MediaPipe processing failed: {e}")
+        return gen_pil

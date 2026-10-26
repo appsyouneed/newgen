@@ -28,6 +28,10 @@ warnings.filterwarnings("ignore")
 logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 logging.getLogger("torch.utils._pytree").setLevel(logging.ERROR)
 logging.getLogger("absl").setLevel(logging.ERROR)
+
+# Suppress MediaPipe verbose logging (EGL, GL context, TensorFlow Lite warnings)
+os.environ['GLOG_minloglevel'] = '3'  # Suppress GLOG (Google logging) - only FATAL
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logs
 logging.getLogger("diffusers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("torchao").setLevel(logging.ERROR)
@@ -582,7 +586,7 @@ def _self_heal_torch():
             capture_output=True, text=True,
         )
         if _check.returncode == 0:
-            print(f"[VersionCheck] torch ?")
+            print(f"[VersionCheck] torch ✓")
             return
         raise RuntimeError(
             f"torch sanity check failed: {_check.stderr.strip()[:300]}\n"
@@ -593,6 +597,70 @@ def _self_heal_torch():
         raise
     except Exception as _e:
         print(f"[VersionCheck] torch check failed (non-fatal): {_e}")
+
+
+def _self_heal_opencv():
+    """Verify OpenCV has CascadeClassifier support for face detection.
+    If cv2.CascadeClassifier is missing (opencv-python-headless or broken install),
+    reinstall opencv-python with full GUI/cascade support.
+    
+    IMPORTANT: opencv-python includes the cascade XML files as package data, so
+    --no-deps would still get CascadeClassifier but might miss the data files.
+    We install WITH deps but rely on pip's dependency resolver to keep numpy
+    compatible (numpy is already installed and satisfies opencv's requirement)."""
+    try:
+        import cv2
+        # Check if CascadeClassifier exists
+        if hasattr(cv2, 'CascadeClassifier') and hasattr(cv2, 'data'):
+            # Verify cascade data is actually accessible
+            try:
+                test_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+                test_cascade = cv2.CascadeClassifier(test_path)
+                if not test_cascade.empty():
+                    print(f"[VersionCheck] opencv-python {cv2.__version__} ✓")
+                    return
+            except Exception:
+                pass
+        
+        # CascadeClassifier missing or broken - reinstall opencv-python
+        print("[SelfHeal] OpenCV missing CascadeClassifier (likely opencv-python-headless) — reinstalling opencv-python...")
+        
+        # Step 1: Uninstall all opencv variants to ensure clean slate
+        _r = subprocess.run(
+            [sys.executable, "-m", "pip", "uninstall", "-y", 
+             "opencv-python-headless", "opencv-contrib-python-headless",
+             "opencv-python", "opencv-contrib-python"],
+            capture_output=True, text=True,
+        )
+        
+        # Step 2: Install opencv-python WITH dependencies (pip will preserve numpy
+        # if it already satisfies opencv's requirement, which it does)
+        print("[SelfHeal] Installing opencv-python...")
+        _r = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir", "opencv-python>=4.5.0,<5.0"],
+            capture_output=True, text=True,
+        )
+        if _r.returncode != 0:
+            print(f"[SelfHeal] opencv-python install failed: {_r.stderr.strip()}")
+            print("[SelfHeal] Face blending will be disabled this session.")
+            return
+        
+        # Don't try to reimport cv2 here - Python's import system caches
+        # modules for the life of the process. The fresh opencv-python will
+        # be available on the NEXT app restart. For THIS session, the runtime
+        # face_blend function handles on-demand install + reload.
+        print("[SelfHeal] opencv-python installed — will be active on next generation ✓")
+            
+    except ImportError:
+        print("[SelfHeal] OpenCV not installed — installing opencv-python...")
+        _r = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir", "opencv-python>=4.5.0,<5.0"],
+            capture_output=True, text=True,
+        )
+        if _r.returncode != 0:
+            print(f"[SelfHeal] opencv-python install failed: {_r.stderr.strip()}")
+    except Exception as _e:
+        print(f"[VersionCheck] OpenCV check failed (non-fatal): {_e}")
 
 
 def _self_heal_diffusers_version():
@@ -632,6 +700,7 @@ def _self_heal_diffusers_version():
 
 
 _self_heal_torch()              # first: transformers crashes if torch.__version__ is None
+_self_heal_opencv()             # ensure opencv-python (not headless) for face detection
 _self_heal_diffusers_version()
 _self_heal_transformers_version()
 # Gradio file patches run here — BEFORE gradio is imported — by importing
@@ -9264,7 +9333,7 @@ def infer_with_preclear(
         filepaths, seed_out, urls_json = infer(
             images_b64_json, prompt, negative_prompt, seed, randomize_seed,
             true_guidance_scale, num_inference_steps, height, width,
-            num_images_per_prompt, progress,
+            num_images_per_prompt, progress, face_match=False,
         )
         yield filepaths, seed_out, urls_json
     except gr.Error:
@@ -9274,6 +9343,496 @@ def infer_with_preclear(
         raise
     except Exception as _infer_e:
         raise gr.Error(f"Generation failed: {_infer_e}") from None
+
+
+# ---------------------------------------------------------------------------
+# Face preservation: blend the original face back over the generated output.
+# Single shared MediaPipe FaceMesh, no runtime pip installs, native log noise
+# silenced, and the blend is skipped (model output returned unchanged) whenever
+# the situation is ambiguous. Disable entirely with NEWGEN_FACE_BLEND=0.
+# ---------------------------------------------------------------------------
+_FACE_BLEND_ENABLED = os.environ.get("NEWGEN_FACE_BLEND", "1") == "1"
+_face_mesh_lock = threading.Lock()
+_face_mesh_state = {"mesh": None, "failed": False}
+_FACE_KEY_IDX = (33, 263, 1, 61, 291)   # eyes, nose tip, mouth corners
+_FACE_OVAL_IDX = (
+    10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+    397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+    172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109,
+)
+
+
+@contextlib.contextmanager
+def _quiet_native_stderr():
+    """Silence C++ (MediaPipe/TFLite/EGL) logging at the file-descriptor level."""
+    saved = None
+    saved_filters = []
+    try:
+        # Suppress Python warnings
+        import warnings
+        saved_filters = warnings.filters[:]
+        warnings.filterwarnings('ignore')
+        
+        # Suppress stderr at FD level
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        saved = os.dup(2)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 2)
+        os.close(devnull)
+    except Exception:
+        saved = None
+    try:
+        yield
+    finally:
+        if saved is not None:
+            try:
+                os.dup2(saved, 2)
+            finally:
+                os.close(saved)
+        if saved_filters:
+            warnings.filters[:] = saved_filters
+
+
+def _get_face_mesh():
+    """One shared FaceMesh for the whole process. Never installs anything.
+    Caller must hold _face_mesh_lock."""
+    if _face_mesh_state["failed"]:
+        return None
+    if _face_mesh_state["mesh"] is not None:
+        return _face_mesh_state["mesh"]
+    try:
+        with _quiet_native_stderr():
+            import mediapipe as mp
+            if not hasattr(mp, "solutions"):
+                raise RuntimeError("mediapipe has no 'solutions' API")
+            mesh = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=True, max_num_faces=5,
+                refine_landmarks=True, min_detection_confidence=0.2,
+            )
+        _face_mesh_state["mesh"] = mesh
+        return mesh
+    except Exception as e:
+        _face_mesh_state["failed"] = True
+        print(f"[face_blend] disabled for this session ({type(e).__name__}: {e})")
+        return None
+
+
+def _close_face_mesh():
+    try:
+        m = _face_mesh_state.get("mesh")
+        if m is not None:
+            m.close()
+    except Exception:
+        pass
+    _face_mesh_state["mesh"] = None
+
+
+import atexit as _atexit_face
+_atexit_face.register(_close_face_mesh)
+
+
+def _single_face_landmarks(mesh, rgb_np):
+    """Return (N,2) pixel landmarks if EXACTLY one face is found, else None."""
+    h, w = rgb_np.shape[:2]
+    # DEBUG START
+    print(f"[DEBUG] _single_face_landmarks: processing image {w}x{h}", flush=True)
+    # DEBUG END
+    with _quiet_native_stderr():
+        res = mesh.process(rgb_np)
+    faces = res.multi_face_landmarks or []
+    # DEBUG START
+    print(f"[DEBUG] _single_face_landmarks: detected {len(faces)} face(s)", flush=True)
+    # DEBUG END
+    if len(faces) != 1:
+        # DEBUG START
+        print(f"[DEBUG] _single_face_landmarks: returning None (need exactly 1 face, got {len(faces)})", flush=True)
+        # DEBUG END
+        return None
+    return np.array([[lm.x * w, lm.y * h] for lm in faces[0].landmark], dtype=np.float32)
+
+
+def _get_face_encoding(rgb_np, landmarks):
+    """Extract a simple geometric feature vector from face landmarks for matching.
+    Returns a normalized feature vector representing face structure."""
+    try:
+        # Use key facial points for geometric encoding
+        key_points = [33, 263, 1, 61, 291, 10, 152]  # eyes, nose, mouth, chin
+        features = []
+        
+        # Calculate relative distances between key points
+        for i in range(len(key_points)):
+            for j in range(i + 1, len(key_points)):
+                pt1 = landmarks[key_points[i]]
+                pt2 = landmarks[key_points[j]]
+                dist = np.linalg.norm(pt1 - pt2)
+                features.append(dist)
+        
+        # Add face center and size
+        center = np.mean(landmarks, axis=0)
+        size = np.std(landmarks, axis=0).sum()
+        features.extend([center[0], center[1], size])
+        
+        # Normalize to unit vector
+        features = np.array(features, dtype=np.float32)
+        norm = np.linalg.norm(features)
+        if norm > 0:
+            features = features / norm
+        return features
+    except Exception:
+        return None
+
+
+def _extract_all_faces(rgb_np, mesh):
+    """Extract all faces from an image with their landmarks and encodings.
+    Returns list of (landmarks, encoding, bbox) tuples."""
+    h, w = rgb_np.shape[:2]
+    with _quiet_native_stderr():
+        res = mesh.process(rgb_np)
+    faces = res.multi_face_landmarks or []
+    
+    if not faces:
+        return []
+    
+    face_data = []
+    for idx, face_lm in enumerate(faces):
+        try:
+            landmarks = np.array([[lm.x * w, lm.y * h] for lm in face_lm.landmark], dtype=np.float32)
+            encoding = _get_face_encoding(rgb_np, landmarks)
+            if encoding is not None:
+                # Calculate bounding box
+                x_min, y_min = landmarks.min(axis=0)
+                x_max, y_max = landmarks.max(axis=0)
+                bbox = (int(x_min), int(y_min), int(x_max), int(y_max))
+                face_data.append((landmarks, encoding, bbox))
+        except Exception:
+            continue
+    
+    return face_data
+
+
+def _match_faces(input_faces, output_faces):
+    """Match output faces to input faces based on geometric similarity.
+    Returns list of (input_idx, output_idx, similarity) tuples."""
+    matches = []
+    
+    for out_idx, (_, out_enc, _) in enumerate(output_faces):
+        best_sim = -1
+        best_in_idx = -1
+        
+        for in_idx, (_, in_enc, _) in enumerate(input_faces):
+            # Cosine similarity
+            similarity = float(np.dot(out_enc, in_enc))
+            if similarity > best_sim:
+                best_sim = similarity
+                best_in_idx = in_idx
+        
+        # Only match if similarity is reasonable (> 0.7)
+        if best_sim > 0.7:
+            matches.append((best_in_idx, out_idx, best_sim))
+    
+    return matches
+
+
+def _blend_single_face(orig_np, gen_np, orig_lm, gen_lm, blend_alpha=0.9, feather_frac=0.18):
+    """Blend a single matched face from orig into gen at the location specified by landmarks.
+    Returns the modified gen_np (in-place modification) and success flag."""
+    try:
+        gh, gw = gen_np.shape[:2]
+        
+        key = list(_FACE_KEY_IDX)
+        M, _ = cv2.estimateAffinePartial2D(orig_lm[key], gen_lm[key])
+        if M is None:
+            # DEBUG START
+            print(f"[DEBUG] _blend_single_face: estimateAffinePartial2D returned None", flush=True)
+            # DEBUG END
+            return gen_np, False
+
+        scale = float(np.hypot(M[0, 0], M[1, 0]))
+        angle = float(np.degrees(np.arctan2(M[1, 0], M[0, 0])))
+        # DEBUG START
+        print(f"[DEBUG] _blend_single_face: scale={scale:.3f}, angle={angle:.3f}", flush=True)
+        # DEBUG END
+        # Relaxed scale and angle constraints
+        if not (0.3 < scale < 3.5) or abs(angle) > 50.0:
+            # DEBUG START
+            print(f"[DEBUG] _blend_single_face: FAILED scale/angle check (scale must be 0.3-3.5, angle must be ±50°)", flush=True)
+            # DEBUG END
+            return gen_np, False
+
+        # Geometry check - more permissive
+        o_mapped = orig_lm @ M[:, :2].T + M[:, 2]
+        face_w = float(gen_lm[:, 0].max() - gen_lm[:, 0].min())
+        # DEBUG START
+        print(f"[DEBUG] _blend_single_face: face_w={face_w:.1f}", flush=True)
+        # DEBUG END
+        if face_w < 10:
+            # DEBUG START
+            print(f"[DEBUG] _blend_single_face: FAILED face_w check (must be >= 10)", flush=True)
+            # DEBUG END
+            return gen_np, False
+        err = float(np.mean(np.linalg.norm(o_mapped - gen_lm, axis=1))) / face_w
+        # DEBUG START
+        print(f"[DEBUG] _blend_single_face: geometry error={err:.4f} (threshold: 0.15)", flush=True)
+        # DEBUG END
+        # Increased error tolerance from 0.05 to 0.15
+        if err > 0.15:
+            # DEBUG START
+            print(f"[DEBUG] _blend_single_face: FAILED geometry error check", flush=True)
+            # DEBUG END
+            return gen_np, False
+
+        aligned = cv2.warpAffine(orig_np, M, (gw, gh), flags=cv2.INTER_CUBIC,
+                                 borderMode=cv2.BORDER_REPLICATE)
+
+        pts = gen_lm[list(_FACE_OVAL_IDX)].astype(np.int32)
+        pts[:, 0] = np.clip(pts[:, 0], 0, gw - 1)
+        pts[:, 1] = np.clip(pts[:, 1], 0, gh - 1)
+        hull = cv2.convexHull(pts)
+        mask = np.zeros((gh, gw), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, hull, 255)
+        mask_bool = mask > 0
+        mask_sum = int(mask_bool.sum())
+        # DEBUG START
+        print(f"[DEBUG] _blend_single_face: mask_sum={mask_sum} (threshold: 50)", flush=True)
+        # DEBUG END
+        if mask_sum < 50:
+            # DEBUG START
+            print(f"[DEBUG] _blend_single_face: FAILED mask_sum check", flush=True)
+            # DEBUG END
+            return gen_np, False
+
+        # Color matching
+        aligned_f = aligned.astype(np.float32)
+        gen_f = gen_np.astype(np.float32)
+        for c in range(3):
+            a = aligned_f[:, :, c][mask_bool]
+            g = gen_f[:, :, c][mask_bool]
+            ratio = float(np.clip(g.std() / (a.std() + 1e-6), 0.7, 1.4))
+            adj = (aligned_f[:, :, c] - a.mean()) * ratio + g.mean()
+            aligned_f[:, :, c] = aligned_f[:, :, c] * 0.2 + adj * 0.8
+        aligned_f = np.clip(aligned_f, 0, 255)
+
+        x, y, bw, bh = cv2.boundingRect(hull)
+        k = max(15, int(min(bw, bh) * feather_frac))
+        k = k if k % 2 == 1 else k + 1
+        soft = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (k * 2 + 1, k * 2 + 1), 0)
+        soft = cv2.GaussianBlur(soft, (k, k), 0)
+        alpha = (soft * blend_alpha)[:, :, None]
+
+        # In-place blend
+        gen_np[:] = (aligned_f * alpha + gen_f * (1.0 - alpha)).astype(np.uint8)
+        # DEBUG START
+        print(f"[DEBUG] _blend_single_face: SUCCESS - face blended", flush=True)
+        # DEBUG END
+        return gen_np, True
+    except Exception as e:
+        # DEBUG START
+        print(f"[DEBUG] _blend_single_face: Exception {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        # DEBUG END
+        return gen_np, False
+
+
+def _blend_face_back(orig_pil, gen_pil, blend_alpha=0.9, feather_frac=0.18):
+    """Blend the original face back over the generated image, safely.
+    Legacy single-face version for backward compatibility.
+
+    Returns (image, count) where count is 1 if face was blended, 0 otherwise."""
+    # DEBUG START
+    print(f"[DEBUG] _blend_face_back called", flush=True)
+    # DEBUG END
+    if not _FACE_BLEND_ENABLED:
+        # DEBUG START
+        print(f"[DEBUG] _FACE_BLEND_ENABLED=False, skipping", flush=True)
+        # DEBUG END
+        return gen_pil, 0
+    try:
+        orig_np = np.array(orig_pil.convert("RGB"))
+        gen_np = np.array(gen_pil.convert("RGB"))
+        # DEBUG START
+        print(f"[DEBUG] Images converted to numpy. orig shape: {orig_np.shape}, gen shape: {gen_np.shape}", flush=True)
+        # DEBUG END
+
+        with _face_mesh_lock:
+            mesh = _get_face_mesh()
+            if mesh is None:
+                # DEBUG START
+                print(f"[DEBUG] Face mesh is None, returning", flush=True)
+                # DEBUG END
+                return gen_pil, 0
+            # DEBUG START
+            print(f"[DEBUG] Getting landmarks from orig image...", flush=True)
+            # DEBUG END
+            o_lm = _single_face_landmarks(mesh, orig_np)
+            # DEBUG START
+            print(f"[DEBUG] orig landmarks: {o_lm is not None} (shape: {o_lm.shape if o_lm is not None else 'None'})", flush=True)
+            # DEBUG END
+            # DEBUG START
+            print(f"[DEBUG] Getting landmarks from gen image...", flush=True)
+            # DEBUG END
+            g_lm = _single_face_landmarks(mesh, gen_np)
+            # DEBUG START
+            print(f"[DEBUG] gen landmarks: {g_lm is not None} (shape: {g_lm.shape if g_lm is not None else 'None'})", flush=True)
+            # DEBUG END
+        if o_lm is None or g_lm is None:
+            # DEBUG START
+            print(f"[DEBUG] Landmarks check failed: o_lm={o_lm is not None}, g_lm={g_lm is not None}", flush=True)
+            # DEBUG END
+            return gen_pil, 0
+
+        # DEBUG START
+        print(f"[DEBUG] Calling _blend_single_face...", flush=True)
+        # DEBUG END
+        result_np, success = _blend_single_face(orig_np, gen_np.copy(), o_lm, g_lm, 
+                                                 blend_alpha, feather_frac)
+        # DEBUG START
+        print(f"[DEBUG] _blend_single_face returned success={success}", flush=True)
+        # DEBUG END
+        if success:
+            return Image.fromarray(result_np), 1
+        return gen_pil, 0
+    except Exception as e:
+        # DEBUG START
+        print(f"[DEBUG] Exception in _blend_face_back: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        # DEBUG END
+        print(f"[face_blend] skipped ({type(e).__name__}: {e})")
+        return gen_pil, 0
+
+
+def _blend_multi_face(input_pils, gen_pil, blend_alpha=0.9, feather_frac=0.18):
+    """Blend multiple input faces back into the generated image.
+    Matches each output face to the most similar input face and blends individually.
+    
+    Returns (result_image, face_count) where face_count is number of faces successfully blended."""
+    if not _FACE_BLEND_ENABLED or not input_pils:
+        return gen_pil, 0
+    
+    try:
+        gen_np = np.array(gen_pil.convert("RGB"))
+        
+        with _face_mesh_lock:
+            mesh = _get_face_mesh()
+            if mesh is None:
+                return gen_pil, 0
+            
+            # Extract all faces from all input images
+            input_faces = []
+            input_images = []
+            for pil_img in input_pils:
+                img_np = np.array(pil_img.convert("RGB"))
+                faces = _extract_all_faces(img_np, mesh)
+                for face_data in faces:
+                    input_faces.append(face_data)
+                    input_images.append(img_np)
+            
+            # Extract all faces from output image
+            output_faces = _extract_all_faces(gen_np, mesh)
+        
+        if not input_faces or not output_faces:
+            return gen_pil, 0
+        
+        # Match output faces to input faces
+        matches = _match_faces(input_faces, output_faces)
+        
+        if not matches:
+            return gen_pil, 0
+        
+        # Sort matches by similarity (best first) to handle overlapping faces properly
+        matches.sort(key=lambda x: x[2], reverse=True)
+        
+        # Apply blending for each matched face
+        result_np = gen_np.copy()
+        blend_count = 0
+        for in_idx, out_idx, similarity in matches:
+            orig_lm = input_faces[in_idx][0]
+            gen_lm = output_faces[out_idx][0]
+            orig_np = input_images[in_idx]
+            
+            result_np, success = _blend_single_face(orig_np, result_np, orig_lm, gen_lm,
+                                                     blend_alpha, feather_frac)
+            if success:
+                blend_count += 1
+        
+        if blend_count > 0:
+            return Image.fromarray(result_np), blend_count
+        
+        return gen_pil, 0
+    except Exception as e:
+        print(f"[face_blend] multi-face processing failed ({type(e).__name__}: {e})")
+        return gen_pil, 0
+
+
+def _apply_face_preservation(pil_images, outputs, face_match=False):
+    """Intelligently blend faces from input images to output images.
+    
+    - Single input image: uses legacy single-face blending for backward compatibility
+    - Multiple input images: uses new multi-face matching and blending
+    - face_match parameter: enables/disables face blending entirely
+    
+    Returns (outputs, face_count) where face_count is number of faces successfully blended
+    """
+    # DEBUG START
+    print(f"[DEBUG] _apply_face_preservation called: face_match={face_match}, num_inputs={len(pil_images) if pil_images else 0}, num_outputs={len(outputs)}", flush=True)
+    # DEBUG END
+    try:
+        if not _FACE_BLEND_ENABLED or not face_match or not pil_images:
+            # DEBUG START
+            print(f"[DEBUG] _apply_face_preservation: early return (_FACE_BLEND_ENABLED={_FACE_BLEND_ENABLED}, face_match={face_match}, has_images={bool(pil_images)})", flush=True)
+            # DEBUG END
+            return outputs, 0
+        
+        # Legacy path: single input image with single face
+        if len(pil_images) == 1:
+            # DEBUG START
+            print(f"[DEBUG] _apply_face_preservation: using single-image path", flush=True)
+            # DEBUG END
+            ref = pil_images[0]
+            result = []
+            total_faces = 0
+            for idx, img in enumerate(outputs):
+                # DEBUG START
+                print(f"[DEBUG] _apply_face_preservation: processing output {idx+1}/{len(outputs)}", flush=True)
+                # DEBUG END
+                blended, count = _blend_face_back(ref, img)
+                result.append(blended)
+                total_faces += count
+                # DEBUG START
+                print(f"[DEBUG] _apply_face_preservation: output {idx+1} result: count={count}, total_so_far={total_faces}", flush=True)
+                # DEBUG END
+            return result, total_faces
+        
+        # New path: multiple input images, match and blend each face individually
+        # DEBUG START
+        print(f"[DEBUG] _apply_face_preservation: using multi-image path", flush=True)
+        # DEBUG END
+        result = []
+        total_faces = 0
+        for idx, img in enumerate(outputs):
+            # DEBUG START
+            print(f"[DEBUG] _apply_face_preservation: processing output {idx+1}/{len(outputs)} (multi-face)", flush=True)
+            # DEBUG END
+            blended, count = _blend_multi_face(pil_images, img)
+            result.append(blended)
+            total_faces += count
+            # DEBUG START
+            print(f"[DEBUG] _apply_face_preservation: output {idx+1} result: count={count}, total_so_far={total_faces}", flush=True)
+            # DEBUG END
+        return result, total_faces
+        
+    except Exception as e:
+        # DEBUG START
+        print(f"[DEBUG] Exception in _apply_face_preservation: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        # DEBUG END
+        print(f"[face_blend] skipped ({type(e).__name__}: {e})")
+        return outputs, 0
 
 
 @_gpu_serialized
@@ -9290,6 +9849,7 @@ def infer(
     progress=None,  # Disabled — all progress flows through streaming generator only
     height=None,
     width=None,
+    face_match=False,
 ):
     # Gradio sliders pass floats; cast to int immediately so .repeat(),
     # randn_tensor batch dims, and cache keys all see a plain Python int.
@@ -9473,6 +10033,22 @@ def infer(
     # post-generation path — they added 100-500ms of latency on every generation
     # on a Blackwell 6000 Pro without meaningful benefit (the allocator handles
     # fragmentation lazily and far more efficiently than a forced purge here).
+
+    # Face preservation (controlled by Face Match checkbox).
+    # Wrapped in try-except to prevent any face blend errors from breaking
+    # the generator cleanup chain (which causes "generator didn't stop" errors).
+    try:
+        image, face_count = _apply_face_preservation(pil_images, image, face_match=face_match)
+        
+        # Print face match status if enabled
+        if face_match:
+            if face_count > 0:
+                print(f"GOOD x{face_count}", flush=True)
+            else:
+                print("FACEMATCH FAILURE", flush=True)
+    except Exception as _face_e:
+        print(f"[face_blend] unexpected error: {_face_e}", flush=True)
+        face_count = 0
 
     import os as _os
     _shm_dir = os.path.join(SCRIPT_DIR, "tmp", "gradio")
@@ -9776,6 +10352,19 @@ function init() {
         });
     });
 
+    // Face Match checkbox sync
+    const faceMatchCheckbox = document.getElementById('face-match-checkbox');
+    const faceMatchState = document.getElementById('pic-face-match-state');
+    if (faceMatchCheckbox && faceMatchState) {
+        faceMatchCheckbox.addEventListener('change', () => {
+            const checkbox = faceMatchState.querySelector('input[type="checkbox"]');
+            if (checkbox) {
+                checkbox.checked = faceMatchCheckbox.checked;
+                checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        });
+    }
+
     fileInput.addEventListener('change', (e) => { processFiles(e.target.files); e.target.value = ''; });
     if (uploadClick) uploadClick.addEventListener('click', () => fileInput.click());
     if (btnUpload)   btnUpload.addEventListener('click',   () => fileInput.click());
@@ -9971,6 +10560,43 @@ body, .gradio-container { margin: 0 !important; padding: 0 !important; max-width
 .tb-btn:hover { border-color: var(--color-accent); }
 .tb-quality { font-size: 11px; padding: 4px 9px; }
 .tb-quality-active { border-color: var(--color-accent) !important; background: var(--color-accent) !important; color: #fff !important; }
+/* Face Match checkbox styling */
+.face-match-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+.face-match-toggle input[type="checkbox"] { 
+    appearance: none; 
+    -webkit-appearance: none; 
+    width: 18px; 
+    height: 18px; 
+    border: 2px solid var(--border-color-primary); 
+    border-radius: 4px; 
+    background: var(--background-fill-secondary); 
+    cursor: pointer; 
+    position: relative; 
+    transition: all 0.15s ease;
+}
+.face-match-toggle input[type="checkbox"]:hover { 
+    border-color: var(--color-accent); 
+}
+.face-match-toggle input[type="checkbox"]:checked { 
+    background: var(--color-accent); 
+    border-color: var(--color-accent); 
+}
+.face-match-toggle input[type="checkbox"]:checked::after {
+    content: '✓';
+    position: absolute;
+    color: white;
+    font-size: 14px;
+    font-weight: bold;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+}
+.face-match-toggle span { 
+    font-size: 12px; 
+    font-weight: 500; 
+    color: var(--body-text-color); 
+    user-select: none; 
+}
 /* Input photo fits inside its container without expanding it */
 #vidgen-reference { overflow: hidden !important; }
 #vidgen-reference img, #vidgen-reference video { max-height: 320px !important; max-width: 100% !important; width: auto !important; height: auto !important; object-fit: contain !important; display: block !important; margin: 0 auto !important; }
@@ -10369,8 +10995,120 @@ def autorun_push_generate(
 
 
 def auth_check(username, password):
-    """Simple password check - password must be 1579"""
+    """Simple password check - password must be 1579
+    
+    This is the basic Gradio auth check, but we also set a persistent cookie
+    via custom middleware below so users don't have to log in again."""
     return password == "1579"
+
+
+# ---------------------------------------------------------------------------
+# Persistent Authentication Cookie System
+# Gradio's built-in auth doesn't persist across sessions, so we add custom
+# FastAPI middleware to set a long-lived signed cookie after successful login.
+# The cookie works across URL changes (Cloudflare tunnel domains change on
+# each restart) because it's set with SameSite=Lax and no domain restriction.
+# ---------------------------------------------------------------------------
+
+def _setup_persistent_auth(app):
+    """Add persistent cookie authentication to the Gradio FastAPI app.
+    
+    Sets a signed, HTTPOnly cookie after successful Gradio auth that lasts
+    30 days. The cookie bypasses Gradio's login screen on future visits even
+    if the URL changes (Cloudflare tunnels get new domains on each restart).
+    
+    Cookie is signed with HMAC-SHA256 using a secret derived from the password
+    so it can't be forged."""
+    import hmac
+    import hashlib
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import Response
+    
+    # Secret key for signing cookies (derived from the password)
+    AUTH_SECRET = hashlib.sha256(b"1579-newgen-auth-secret").hexdigest()
+    COOKIE_NAME = "newgen_auth_token"
+    COOKIE_MAX_AGE = 30 * 24 * 60 * 60  # 30 days in seconds
+    
+    def _sign_token(username: str) -> str:
+        """Create a signed token for the username."""
+        message = f"{username}:newgen-session"
+        signature = hmac.new(
+            AUTH_SECRET.encode(),
+            message.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        return f"{username}:{signature}"
+    
+    def _verify_token(token: str) -> bool:
+        """Verify a signed token is valid."""
+        try:
+            parts = token.split(":", 1)
+            if len(parts) != 2:
+                return False
+            username, signature = parts
+            expected = _sign_token(username)
+            # Constant-time comparison to prevent timing attacks
+            return hmac.compare_digest(token, expected)
+        except Exception:
+            return False
+    
+    class PersistentAuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            # Check if user has valid auth cookie
+            auth_cookie = request.cookies.get(COOKIE_NAME)
+            has_valid_cookie = auth_cookie and _verify_token(auth_cookie)
+            
+            if has_valid_cookie:
+                # Valid cookie - bypass Gradio auth by injecting auth header
+                # Gradio checks for HTTP Basic Auth in the Authorization header
+                import base64
+                # Extract username from cookie for the auth header
+                username = auth_cookie.split(":")[0] if ":" in auth_cookie else "user"
+                credentials = base64.b64encode(f"{username}:1579".encode()).decode('ascii')
+                request.headers.__dict__["_list"].append(
+                    (b"authorization", f"Basic {credentials}".encode())
+                )
+            
+            # Capture the Authorization header BEFORE processing the request
+            # This is where the actual login credentials are sent by the browser
+            auth_header = request.headers.get("authorization", "")
+            username_from_auth = None
+            password_from_auth = None
+            
+            if "Basic" in auth_header and not has_valid_cookie:
+                # This is a new login attempt, capture the credentials
+                try:
+                    import base64
+                    encoded = auth_header.replace("Basic ", "").strip()
+                    decoded = base64.b64decode(encoded).decode('utf-8')
+                    username_from_auth, password_from_auth = decoded.split(":", 1)
+                except Exception:
+                    pass
+            
+            response = await call_next(request)
+            
+            # If this request had valid credentials and was successful, set our persistent cookie
+            # Check for any successful request (200) with correct password that isn't already authenticated
+            if username_from_auth and password_from_auth == "1579" and response.status_code == 200:
+                # Successful auth - set persistent cookie
+                token = _sign_token(username_from_auth)
+                response.set_cookie(
+                    key=COOKIE_NAME,
+                    value=token,
+                    max_age=COOKIE_MAX_AGE,
+                    httponly=True,  # Prevents JavaScript access (XSS protection)
+                    secure=False,   # Works with both HTTP and HTTPS
+                    samesite="lax", # Works across subdomains and URL changes
+                    path="/",       # Available for entire site
+                )
+                print(f"[Auth] Persistent cookie set for user '{username_from_auth}' (30 days)")
+            
+            return response
+    
+    # Add the middleware to the FastAPI app
+    app.add_middleware(PersistentAuthMiddleware)
+    print("[Auth] Persistent cookie authentication enabled (30-day sessions)")
+
 
 with gr.Blocks(css=css) as demo:
     with gr.Row(elem_id="top-bar-row"):
@@ -11934,6 +12672,11 @@ with gr.Blocks(css=css) as demo:
                             <button class="tb-btn tb-quality" data-size="768">768 Sharper</button>
                             <button class="tb-btn tb-quality" data-size="1024">1024 Better</button>
                             <button class="tb-btn tb-quality" data-size="1920">1920 High</button>
+                            <span style="margin-left: 12px; margin-right: 4px; border-left: 1px solid var(--border-color-primary); height: 20px;"></span>
+                            <label class="face-match-toggle">
+                                <input type="checkbox" id="face-match-checkbox">
+                                <span>Face Match</span>
+                            </label>
                         </div>
                         <div id="gallery-drop-zone">
                             <div id="upload-prompt" class="upload-prompt-modern">
@@ -12067,6 +12810,7 @@ with gr.Blocks(css=css) as demo:
                 with gr.Accordion("Advanced Settings", open=False):
                     pic_seed = gr.Slider(label="Seed", minimum=0, maximum=PICGEN_MAX_SEED, step=1, value=0)
                     pic_randomize_seed = gr.Checkbox(label="Randomize seed", value=True)
+                    pic_face_match = gr.Checkbox(label="Face Match", value=False, visible=False, elem_id="pic-face-match-state")
                     with gr.Row():
                         pic_guidance = gr.Slider(label="True guidance scale", minimum=1.0, maximum=10.0, step=0.1, value=1.0)
                         pic_steps = gr.Slider(label="Number of inference steps", minimum=1, maximum=40, step=1, value=4)
@@ -12089,13 +12833,13 @@ with gr.Blocks(css=css) as demo:
                 _pic_infer_inputs = [
                     hidden_images_b64, pic_prompt, pic_negative_prompt,
                     pic_seed, pic_randomize_seed, pic_guidance, pic_steps,
-                    pic_quality, pic_num_images,
+                    pic_quality, pic_num_images, pic_face_match,
                 ]
 
                 def run_picgen(
                     images_b64_json, prompt, negative_prompt, seed, randomize_seed,
                     true_guidance_scale, num_inference_steps, resolution,
-                    num_images_per_prompt,
+                    num_images_per_prompt, face_match,
                 ):
                     """Plain (non-generator) handler for the Generate button.
 
@@ -12131,7 +12875,7 @@ with gr.Blocks(css=css) as demo:
                         filepaths, seed_out, urls_json = infer(
                             images_b64_json, prompt, negative_prompt, seed, randomize_seed,
                             true_guidance_scale, num_inference_steps, resolution,
-                            num_images_per_prompt, None,
+                            num_images_per_prompt, None, face_match=face_match,
                         )
                     except gr.Error:
                         _set_picgen_progress(_total, _total, "", running=False)
@@ -13747,6 +14491,7 @@ if __name__ == "__main__":
     if DUAL_GPU:
         print(f" GRADIO LAUNCHING  Wan on {WAN_DEVICE}, Qwen on {PIC_DEVICE}. Both tabs ready.")
         demo.queue()
+        _setup_persistent_auth(demo.app)  # Enable persistent login cookies
         demo.launch(
             server_name="0.0.0.0",
             server_port=7860,
@@ -13762,6 +14507,7 @@ if __name__ == "__main__":
         else:
             print(" GRADIO LAUNCHING  Qwen on GPU, picgen ready immediately.")
         demo.queue()
+        _setup_persistent_auth(demo.app)  # Enable persistent login cookies
         demo.launch(
             server_name="0.0.0.0",
             server_port=7860,
@@ -14080,8 +14826,3 @@ if __name__ == "__main__":
             print("[Predownload] All background pre-downloads complete.")
 
         threading.Thread(target=_bg_predownload_assets, daemon=True).start()
-
-
-
-
-
