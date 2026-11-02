@@ -4663,28 +4663,48 @@ MAX_DURATION = 600.0        # 10 minutes max via chaining
 # interpolation artifacts. Hence OFF by default; the UI checkbox flips this
 # module-wide flag the instant it's toggled, so it applies on the next Generate.
 #
-# _FAST_MODE_FPS is the reduced native rate we generate at; RIFE multiplies it
-# back up to FIXED_FPS for playback.
+# SUPER FAST MODE: Even faster variant that generates at 4 fps (QUARTER frames)
+# and RIFE interpolates x4 back to 16 fps. Net: ~4x faster but more interpolation.
+# Both modes are mutually exclusive.
+#
+# _FAST_MODE_FPS / _SUPER_FAST_MODE_FPS are the reduced native rates we generate
+# at; RIFE multiplies them back up to FIXED_FPS for playback.
 # ---------------------------------------------------------------------------
 _FAST_MODE = False
+_SUPER_FAST_MODE = False
 _FAST_MODE_FPS = 8
+_SUPER_FAST_MODE_FPS = 4
 _FAST_RIFE_FACTOR = max(1, FIXED_FPS // _FAST_MODE_FPS)   # 16 // 8 = 2
+_SUPER_FAST_RIFE_FACTOR = max(1, FIXED_FPS // _SUPER_FAST_MODE_FPS)   # 16 // 4 = 4
 
 
 def _set_fast_mode(enabled: bool):
     """UI handler: toggle fast video generation. Effective immediately for the
     next Generate press (the generators read _FAST_MODE at run time)."""
-    global _FAST_MODE
+    global _FAST_MODE, _SUPER_FAST_MODE
     _FAST_MODE = bool(enabled)
+    if _FAST_MODE:
+        _SUPER_FAST_MODE = False  # Disable super fast if fast is enabled
     print(f"[FastMode] {'ENABLED — generating at ~%d fps + RIFE x%d to %d fps (faster).' % (_FAST_MODE_FPS, _FAST_RIFE_FACTOR, FIXED_FPS) if _FAST_MODE else 'disabled — native 16 fps generation.'}")
-    return None
+    return gr.update(value=False) if enabled else gr.update()  # Return update for super_fast_mode_cb
+
+
+def _set_super_fast_mode(enabled: bool):
+    """UI handler: toggle super fast video generation (4 fps + RIFE x4)."""
+    global _FAST_MODE, _SUPER_FAST_MODE
+    _SUPER_FAST_MODE = bool(enabled)
+    if _SUPER_FAST_MODE:
+        _FAST_MODE = False  # Disable fast if super fast is enabled
+    print(f"[SuperFastMode] {'ENABLED — generating at ~%d fps + RIFE x%d to %d fps (fastest).' % (_SUPER_FAST_MODE_FPS, _SUPER_FAST_RIFE_FACTOR, FIXED_FPS) if _SUPER_FAST_MODE else 'disabled.'}")
+    return gr.update(value=False) if enabled else gr.update()  # Return update for fast_mode_cb
 
 
 def _fast_num_frames(duration_seconds: float) -> int:
-    """Fast-mode frame count for a segment: ~half the native frames (generate
-    at _FAST_MODE_FPS instead of FIXED_FPS), snapped to Wan's 4n+1 VAE layout,
-    capped so peak stays within the model's quality window."""
-    raw = int(round(float(duration_seconds) * _FAST_MODE_FPS))
+    """Fast-mode frame count for a segment: ~half (8 fps) or ~quarter (4 fps) the
+    native frames depending on mode, snapped to Wan's 4n+1 VAE layout, capped so
+    peak stays within the model's quality window."""
+    fps = _SUPER_FAST_MODE_FPS if _SUPER_FAST_MODE else _FAST_MODE_FPS
+    raw = int(round(float(duration_seconds) * fps))
     raw = int(np.clip(raw, MIN_FRAMES_MODEL, MAX_FRAMES_MODEL))
     n = round((raw - 1) / 4)
     frames = int(n) * 4 + 1
@@ -6464,12 +6484,19 @@ def generate_video(
 
         while remaining > 0.01:
             seg_duration = min(remaining, SEGMENT_DURATION)
-            # Fast mode: generate ~half the frames (native ~8 fps), then RIFE x2
-            # back to 16 fps below. The segment's real playback length must be
-            # measured at the rate we GENERATED (8 fps) so the chain accounts
-            # for the true duration and the total video length is preserved.
-            _gen_fps = _FAST_MODE_FPS if _FAST_MODE else FIXED_FPS
-            num_frames = _fast_num_frames(seg_duration) if _FAST_MODE else get_num_frames(seg_duration)
+            # Fast/Super Fast mode: generate at reduced fps, then RIFE interpolate
+            # back to 16 fps. The segment's real playback length must be measured
+            # at the rate we GENERATED so the chain accounts for true duration.
+            if _SUPER_FAST_MODE:
+                _gen_fps = _SUPER_FAST_MODE_FPS
+                num_frames = _fast_num_frames(seg_duration)
+            elif _FAST_MODE:
+                _gen_fps = _FAST_MODE_FPS
+                num_frames = _fast_num_frames(seg_duration)
+            else:
+                _gen_fps = FIXED_FPS
+                num_frames = get_num_frames(seg_duration)
+            
             # Actual playback length of this segment once snapped to the 4n+1
             # frame grid -- this is what actually ends up in the video, so the
             # chain must account for THIS, not the requested seg_duration, or
@@ -6505,9 +6532,12 @@ def generate_video(
                 _seg_progress,
             )
 
-            if _FAST_MODE:
-                # RIFE-interpolate the ~8 fps frames back up to 16 fps so the
-                # clip plays at full smoothness and correct length.
+            if _SUPER_FAST_MODE:
+                # RIFE-interpolate the ~4 fps frames back up to 16 fps (x4)
+                seg_frames = interpolate_bits(raw_frames, multiplier=_SUPER_FAST_RIFE_FACTOR)
+                seg_fps = _SUPER_FAST_MODE_FPS * _SUPER_FAST_RIFE_FACTOR   # == FIXED_FPS (16)
+            elif _FAST_MODE:
+                # RIFE-interpolate the ~8 fps frames back up to 16 fps (x2)
                 seg_frames = interpolate_bits(raw_frames, multiplier=_FAST_RIFE_FACTOR)
                 seg_fps = _FAST_MODE_FPS * _FAST_RIFE_FACTOR   # == FIXED_FPS (16)
             else:
@@ -6520,9 +6550,9 @@ def generate_video(
 
             seg_buf = encode_frames_to_bytes(seg_frames, fps=seg_fps, quality=int(export_quality))
             segment_bufs.append(seg_buf)
+            mode_label = ' [SUPERFAST]' if _SUPER_FAST_MODE else (' [FAST]' if _FAST_MODE else '')
             print(f"Segment {seg_index} complete ({actual_seg_duration:.2f}s, "
-                  f"{len(seg_frames)} frames @ {seg_fps} fps"
-                  f"{' [FAST]' if _FAST_MODE else ''})")
+                  f"{len(seg_frames)} frames @ {seg_fps} fps{mode_label})")
 
             # --- STREAMING: yield a growing preview after every segment ------
             # Concatenate all segments so far into a tmp file and yield it so
@@ -6601,12 +6631,31 @@ def generate_video(
     except gr.Error:
         _generation_release(_current_input_image_path)
         _generation_release(_end_image_protect_path)
+        # Re-raise gr.Error so Gradio shows it to the user, but ensure the
+        # generator properly terminates by yielding None before raising.
+        try:
+            yield None, None, gr.update(visible=True, value="Generation cancelled.")
+        except:
+            pass
         raise
     except Exception as e:
         _generation_release(_current_input_image_path)
         _generation_release(_end_image_protect_path)
         print(f"Generation error: {e}")
+        # Yield an error state before raising to ensure generator cleanup
+        try:
+            yield None, None, gr.update(visible=True, value=f"Error: {e}")
+        except:
+            pass
         raise gr.Error(f"Generation failed: {e}")
+    finally:
+        # Final cleanup: ensure resources are always released even if
+        # yields/raises above somehow didn't execute
+        try:
+            _generation_release(_current_input_image_path)
+            _generation_release(_end_image_protect_path)
+        except:
+            pass
 
 
 def _generate_video_blocking(*args, **kwargs):
@@ -6747,8 +6796,15 @@ def generate_sequence(
 
             while remaining > 0.01:
                 seg_duration = min(remaining, SEGMENT_DURATION)
-                _gen_fps = _FAST_MODE_FPS if _FAST_MODE else FIXED_FPS
-                num_frames = _fast_num_frames(seg_duration) if _FAST_MODE else get_num_frames(seg_duration)
+                if _SUPER_FAST_MODE:
+                    _gen_fps = _SUPER_FAST_MODE_FPS
+                    num_frames = _fast_num_frames(seg_duration)
+                elif _FAST_MODE:
+                    _gen_fps = _FAST_MODE_FPS
+                    num_frames = _fast_num_frames(seg_duration)
+                else:
+                    _gen_fps = FIXED_FPS
+                    num_frames = get_num_frames(seg_duration)
                 actual_seg_duration = num_frames / _gen_fps
                 part_seg_index += 1
                 seg_counter += 1
@@ -6765,7 +6821,10 @@ def generate_sequence(
                     lora_selections, selected_loras_info, progress,
                 )
 
-                if _FAST_MODE:
+                if _SUPER_FAST_MODE:
+                    seg_frames = interpolate_bits(raw_frames, multiplier=_SUPER_FAST_RIFE_FACTOR)
+                    seg_fps = _SUPER_FAST_MODE_FPS * _SUPER_FAST_RIFE_FACTOR
+                elif _FAST_MODE:
                     seg_frames = interpolate_bits(raw_frames, multiplier=_FAST_RIFE_FACTOR)
                     seg_fps = _FAST_MODE_FPS * _FAST_RIFE_FACTOR
                 else:
@@ -6778,9 +6837,9 @@ def generate_sequence(
 
                 seg_buf = encode_frames_to_bytes(seg_frames, fps=seg_fps, quality=int(export_quality))
                 all_segment_bufs.append(seg_buf)
+                mode_label = ' [SUPERFAST]' if _SUPER_FAST_MODE else (' [FAST]' if _FAST_MODE else '')
                 print(f"Sequence part {slot_idx + 1}/{n_slots} segment {part_seg_index} "
-                      f"complete ({actual_seg_duration:.2f}s, {len(seg_frames)} frames @ {seg_fps} fps"
-                      f"{' [FAST]' if _FAST_MODE else ''})")
+                      f"complete ({actual_seg_duration:.2f}s, {len(seg_frames)} frames @ {seg_fps} fps{mode_label})")
 
                 remaining -= actual_seg_duration
                 if remaining <= 0.01:
@@ -6825,6 +6884,13 @@ def generate_sequence(
             _generation_release(p)
         print(f"Sequence generation error: {e}")
         raise gr.Error(f"Sequence generation failed: {e}")
+    finally:
+        # Final cleanup: ensure all protected paths are released
+        try:
+            for p in protected_slot_paths:
+                _generation_release(p)
+        except:
+            pass
 
 
 
@@ -10277,16 +10343,71 @@ function init() {
         if (!lb) {
             lb = document.createElement('div');
             lb.id = 'picgen-lightbox';
-            lb.style.cssText = 'display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.92);z-index:9999;align-items:center;justify-content:center;cursor:zoom-out;';
-            lb.innerHTML = '<div style="position:relative;max-width:92vw;max-height:92vh;display:flex;align-items:center;justify-content:center;">'
-                + '<img id="picgen-lb-img" style="max-width:92vw;max-height:92vh;width:auto;height:auto;border-radius:6px;display:block;object-fit:contain;image-rendering:auto;box-shadow:0 8px 40px rgba(0,0,0,0.7);">'
-                + '<button id="picgen-lb-close" style="position:fixed;top:16px;right:20px;width:36px;height:36px;border-radius:50%;background:rgba(0,0,0,0.7);color:#fff;border:1px solid rgba(255,255,255,0.3);cursor:pointer;font-size:20px;line-height:1;display:flex;align-items:center;justify-content:center;z-index:10000;">\u00d7</button>'
+            // Full viewport overlay with flexbox centering
+            lb.style.cssText = 'display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.95);z-index:9999;align-items:center;justify-content:center;cursor:zoom-out;';
+            
+            // Inner container with controls
+            lb.innerHTML = '<div style="position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:20px;box-sizing:border-box;">'
+                // Close button (top right)
+                + '<button id="picgen-lb-close" title="Close (ESC)" style="position:fixed;top:20px;right:20px;width:44px;height:44px;border-radius:50%;background:rgba(0,0,0,0.8);color:#fff;border:2px solid rgba(255,255,255,0.4);cursor:pointer;font-size:24px;line-height:1;display:flex;align-items:center;justify-content:center;z-index:10001;transition:all 0.2s;">\u00d7</button>'
+                // Download button (top right, next to close)
+                + '<button id="picgen-lb-download" title="Download Image" style="position:fixed;top:20px;right:80px;width:44px;height:44px;border-radius:50%;background:rgba(0,0,0,0.8);color:#fff;border:2px solid rgba(255,255,255,0.4);cursor:pointer;font-size:18px;line-height:1;display:flex;align-items:center;justify-content:center;z-index:10001;transition:all 0.2s;">\u2B07</button>'
+                // Image - uses full available space
+                + '<img id="picgen-lb-img" style="max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;image-rendering:auto;box-shadow:0 0 60px rgba(0,0,0,0.9);border-radius:4px;">'
                 + '</div>';
             document.body.appendChild(lb);
-            lb.addEventListener('click', () => { lb.style.display = 'none'; });
-            document.getElementById('picgen-lb-close').addEventListener('click', (e) => { e.stopPropagation(); lb.style.display = 'none'; });
-            document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && lb.style.display === 'flex') lb.style.display = 'none'; });
+            
+            // Close on background click
+            lb.addEventListener('click', (e) => { 
+                if (e.target === lb || e.target.id === 'picgen-lb-img') { 
+                    lb.style.display = 'none'; 
+                }
+            });
+            
+            // Close button
+            document.getElementById('picgen-lb-close').addEventListener('click', (e) => { 
+                e.stopPropagation(); 
+                lb.style.display = 'none'; 
+            });
+            
+            // Download button
+            document.getElementById('picgen-lb-download').addEventListener('click', (e) => { 
+                e.stopPropagation();
+                const img = document.getElementById('picgen-lb-img');
+                if (img && img.src) {
+                    // Create temporary download link
+                    const a = document.createElement('a');
+                    a.href = img.src;
+                    a.download = 'picgen-image-' + Date.now() + '.png';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                }
+            });
+            
+            // Close on ESC key
+            document.addEventListener('keydown', (e) => { 
+                if (e.key === 'Escape' && lb.style.display === 'flex') {
+                    lb.style.display = 'none'; 
+                }
+            });
+            
+            // Hover effects for buttons
+            const btnClose = document.getElementById('picgen-lb-close');
+            const btnDownload = document.getElementById('picgen-lb-download');
+            [btnClose, btnDownload].forEach(btn => {
+                btn.addEventListener('mouseenter', () => {
+                    btn.style.background = 'rgba(255,255,255,0.2)';
+                    btn.style.borderColor = 'rgba(255,255,255,0.8)';
+                });
+                btn.addEventListener('mouseleave', () => {
+                    btn.style.background = 'rgba(0,0,0,0.8)';
+                    btn.style.borderColor = 'rgba(255,255,255,0.4)';
+                });
+            });
         }
+        
+        // Set the image and show lightbox
         document.getElementById('picgen-lb-img').src = b64;
         lb.style.display = 'flex';
     }
@@ -11201,6 +11322,18 @@ with gr.Blocks(css=css) as demo:
                     elem_id="fast-mode-cb",
                     scale=0,
                 )
+                super_fast_mode_cb = gr.Checkbox(
+                    label="⚡⚡ Super Fast Mode (~4x)",
+                    value=False,
+                    info=(
+                        "OFF by default. When checked, video is generated at quarter "
+                        "frames (~4 fps) and RIFE-interpolated x4 back to 16 fps — roughly "
+                        "4x faster. Tradeoff: more interpolation = more potential artifacts. "
+                        "Mutually exclusive with Fast Mode. Takes effect on next Generate."
+                    ),
+                    elem_id="super-fast-mode-cb",
+                    scale=0,
+                )
                 auto_download_cb = gr.Checkbox(
                     label="Auto-Download Videos",
                     value=True,
@@ -11213,13 +11346,19 @@ with gr.Blocks(css=css) as demo:
                     scale=0,
                 )
 
-            # Toggle the module-wide fast-mode flag the instant the box changes,
-            # so it applies on the next Generate without threading a param
-            # through every generator signature.
+            # Toggle the module-wide fast-mode flags the instant the boxes change,
+            # so they apply on the next Generate without threading params
+            # through every generator signature. The two modes are mutually exclusive.
             fast_mode_cb.change(
                 fn=_set_fast_mode,
                 inputs=[fast_mode_cb],
-                outputs=[],
+                outputs=[super_fast_mode_cb],  # Uncheck super fast if fast is enabled
+            )
+            
+            super_fast_mode_cb.change(
+                fn=_set_super_fast_mode,
+                inputs=[super_fast_mode_cb],
+                outputs=[fast_mode_cb],  # Uncheck fast if super fast is enabled
             )
 
             with gr.Row():
@@ -12718,7 +12857,7 @@ with gr.Blocks(css=css) as demo:
                         pic_run_button_top = gr.Button("Generate", variant="primary", size="lg")
                         pic_cancel_button_top = gr.Button("Cancel", variant="stop", size="sm")
                         pic_num_images = gr.Slider(
-                            label="Number of images", minimum=1, maximum=4, step=1, value=1,
+                            label="Number of images", minimum=1, maximum=10, step=1, value=1,
                         )
                         pic_prompt = gr.Textbox(
                             label="Prompt", show_label=True,
@@ -12751,10 +12890,10 @@ with gr.Blocks(css=css) as demo:
                             # Default to PREVIEW mode: big image on top with a
                             # thumbnail strip below, instead of the 2-column grid.
                             # preview=True makes the gallery open/stay in preview;
-                            # selected_index=0 selects the first image.
+                            # selected_index is NOT set here - we control it via yields
                             preview=True,
                             allow_preview=True,
-                            selected_index=0,
+                            selected_index=None,
                         )
                         # Live per-step progress shown as a normal block DIRECTLY
                         # UNDER the output gallery, only while generating. Its
@@ -12841,16 +12980,11 @@ with gr.Blocks(css=css) as demo:
                     true_guidance_scale, num_inference_steps, resolution,
                     num_images_per_prompt, face_match,
                 ):
-                    """Plain (non-generator) handler for the Generate button.
+                    """Generator handler for the Generate button that yields images in real-time.
 
-                    Using a plain function (not a generator/yield) is essential
-                    when running through a Cloudflare tunnel or any reverse proxy:
-                    generators use SSE streaming which proxies can buffer, stall,
-                    or drop before the first yield arrives.  A plain function
-                    returns exactly one response when it finishes — always works.
-
-                    Prints to terminal immediately on entry so the operator can
-                    confirm the click was received even before the GPU starts.
+                    This is now a generator that yields results as each image is generated,
+                    allowing users to see images appear one by one instead of waiting for
+                    the entire batch to complete.
 
                     Outputs order must match .click outputs=[pic_result, pic_seed, picgen_urls].
                     """
@@ -12871,26 +13005,41 @@ with gr.Blocks(css=css) as demo:
                     _total = max(1, num_inference_steps)
                     _picgen_cancel.clear()
                     _set_picgen_progress(0, _total, "Preparing", running=True)
-                    try:
-                        filepaths, seed_out, urls_json = infer(
-                            images_b64_json, prompt, negative_prompt, seed, randomize_seed,
-                            true_guidance_scale, num_inference_steps, resolution,
-                            num_images_per_prompt, None, face_match=face_match,
-                        )
-                    except gr.Error:
-                        _set_picgen_progress(_total, _total, "", running=False)
-                        raise
-                    except Exception as _e:
-                        _set_picgen_progress(_total, _total, "", running=False)
-                        raise gr.Error(f"Generation failed: {_e}") from None
+                    
+                    # Generate images one at a time and yield after each
+                    all_filepaths = []
+                    final_seed = seed
+                    
+                    for img_idx in range(num_images_per_prompt):
+                        # Use a different seed for each image if randomize is on
+                        current_seed = seed if not randomize_seed else random.randint(0, PICGEN_MAX_SEED)
+                        if img_idx == 0:
+                            final_seed = current_seed
+                        
+                        try:
+                            filepaths, seed_out, urls_json = infer(
+                                images_b64_json, prompt, negative_prompt, current_seed, False,
+                                true_guidance_scale, num_inference_steps, resolution,
+                                1, None, face_match=face_match,
+                            )
+                            all_filepaths.extend(filepaths)
+                            
+                            # Yield the accumulated results as a raw list.
+                            # The JavaScript watchPicgenGallery() handles selection:
+                            # - First image (count 0→1): auto-clicks first thumbnail
+                            # - Subsequent images: preserves user's selection
+                            urls_json_accumulated = json.dumps(all_filepaths)
+                            yield all_filepaths, final_seed, urls_json_accumulated
+                            
+                        except gr.Error:
+                            _set_picgen_progress(_total, _total, "", running=False)
+                            raise
+                        except Exception as _e:
+                            _set_picgen_progress(_total, _total, "", running=False)
+                            raise gr.Error(f"Generation failed: {_e}") from None
+                    
                     _set_picgen_progress(_total, _total, "Done", running=False)
                     print("DONE", flush=True)
-                    # Return the raw filepath list — NOT gr.update() — so
-                    # Gradio always treats this as a brand-new value and
-                    # re-renders the gallery completely, replacing old images.
-                    # gr.update(value=filepaths) with the same selected_index
-                    # as before can be a no-op if Gradio diffs the state.
-                    return filepaths, seed_out, urls_json
                 # No JS prehook needed: hidden_images_b64 is kept in sync
                 # with window.__uploadedImages by syncToGradio() (called on
                 # every add/remove/clear). Gradio reads it directly as the
@@ -13208,15 +13357,48 @@ with gr.Blocks(css=css) as demo:
     function attach() {
         var gal = document.getElementById('picgen-result-gallery');
         if (!gal) { setTimeout(attach, 500); return; }
+        
+        // Disable scroll anchoring completely
         gal.style.overflowAnchor = 'none';
+        document.body.style.overflowAnchor = 'none';
+        
+        // Save references to original scroll functions
+        var originalScrollTo = window.scrollTo;
+        var originalScrollIntoView = Element.prototype.scrollIntoView;
+        
         // Capture-phase: runs before Gradio's own handlers, so we can lock the
-        // scroll position around the DOM swap they trigger.
-        gal.addEventListener('click', function () {
+        // scroll position around the DOM swap they trigger. Extended to 30 frames
+        // (~0.5s) to handle slower renders when zoomed in.
+        gal.addEventListener('click', function (e) {
+            // Save current scroll position
             var x = window.scrollX, y = window.scrollY;
             var n = 0;
+            var isLocking = true;
+            
+            // Temporarily override scroll functions to prevent Gradio from scrolling
+            window.scrollTo = function(newX, newY) { 
+                if (isLocking) return;  // Block during lock period
+                originalScrollTo.call(window, newX, newY);
+            };
+            Element.prototype.scrollIntoView = function() { 
+                if (isLocking) return;  // Block during lock period
+                originalScrollIntoView.apply(this, arguments);
+            };
+            
             function lock() {
-                window.scrollTo(x, y);
-                if (++n < 20) requestAnimationFrame(lock);  // ~20 frames (~0.3s)
+                // Use original scrollTo to restore position
+                originalScrollTo.call(window, x, y);
+                if (++n < 30) {
+                    requestAnimationFrame(lock);
+                } else {
+                    // Release the lock after 30 frames
+                    isLocking = false;
+                    // Restore original functions after a delay
+                    setTimeout(function() {
+                        window.scrollTo = originalScrollTo;
+                        Element.prototype.scrollIntoView = originalScrollIntoView;
+                    }, 100);
+                }
             }
             requestAnimationFrame(lock);
         }, true);
@@ -13401,37 +13583,60 @@ with gr.Blocks(css=css) as demo:
         const gallery = document.getElementById('picgen-result-gallery');
         if (!gallery) { setTimeout(watchPicgenGallery, 500); return; }
 
-        // Force the FIRST result image to be the shown/selected one whenever a
-        // new result set renders. Gradio's gr.Gallery (preview mode) often
-        // lands on the last image after receiving a new value list; we counter
-        // that by clicking the first thumbnail once per new result set.
-        //
-        // We key off the set of image srcs so we only re-select when the
-        // CONTENT actually changes (a brand-new generation) — never on the
-        // user's own later thumbnail clicks within the same result set.
-        let _lastResultKey = '';
+        // Track the user's selection so we only auto-select the first image
+        // when a NEW generation batch starts, not on every progressive update.
+        // 
+        // The key insight: when images are added progressively (1 → 2 → 3),
+        // the count increases but we should NOT reset selection. We only reset
+        // when the count goes DOWN (previous results cleared) or when the user
+        // has NOT yet made a selection (first image of a new batch).
+        let _lastImageCount = 0;
+        let _userHasSelected = false;
+        
         function selectFirstResult() {
-            const thumbs = gallery.querySelectorAll('.thumbnail-item, .thumbnail-lg, button.thumbnail-item');
-            // Build a key from the current image sources to detect new content.
             const imgs = Array.from(gallery.querySelectorAll('img'));
-            if (imgs.length === 0) { _lastResultKey = ''; return; }
-            const key = imgs.map(im => im.src).join('|');
-            if (key === _lastResultKey) return;   // same set — leave user's selection alone
-            _lastResultKey = key;
-            // Prefer clicking the first thumbnail in the strip; fall back to the
-            // first gallery image/button if the thumbnail strip isn't present
-            // (e.g. a single-image result).
-            const firstThumb = gallery.querySelector('.thumbnail-item, .thumbnail-lg, button.thumbnail-item');
-            if (firstThumb) {
-                firstThumb.click();
+            const currentCount = imgs.length;
+            
+            if (currentCount === 0) {
+                _lastImageCount = 0;
+                _userHasSelected = false;
+                return;
+            }
+            
+            // If count decreased, it's a new generation batch (previous results cleared)
+            if (currentCount < _lastImageCount) {
+                _userHasSelected = false;
+            }
+            
+            // If count increased from 0 to 1, it's the first image of a new batch
+            if (_lastImageCount === 0 && currentCount === 1) {
+                _userHasSelected = false;
+            }
+            
+            _lastImageCount = currentCount;
+            
+            // Only auto-select the first image if the user hasn't made a selection yet
+            if (!_userHasSelected) {
+                const firstThumb = gallery.querySelector('.thumbnail-item, .thumbnail-lg, button.thumbnail-item');
+                if (firstThumb) {
+                    firstThumb.click();
+                    _userHasSelected = true;  // User can now freely select others
+                }
             }
         }
+        
+        // Track when user manually clicks a thumbnail (respect their choice)
+        gallery.addEventListener('click', (e) => {
+            const clickedThumb = e.target.closest('.thumbnail-item, .thumbnail-lg, button.thumbnail-item');
+            if (clickedThumb) {
+                _userHasSelected = true;
+            }
+        });
 
         // Watch for gallery content changes (new images rendered after generation)
         const obs = new MutationObserver(() => {
             patchGalleryDownloadButtons(gallery);
-            // Defer slightly so Gradio finishes its own render/selection first,
-            // then we override to image #1.
+            // Defer slightly so Gradio finishes its own render first
             setTimeout(selectFirstResult, 60);
         });
         obs.observe(gallery, { childList: true, subtree: true });
