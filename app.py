@@ -10573,7 +10573,14 @@ def _cache_preprocessed_images(images, resolution, condition_images, vae_images,
 
 
 def _find_starter_path(starter_num: int):
-    """Find a starter image file by number, trying .jpg / .png / .webp."""
+    """Find a starter image file by number, trying .jpg / .png / .webp.
+
+    Starter images are named simply by their number, e.g. 1.jpg .. 30.jpg.
+    The legacy start{n}.jpg naming is still accepted as a fallback."""
+    for ext in (".jpg", ".png", ".webp"):
+        p = os.path.join(SCRIPT_DIR, f"starters/{starter_num}{ext}")
+        if os.path.exists(p):
+            return p, ext
     for ext in (".jpg", ".png", ".webp"):
         p = os.path.join(SCRIPT_DIR, f"starters/start{starter_num}{ext}")
         if os.path.exists(p):
@@ -10593,7 +10600,7 @@ def add_starter_image(starter_num):
 
 
 def _build_starter_grid_html():
-    """Read starters/start1.jpg .. start10.jpg from disk, base64-encode each,
+    """Read starters/1.jpg .. 30.jpg from disk, base64-encode each,
     and return a self-contained HTML string with thumbnails + click buttons.
 
     Called ONCE at UI build time and used as the initial value of the starter
@@ -10604,8 +10611,10 @@ def _build_starter_grid_html():
     immediately when the app loads."""
     starters_dir = Path(SCRIPT_DIR) / "starters"
     cards = []
-    for n in range(1, 11):
-        p = starters_dir / f"start{n}.jpg"
+    for n in range(1, 31):
+        p = starters_dir / f"{n}.jpg"
+        if not p.exists():
+            p = starters_dir / f"start{n}.jpg"
         if p.exists():
             data = p.read_bytes()
             b64 = base64.b64encode(data).decode()
@@ -10622,7 +10631,7 @@ def _build_starter_grid_html():
             onclick = (
                 f"(function(){{"
                 f"var img=this.closest('.starter-card').querySelector('img');"
-                f"if(img&&window.__addImage)window.__addImage(img.src,'starter{n}.jpg');"
+                f"if(img&&window.__addImage)window.__addImage(img.src,'{n}.jpg');"
                 f"}}).call(this)"
             )
         else:
@@ -10647,11 +10656,11 @@ def _build_starter_grid_html():
       color:var(--body-text-color-subdued);background:var(--background-fill-primary);}}
     .starter-btn{{width:100%;border:none;border-top:1px solid var(--border-color-primary);
       background:var(--background-fill-secondary);color:var(--body-text-color);
-      font-size:12px;font-weight:700;padding:4px 0;cursor:pointer;text-align:center;
-      line-height:1.4;}}
+      font-size:8px;font-weight:700;padding:1px 0;cursor:pointer;text-align:center;
+      line-height:1.2;}}
     .starter-btn:hover:not([disabled]){{background:var(--color-accent);color:#fff;}}
     #starter-grid-container .prose{{margin:0!important;padding:0!important;}}
-    #starter-grid{{display:grid;grid-template-columns:repeat(10,1fr);gap:4px;width:100%;margin-bottom:8px;}}
+    #starter-grid{{display:grid;grid-template-columns:repeat(30,1fr);gap:1.5px;width:100%;margin-bottom:8px;}}
     </style>
     <div id="starter-grid">{grid_items}</div>
     """
