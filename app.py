@@ -802,30 +802,107 @@ except Exception:
     pass
 
 
+_SDPA_STATE = {"order": None}
+
+
+def _get_sdpa_order():
+    """Fastest EXACT attention kernels on this GPU, fastest first.
+
+    On first use, each exact PyTorch SDPA backend (cuDNN, flash, memory-efficient)
+    is checked against a float32 reference on a small problem and timed. A backend
+    is only allowed if its output matches, so this never trades accuracy for
+    speed: it only picks which exact kernel runs. The result is logged once and
+    cached. Returns [] (no hint, PyTorch default) if anything goes wrong."""
+    if _SDPA_STATE["order"] is not None:
+        return _SDPA_STATE["order"]
+    order = []
+    try:
+        import time as _t
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA not available")
+        dev = f"cuda:{torch.cuda.current_device()}"
+        gen = torch.Generator(device=dev).manual_seed(1234)
+        shape = (1, 40, 4096, 128)          # Wan 14B: 40 heads, head_dim 128
+        q = torch.randn(shape, device=dev, dtype=torch.bfloat16, generator=gen)
+        k = torch.randn(shape, device=dev, dtype=torch.bfloat16, generator=gen)
+        v = torch.randn(shape, device=dev, dtype=torch.bfloat16, generator=gen)
+        # Autocast is switched off for the whole check: the caller runs inside the
+        # pipeline's bf16 autocast, which would otherwise quietly turn this
+        # float32 reference into bf16 and weaken the comparison.
+        with torch.autocast(device_type="cuda", enabled=False):
+            with sdpa_kernel([SDPBackend.MATH]):
+                ref = torch.nn.functional.scaled_dot_product_attention(
+                    q[:, :1].float(), k[:, :1].float(), v[:, :1].float())
+        results = []
+        notes = []
+        for _name in ("CUDNN_ATTENTION", "FLASH_ATTENTION", "EFFICIENT_ATTENTION"):
+            _b = getattr(SDPBackend, _name, None)
+            if _b is None:
+                continue
+            try:
+                with torch.autocast(device_type="cuda", enabled=False), sdpa_kernel([_b]):
+                    out = torch.nn.functional.scaled_dot_product_attention(q, k, v)   # warm-up
+                    torch.cuda.synchronize()
+                    err = (out[:, :1].float() - ref).abs()
+                    if float(err.max()) > 0.05 or float(err.mean()) > 0.005:
+                        notes.append(f"{_name.split('_')[0].lower()}: rejected (output differs from reference)")
+                        continue
+                    t0 = _t.time()
+                    for _ in range(3):
+                        torch.nn.functional.scaled_dot_product_attention(q, k, v)
+                    torch.cuda.synchronize()
+                    results.append(((_t.time() - t0) / 3 * 1000.0, _b, _name.split('_')[0].lower()))
+            except Exception as _e:
+                notes.append(f"{_name.split('_')[0].lower()}: unavailable ({str(_e)[:60]})")
+        results.sort(key=lambda r: r[0])
+        fast_first = [r[1] for r in results]
+        # Keep every exact backend ALLOWED (as before) so a real call with a shape
+        # the probe did not cover can still find a kernel; the probe only decides
+        # which one is tried first.
+        rest = [getattr(SDPBackend, n) for n in
+                ("FLASH_ATTENTION", "EFFICIENT_ATTENTION", "CUDNN_ATTENTION")
+                if getattr(SDPBackend, n, None) is not None
+                and getattr(SDPBackend, n) not in fast_first]
+        order = (fast_first + rest) if fast_first else []
+        timing = ", ".join(f"{r[2]} {r[0]:.1f} ms" for r in results) or "none usable"
+        print(f"[SDPA] exact attention kernels on {dev}: {timing}"
+              + (f" | {'; '.join(notes)}" if notes else "")
+              + (f" -> tried in this order: {[r[2] for r in results]}" if fast_first else ""))
+        del q, k, v, ref
+    except Exception as _e:
+        print(f"[SDPA] kernel check skipped ({_e}); using PyTorch default selection.")
+        order = []
+    _SDPA_STATE["order"] = order
+    return order
+
+
 @contextlib.contextmanager
 def _fused_sdpa_backend():
-    """Force PyTorch SDPA to use the fused flash / mem-efficient / cuDNN kernels
-    (and drop the slow math fallback) for attention inside the block. This is
-    numerically exact — same attention, faster kernel — so no quality or
-    prompt-adherence change. Fully guarded: on any torch without the
-    torch.nn.attention API, it is a no-op and the code runs unchanged.
-    Used around the Wan video denoise loop and available for other GPU work.
-    """
+    """Run attention with the fastest exact kernel (see _get_sdpa_order) and never
+    fall back to the slow math path. Numerically the same attention, so no quality
+    or prompt-adherence change. If anything is unsupported it is a no-op.
+
+    Structured so that an exception raised INSIDE the with-block (for example an
+    out-of-memory error) propagates unchanged; the old version yielded a second
+    time in its except clause, which turned any such error into 'generator didn't
+    stop after throw()' and hid the real cause from the OOM recovery."""
+    cm = None
     try:
-        from torch.nn.attention import sdpa_kernel, SDPBackend
-        backends = []
-        for _name in ("FLASH_ATTENTION", "EFFICIENT_ATTENTION", "CUDNN_ATTENTION"):
-            _b = getattr(SDPBackend, _name, None)
-            if _b is not None:
-                backends.append(_b)
-        if not backends:
-            yield
-            return
-        with sdpa_kernel(backends):
-            yield
+        from torch.nn.attention import sdpa_kernel
+        order = _get_sdpa_order()
+        if order:
+            try:
+                cm = sdpa_kernel(order, set_priority=True)
+            except TypeError:
+                cm = sdpa_kernel(order)      # older torch: no priority ordering
     except Exception:
-        # Old torch / unsupported combo — run without the backend hint.
+        cm = None
+    if cm is None:
         yield
+    else:
+        with cm:
+            yield
 
 
 logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
@@ -1567,6 +1644,8 @@ def interpolate_bits(frames_np, multiplier=2, scale=1.0):
             if wan_pipe is not None and _active_model == "wan":
                 _disable_offload(wan_pipe, "wan")
                 _active_model = None
+        import time as _tm_rife
+        _t_rife0 = _tm_rife.time()
         model = _ensure_rife_loaded()
         I0 = I1 = mid_tensors = None
         try:
@@ -1609,6 +1688,8 @@ def interpolate_bits(frames_np, multiplier=2, scale=1.0):
                         pbar.update(50)
                 pbar.update(total_steps % 50)
                 output_frames.append(from_tensor(I1))
+            print(f"[Timing] RIFE x{multiplier}: {T} -> {len(output_frames)} frames "
+                  f"in {_tm_rife.time() - _t_rife0:.1f}s")
             return output_frames
         finally:
             del I0, I1, mid_tensors
@@ -1627,26 +1708,31 @@ def encode_frames_to_bytes(frames: list, fps: int, quality: int = 8) -> bytes:
     """
     import av as _av
     import numpy as _np
+    import time as _time
 
-    if not frames:
+    _t_enc0 = _time.time()
+    if frames is None or len(frames) == 0:
         raise ValueError("encode_frames_to_bytes: empty frame list")
 
-    pil_frames = []
-    for f in frames:
+    def _to_rgb_u8(f):
+        """One frame -> contiguous HxWx3 uint8, with no PIL round trip. Floats in
+        [0,1] are rounded to the nearest level (a plain astype truncates, which
+        darkens every pixel by up to one level)."""
         if isinstance(f, Image.Image):
-            pil_frames.append(f)
-        else:
-            arr = _np.asarray(f)
-            if arr.dtype != _np.uint8:
-                # Round to the nearest level (plain astype truncates, which
-                # darkens every pixel by up to one level).
-                arr = _np.rint(_np.clip(arr * 255.0, 0, 255)).astype(_np.uint8)
-            pil_frames.append(Image.fromarray(arr))
+            return _np.asarray(f.convert("RGB"))
+        a = _np.asarray(f)
+        if a.dtype != _np.uint8:
+            t = a.astype(_np.float32) * 255.0
+            _np.rint(t, out=t)
+            _np.clip(t, 0.0, 255.0, out=t)
+            a = t.astype(_np.uint8)
+        return a
 
+    _first = _to_rgb_u8(frames[0])
+    h0, w0 = _first.shape[0], _first.shape[1]
+    w = w0 if w0 % 2 == 0 else w0 - 1
+    h = h0 if h0 % 2 == 0 else h0 - 1
     buf = BytesIO()
-    w, h = pil_frames[0].size
-    w = w if w % 2 == 0 else w - 1
-    h = h if h % 2 == 0 else h - 1
 
     container = _av.open(buf, mode="w", format="mp4")
     stream = container.add_stream("libx264", rate=fps)
@@ -1672,10 +1758,11 @@ def encode_frames_to_bytes(frames: list, fps: int, quality: int = 8) -> bytes:
     except Exception:
         pass
 
-    for pil_frame in pil_frames:
-        if pil_frame.size != (w, h):
-            pil_frame = pil_frame.resize((w, h))
-        arr = _np.array(pil_frame.convert("RGB"))
+    for _i, _f in enumerate(frames):
+        arr = _first if _i == 0 else _to_rgb_u8(_f)
+        if arr.shape[0] != h or arr.shape[1] != w:
+            arr = arr[:h, :w]            # drop a stray odd row/column (never hit at 16-multiples)
+        arr = _np.ascontiguousarray(arr)
         av_frame = _av.VideoFrame.from_ndarray(arr, format="rgb24")
         for pkt in stream.encode(av_frame):
             container.mux(pkt)
@@ -1683,8 +1770,40 @@ def encode_frames_to_bytes(frames: list, fps: int, quality: int = 8) -> bytes:
     for pkt in stream.encode():  # flush
         container.mux(pkt)
     container.close()
-    return buf.getvalue()
+    _out = buf.getvalue()
+    print(f"[Timing] encode: {len(frames)} frames @ {w}x{h}, {fps} fps -> "
+          f"{len(_out) / 1e6:.1f} MB in {_time.time() - _t_enc0:.1f}s")
+    return _out
 
+
+
+class _SegmentEncoder:
+    """Encodes finished segments on a background thread while the GPU is already
+    working on the next one. The chain only needs the lossless last frame of a
+    segment (taken from the raw frames), not its MP4, so there is no reason to
+    wait for the encode. One worker keeps the segments in order and avoids
+    oversubscribing the CPU. Output is byte-for-byte what encoding inline gives."""
+
+    def __init__(self):
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        self._ex = _TPE(max_workers=1, thread_name_prefix="seg-encode")
+        self._futs = []
+
+    def submit(self, frames, fps, quality):
+        self._futs.append(self._ex.submit(encode_frames_to_bytes, frames, fps, quality))
+
+    def finished(self):
+        """MP4s of every segment EXCEPT the newest (which is still being encoded)."""
+        return [f.result() for f in self._futs[:-1]]
+
+    def all(self):
+        """MP4s of every segment, in order; waits for the last encode."""
+        out = [f.result() for f in self._futs]
+        self._ex.shutdown(wait=False)
+        return out
+
+    def __len__(self):
+        return len(self._futs)
 
 
 # ---------------------------------------------------------------------------
@@ -3193,6 +3312,65 @@ def _run_foley(video_path: str, sfx_prompt: str, output_wav: str) -> bool:
 
 
 
+class _VoicePrefetch:
+    """Generates the cloned voice in a background thread while the video is still
+    being made. The voice only needs the reference clip and the dialogue text, not
+    the video, so there is no reason to wait for the video first: the Chatterbox
+    worker is a separate process, and the end of the run just collects the result.
+    The audio produced is identical to generating it afterwards."""
+
+    def __init__(self, ref_path, text, speed):
+        self.ref_path, self.text, self.speed = ref_path, text, speed
+        self.ok = False
+        _d = Path("/dev/shm/newgen")
+        _d.mkdir(parents=True, exist_ok=True)
+        self.out = str(_d / f"pf_voice_{uuid.uuid4().hex[:8]}.wav")
+        self._t = threading.Thread(target=self._run, daemon=True, name="voice-prefetch")
+        self._t.start()
+
+    def _run(self):
+        try:
+            import time as _tm
+            _t0 = _tm.time()
+            self.ok = bool(_run_chatterbox(self.ref_path, self.text, self.out, speed=self.speed))
+            print(f"[Timing] voice (generated alongside the video): {_tm.time() - _t0:.1f}s")
+        except Exception as _e:
+            print(f"[AudioEngine] background voice generation failed: {_e}")
+            self.ok = False
+
+    def result(self):
+        """Wait for the voice; returns its wav path, or None if it failed."""
+        self._t.join()
+        if self.ok and os.path.exists(self.out) and os.path.getsize(self.out) > 0:
+            return self.out
+        return None
+
+
+def _start_voice_prefetch(ref_audio, dialogue_text, voice_speed, enabled=True):
+    """Start generating the voice now. Returns a _VoicePrefetch, or None when no
+    voice is wanted (switch off, no reference clip, or no dialogue)."""
+    try:
+        if VIDGEN_DISABLED or not enabled:
+            return None
+        if not (dialogue_text and str(dialogue_text).strip()):
+            return None
+        path = None
+        if ref_audio is not None:
+            if hasattr(ref_audio, "name"):
+                path = ref_audio.name
+            elif isinstance(ref_audio, dict):
+                path = ref_audio.get("path") or ref_audio.get("name") or ref_audio.get("url")
+            else:
+                path = str(ref_audio) if ref_audio else None
+        if not path or not os.path.exists(str(path)):
+            return None
+        print("[AudioEngine] Starting the voice now, in parallel with the video.")
+        return _VoicePrefetch(str(path), str(dialogue_text).strip(), float(voice_speed))
+    except Exception as _e:
+        print(f"[AudioEngine] could not start background voice ({_e}); it will run after the video.")
+        return None
+
+
 def add_audio_to_video(
     video_buf: bytes,
     sfx_prompt: str,
@@ -3203,6 +3381,7 @@ def add_audio_to_video(
     voice_speed: float = 1.0,
     enable_sfx: bool = True,
     enable_voice: bool = True,
+    prefetched_voice=None,
 ) -> bytes:
     """Dual-engine audio synthesis for a generated video.
 
@@ -3321,10 +3500,26 @@ def add_audio_to_video(
                 print("[AudioEngine] Voice skipped: no voice reference clip uploaded.")
         if voice_active:
             try:
-                # Lazily ensure Chatterbox-Turbo is installed and loaded.
-                # _run_chatterbox handles installation + GPU load on first call.
-                print(f"[AudioEngine] Running Chatterbox-Turbo voice clone... (speed={voice_speed:.2f})")
-                has_voice = _run_chatterbox(_ref_path, dialogue_text.strip(), voice_wav, speed=voice_speed)
+                # The voice may already have been made in the background while the
+                # video was generating; if so just collect it. Otherwise (or if
+                # that attempt failed) make it now, exactly as before.
+                if prefetched_voice is not None:
+                    import time as _tm_pf
+                    _tw0 = _tm_pf.time()
+                    _pre = prefetched_voice.result()
+                    if _pre:
+                        voice_wav = _pre
+                        _tmps.append(_pre)         # cleaned up with the other temp files
+                        has_voice = True
+                        print(f"[AudioEngine] Voice was ready from the background run "
+                              f"(waited {_tm_pf.time() - _tw0:.1f}s).")
+                    else:
+                        print("[AudioEngine] Background voice was not usable; generating it now.")
+                if not has_voice:
+                    # Lazily ensure Chatterbox-Turbo is installed and loaded.
+                    # _run_chatterbox handles installation + GPU load on first call.
+                    print(f"[AudioEngine] Running Chatterbox-Turbo voice clone... (speed={voice_speed:.2f})")
+                    has_voice = _run_chatterbox(_ref_path, dialogue_text.strip(), voice_wav, speed=voice_speed)
                 if has_voice:
                     print("[AudioEngine] Voice track generated.")
                 else:
@@ -4343,6 +4538,9 @@ def generate_lip_sync_video(
     """
     print(f"[LipSync] Starting Lip-Synced Speaking mode...")
     print(f"[LipSync] Parameters: bbox_shift={lipsync_bbox_shift}, batch_size={lipsync_batch_size}")
+    # Lip-sync always needs the voice, and it does not depend on the video:
+    # make it now, while the base video is being generated.
+    _ls_prefetch = _start_voice_prefetch(ref_aud, dlg_txt, float(v_speed), enabled=True)
     
     # Save current fast mode states and temporarily disable them for lip sync
     # MuseTalk needs native 16 fps video for accurate mouth tracking —
@@ -4420,7 +4618,18 @@ def generate_lip_sync_video(
             print(f"[LipSync]   Text length: {len(dlg_txt.strip())} characters")
             print(f"[LipSync]   Voice speed: {v_speed}")
             
-            ok = _run_chatterbox(str(_ref_path), dlg_txt.strip(), _voice_wav_path, speed=float(v_speed))
+            ok = False
+            if _ls_prefetch is not None:
+                _pre_wav = _ls_prefetch.result()
+                if _pre_wav:
+                    try:
+                        shutil.move(_pre_wav, _voice_wav_path)
+                        ok = True
+                        print("[LipSync] Voice was ready from the background run.")
+                    except Exception as _mv_e:
+                        print(f"[LipSync] could not use the background voice ({_mv_e}); regenerating.")
+            if not ok:
+                ok = _run_chatterbox(str(_ref_path), dlg_txt.strip(), _voice_wav_path, speed=float(v_speed))
             
             if ok and Path(_voice_wav_path).exists() and Path(_voice_wav_path).stat().st_size > 0:
                 voice_wav = _voice_wav_path
@@ -5048,9 +5257,9 @@ def apply_lora_settings(selected_loras_info, user_steps, user_flow_shift, flow_s
 
     final_steps = user_steps
     recommended_steps = merged_settings.get('recommended_steps')
-    if recommended_steps is not None and user_steps == 4:
+    if recommended_steps is not None and user_steps == VIDGEN_DEFAULT_STEPS:
         # Only apply the LoRA recommendation when the slider is still at the
-        # default value of 4 (meaning the user hasn't deliberately changed it).
+        # default value (VIDGEN_DEFAULT_STEPS; the user hasn't deliberately changed it).
         # If the user moved the slider to any other value, respect that choice.
         final_steps = recommended_steps
         messages.append(f"Steps set to {recommended_steps} (LoRA recommendation)")
@@ -5083,6 +5292,9 @@ for lora_id, info in AVAILABLE_LORAS.items():
 FIXED_FPS = 16
 
 WAN_STEPS = 3  # Default fallback, actual steps come from UI slider
+# Default for the video "Generation Steps" slider. The LoRA logic compares the
+# slider against this to tell "left at the default" from "changed by the user".
+VIDGEN_DEFAULT_STEPS = 3
 # 3.0 is the flow shift the WAMU Wan 2.2 I2V Lightning 4-step model ships with
 # (its scheduler_config.json). At 4 steps it puts 2 steps on the high-noise
 # expert and 2 on the low-noise (detail) expert.
@@ -5127,7 +5339,7 @@ MAX_DURATION = 600.0        # 10 minutes max via chaining
 # _FAST_MODE_FPS / _SUPER_FAST_MODE_FPS are the reduced native rates we generate
 # at; RIFE multiplies them back up to FIXED_FPS for playback.
 # ---------------------------------------------------------------------------
-_FAST_MODE = False
+_FAST_MODE = True          # Fast Mode is ON by default on the video tab (the checkbox below starts ticked too)
 _SUPER_FAST_MODE = False
 _FAST_MODE_FPS = 8
 _SUPER_FAST_MODE_FPS = 4
@@ -5499,6 +5711,18 @@ def _from_pretrained_cached(repo: str, **kwargs):
 
 
 _WAN_VAE_FP32_ENABLED = os.environ.get("NEWGEN_WAN_VAE_FP32", "1") != "0"
+# Seconds spent in the Wan VAE decode during the current generation (for the
+# [Timing] log line).
+_WAN_TIMING = {"decode": 0.0}
+
+# OPT-IN, off by default: https://github.com/Occipital-Labs/fastvae (pip install
+# fastvae) replaces the Wan VAE decoder with a fused Triton one, about 2.4x
+# faster on RTX PRO 6000 Blackwell in the project's own benchmark. Its numbers
+# are for a bf16 decode and it is not bit-identical to the reference decoder
+# (max error 4e-2 on a [-1, 1] output), so it is NOT used by default: the
+# float32 decode above is the higher-fidelity path. Set NEWGEN_FASTVAE=1 to
+# trade that fidelity for decode speed; A/B it on one video first.
+_FASTVAE_REQUESTED = os.environ.get("NEWGEN_FASTVAE", "0") == "1"
 
 
 def _set_wan_vae_precision(pipeline, full_precision: bool) -> bool:
@@ -5529,6 +5753,12 @@ def _set_wan_vae_precision(pipeline, full_precision: bool) -> bool:
                         pass
                     _res = None
                     _oom_hit = False
+                    import time as _tm_dec
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
+                    _td0 = _tm_dec.time()
                     try:
                         with torch.autocast(device_type="cuda", enabled=False):
                             _res = orig(*a, **kw)
@@ -5538,6 +5768,11 @@ def _set_wan_vae_precision(pipeline, full_precision: bool) -> bool:
                             raise
                         _oom_hit = True
                     if not _oom_hit:
+                        try:
+                            torch.cuda.synchronize()
+                        except Exception:
+                            pass
+                        _WAN_TIMING["decode"] += _tm_dec.time() - _td0
                         return _res
                     # The exception is cleared here, so the failed attempt's
                     # tensors can actually be released before the retry.
@@ -5578,6 +5813,81 @@ def _set_wan_vae_precision(pipeline, full_precision: bool) -> bool:
     except Exception as _e:
         print(f" WAN VAE: precision change skipped ({_e}).")
         return False
+
+
+_VAE_LAYOUT = {"tested": False, "use_cl3d": False}
+
+
+def _wan_vae_5d_params(vae):
+    return [p for p in vae.parameters() if p.dim() == 5]
+
+
+def _tune_wan_vae_layout():
+    """Pick the faster memory layout for the Wan VAE's 3D convolutions, once.
+
+    The existing `channels_last` call does nothing for 5D data; channels_last_3d is
+    the layout cuDNN prefers for 3D convolutions. It is only a memory layout (same
+    arithmetic), but whether it is faster here depends on the card and library
+    versions, so it is MEASURED: a small test latent is decoded with each layout,
+    and the new one is kept only if it is at least 8% faster AND the decoded
+    pictures agree closely. Otherwise nothing changes. The choice is re-applied
+    after every model swap (eviction restores the original layout).
+    NEWGEN_VAE_LAYOUT_TUNE=0 disables it. Never raises."""
+    try:
+        vae = wan_pipe.vae
+        if os.environ.get("NEWGEN_VAE_LAYOUT_TUNE", "1") == "0" or _FASTVAE_REQUESTED:
+            return
+        ps = _wan_vae_5d_params(vae)
+        if not ps or ps[0].device.type != "cuda":
+            return
+        cl3d = torch.channels_last_3d
+        if _VAE_LAYOUT["tested"]:
+            if _VAE_LAYOUT["use_cl3d"]:
+                for p in ps:
+                    if not p.data.is_contiguous(memory_format=cl3d):
+                        p.data = p.data.contiguous(memory_format=cl3d)
+            return
+        _VAE_LAYOUT["tested"] = True
+        import time as _tl
+        dec = getattr(vae, "_ng_orig_decode", None) or vae.decode
+        dtype = ps[0].dtype
+        dev = ps[0].device
+        gen = torch.Generator(device=dev).manual_seed(7)
+        z = torch.randn(1, int(vae.config.z_dim), 4, 48, 48, device=dev, dtype=dtype, generator=gen)
+
+        def _run():
+            with torch.no_grad(), torch.autocast(device_type="cuda", enabled=False):
+                o = dec(z, return_dict=False)[0]
+            torch.cuda.synchronize()
+            return o
+
+        def _time(n=3):
+            _run()                                   # warm-up / algorithm selection
+            t0 = _tl.time()
+            for _ in range(n):
+                o = _run()
+            return (_tl.time() - t0) / n, o
+
+        t_base, o_base = _time()
+        o_base = o_base.float().cpu()
+        saved = [(p, p.data) for p in ps]
+        for p in ps:
+            p.data = p.data.contiguous(memory_format=cl3d)
+        t_alt, o_alt = _time()
+        diff = float((o_alt.float().cpu() - o_base).abs().max())
+        keep = (t_alt < t_base * 0.92) and (diff < 0.02)
+        if not keep:
+            for p, d in saved:
+                p.data = d
+        _VAE_LAYOUT["use_cl3d"] = bool(keep)
+        print(f" WAN VAE layout test: default {t_base * 1000:.0f} ms, channels_last_3d "
+              f"{t_alt * 1000:.0f} ms, max picture difference {diff:.4f} -> "
+              f"{'using channels_last_3d' if keep else 'keeping the default layout'}.")
+        del z, o_base, o_alt
+    except Exception as _e:
+        print(f" WAN VAE layout test skipped ({_e}).")
+        _VAE_LAYOUT["tested"] = True
+        _VAE_LAYOUT["use_cl3d"] = False
 
 
 def _build_wan_pipeline(target_device="cpu"):
@@ -5647,7 +5957,19 @@ def _build_wan_pipeline(target_device="cpu"):
     # both are handled: weights to float32, and encode/decode shielded from
     # autocast. Costs a little decode time and ~1 GB; set
     # NEWGEN_WAN_VAE_FP32=0 to turn it off.
-    _set_wan_vae_precision(pipeline, True)
+    _fastvae_active = False
+    if _FASTVAE_REQUESTED:
+        try:
+            from fastvae import accelerate_vae
+            accelerate_vae(pipeline)
+            _fastvae_active = True
+            print(" WAN VAE: fastvae fused decoder ACTIVE (opt-in; bf16, not bit-identical "
+                  "to the reference decoder). Unset NEWGEN_FASTVAE to use the float32 decoder.")
+        except Exception as _e:
+            print(f" WAN VAE: fastvae requested but unavailable ({_e}); using the float32 decoder. "
+                  "Install it with: pip install fastvae")
+    if not _fastvae_active:
+        _set_wan_vae_precision(pipeline, True)
 
     # VAE memory format optimization: channels-last is 1.3-1.4x faster on Ampere
     # for conv3d operations (VAE decoder). Quality-neutral (same math, better memory access).
@@ -6614,6 +6936,42 @@ def edit_reference_frame(
     return edited
 
 
+# ---------------------------------------------------------------------------
+# Video generation Cancel.
+#
+# Pressing Cancel sets a flag. The generation checks it before each segment and
+# after every denoise step, so it stops within about one step (a few seconds;
+# a single GPU step cannot be interrupted part-way). Raising from the step
+# callback also skips the VAE decode, so no time is wasted finishing a video
+# that will be thrown away. Pressing Cancel when nothing is running does nothing:
+# the flag is cleared when the next generation starts.
+# ---------------------------------------------------------------------------
+_vidgen_cancel = threading.Event()
+
+
+class _VidgenCancelled(gr.Error):
+    """Raised inside a video generation after Cancel. It subclasses gr.Error so
+    every existing `except gr.Error` cleanup path (releasing the protected input
+    images, etc.) runs exactly as for any other early exit; the top-level
+    dispatcher catches this class specifically and finishes cleanly."""
+
+    def __init__(self):
+        super().__init__("Generation cancelled.")
+
+
+def _vidgen_check_cancel():
+    if _vidgen_cancel.is_set():
+        raise _VidgenCancelled()
+
+
+def _cancel_vidgen():
+    """Cancel button handler."""
+    _vidgen_cancel.set()
+    print("[Cancel] Video cancel requested: stopping at the next denoise step.")
+    return gr.update(visible=True,
+                     value="Cancelling... the current step finishes first (a few seconds).")
+
+
 @_gpu_serialized
 def animate_frame(
     frame: Image.Image,
@@ -6629,6 +6987,7 @@ def animate_frame(
     progress=None,
 ):
     """Stage 2  animate a frame with WAMU v2 merged model."""
+    _vidgen_check_cancel()      # cancelled while waiting: don't even swap the model in
     activate_wan()
 
     selected = {}
@@ -6653,6 +7012,8 @@ def animate_frame(
     steps = wan_steps if wan_steps is not None else WAN_STEPS
 
     with torch.cuda.device(WAN_DEVICE):
+        # Faster exact VAE layout: measured once, then re-applied after swaps.
+        _tune_wan_vae_layout()
         # Show the expert split for this run and keep a very high flow shift
         # (manual slider or a LoRA recommendation) from leaving the detail
         # expert with a single step. Applies to every video mode.
@@ -6682,33 +7043,51 @@ def animate_frame(
         # THIS segment) from the diffusion pipeline's per-step callback, so the
         # output-box progress advances smoothly during denoising instead of
         # freezing at the segment's starting percentage.
-        if callable(progress):
-            _total_steps = max(1, int(steps))
+        # Always installed (not only when a progress callback exists): it is also
+        # where Cancel is noticed, once per denoise step.
+        _total_steps = max(1, int(steps))
 
-            def _step_cb(pipe, step_index, timestep, cb_kwargs):
+        def _step_cb(pipe, step_index, timestep, cb_kwargs):
+            if _vidgen_cancel.is_set():
+                raise _VidgenCancelled()
+            if callable(progress):
                 try:
                     progress((step_index + 1) / _total_steps)
                 except Exception:
                     pass
-                return cb_kwargs
+            return cb_kwargs
 
-            kwargs["callback_on_step_end"] = _step_cb
+        kwargs["callback_on_step_end"] = _step_cb
 
         def _call_pipe(**kw):
             # bf16 autocast + fused SDPA backend: quality-neutral speedups for
             # the Wan denoise loop (exact math, faster attention/matmul kernels
             # on Blackwell). Both are guarded and fall back cleanly.
+            import time as _tm_pipe
+            _WAN_TIMING["decode"] = 0.0
+            _tp0 = _tm_pipe.time()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 with _fused_sdpa_backend():
                     try:
-                        return wan_pipe(**kw).frames[0]
+                        _frames = wan_pipe(**kw).frames[0]
                     except TypeError as e:
                         # Older pipeline without callback_on_step_end support:
                         # retry without the callback rather than failing.
                         if "callback_on_step_end" in str(e) and "callback_on_step_end" in kw:
                             kw.pop("callback_on_step_end", None)
-                            return wan_pipe(**kw).frames[0]
-                        raise
+                            _frames = wan_pipe(**kw).frames[0]
+                        else:
+                            raise
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            _ttot = _tm_pipe.time() - _tp0
+            _tdec = _WAN_TIMING.get("decode", 0.0)
+            print(f"[Timing] Wan segment: {_ttot:.1f}s total = "
+                  f"{max(0.0, _ttot - _tdec):.1f}s denoise+setup + {_tdec:.1f}s VAE decode "
+                  f"({kw.get('num_frames')} frames, {steps} steps)")
+            return _frames
 
         def _run(**kw):
             try:
@@ -7068,7 +7447,7 @@ def generate_video(
     dialogue_text="",
     voice_speed=0.85,
     negative_prompt=None,
-    edit_steps=4,
+    edit_steps=3,
     edit_guidance=1.0,
     flow_shift_auto=True,
     flow_shift=None,
@@ -7143,7 +7522,11 @@ def generate_video(
 
     current_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
     started = time.time()
-    segment_bufs = []  # list[bytes] — in-memory MP4 segments
+    segment_bufs = []  # list[bytes] — in-memory MP4 segments (filled from _seg_enc after the loop)
+    _seg_enc = _SegmentEncoder()   # encodes each segment while the next one denoises
+    # Voice does not depend on the video: make it while Wan is denoising.
+    _pf_voice = _start_voice_prefetch(ref_audio_path, dialogue_text, voice_speed,
+                                      enabled=bool(add_audio_cb))
 
     try:
         if progress is not None:
@@ -7179,6 +7562,7 @@ def generate_video(
         _P_START, _P_END = 0.15, 0.90
 
         while remaining > 0.01:
+            _vidgen_check_cancel()
             # Equal split over the planned segment count; the last one takes
             # whatever time is left, so frame rounding can never add a sliver
             # segment (an extra seam).
@@ -7248,26 +7632,30 @@ def generate_video(
                     seg_frames = list(raw_frames)
                 seg_fps = FIXED_FPS * factor
 
-            seg_buf = encode_frames_to_bytes(seg_frames, fps=seg_fps, quality=int(export_quality))
-            segment_bufs.append(seg_buf)
+            # Encode in the background; the next segment starts denoising right away.
+            _seg_enc.submit(seg_frames, seg_fps, int(export_quality))
             mode_label = ' [SUPERFAST]' if _SUPER_FAST_MODE else (' [FAST]' if _FAST_MODE else '')
             print(f"Segment {seg_index} complete ({actual_seg_duration:.2f}s, "
                   f"{len(seg_frames)} frames @ {seg_fps} fps{mode_label})")
 
             # --- STREAMING: yield a growing preview after every segment ------
-            # Concatenate all segments so far into a tmp file and yield it so
-            # Gradio updates the video component immediately.  Only do this when
-            # there are more segments still to generate (is_last_segment will get
-            # the final yield below after audio is added).
+            # Concatenate the segments encoded so far into a tmp file and yield it
+            # so Gradio updates the video component. Because each segment now
+            # encodes in the background (that overlap is the speedup), the preview
+            # runs one segment behind: it shows everything except the segment
+            # that was only just finished. Only done when more segments are still
+            # to come (the last one gets the final yield after audio is added).
             if not is_last_segment and total_segments > 1:
                 try:
-                    preview_buf = concatenate_videos(segment_bufs)
-                    preview_name = _media_name("vidgen_preview", ".mp4")
-                    preview_path = _write_video_tmp(preview_buf, preview_name)
-                    yield preview_path, preview_path, gr.update(visible=False, value="")
-                    # Clean up the preview tmp file — the browser has already
-                    # received it and the final video will replace it.
-                    _delete_video_tmp(preview_path)
+                    _prev_bufs = _seg_enc.finished()
+                    if _prev_bufs:
+                        preview_buf = concatenate_videos(_prev_bufs)
+                        preview_name = _media_name("vidgen_preview", ".mp4")
+                        preview_path = _write_video_tmp(preview_buf, preview_name)
+                        yield preview_path, preview_path, gr.update(visible=False, value="")
+                        # Clean up the preview tmp file — the browser has already
+                        # received it and the final video will replace it.
+                        _delete_video_tmp(preview_path)
                 except Exception as _prev_e:
                     print(f"[Streaming] preview yield failed (non-fatal): {_prev_e}")
             # ------------------------------------------------------------------
@@ -7277,16 +7665,18 @@ def generate_video(
             if remaining <= 0.01 or _segs_left <= 1:
                 break
 
-            nxt = _lossless_last_frame(raw_frames, seg_buf)
+            nxt = _lossless_last_frame(raw_frames, None)
             if nxt is None:
                 print("Could not read segment tail frame  stopping chain here.")
                 break
             current_frame = nxt
             seg_seed = random.randint(0, MAX_SEED)
 
-        if not segment_bufs:
+        if len(_seg_enc) == 0:
             raise gr.Error("No video segments were produced.")
 
+        segment_bufs = _seg_enc.all()   # waits only for the last segment's encode
+        _vidgen_check_cancel()          # cancelled during the last segment: skip audio too
         final_buf = concatenate_videos(segment_bufs)
 
         # Voice and SFX are independent switches. enable_sfx=None means a legacy
@@ -7301,6 +7691,7 @@ def generate_video(
                     voice_speed=float(voice_speed),
                     enable_sfx=_sfx_on,
                     enable_voice=_voice_on,
+                    prefetched_voice=_pf_voice,
                 )
             except Exception as e:
                 print(f"[AudioEngine] error in generate_video: {e}")
@@ -7396,7 +7787,7 @@ def generate_sequence(
     dialogue_text="",
     voice_speed=0.85,
     negative_prompt=None,
-    edit_steps=4,
+    edit_steps=3,
     edit_guidance=1.0,
     flow_shift_auto=True,
     flow_shift=None,
@@ -7460,7 +7851,11 @@ def generate_sequence(
 
     current_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
     started = time.time()
-    all_segment_bufs = []  # list[bytes] — in-memory MP4 segments
+    all_segment_bufs = []  # list[bytes] — in-memory MP4 segments (filled from _seg_enc after the loops)
+    _seg_enc = _SegmentEncoder()   # encodes each segment while the next one denoises
+    # Voice does not depend on the video: make it while Wan is denoising.
+    _pf_voice = _start_voice_prefetch(ref_audio_path, dialogue_text, voice_speed,
+                                      enabled=bool(add_audio_cb))
 
     try:
         n_slots = len(slots)
@@ -7495,6 +7890,7 @@ def generate_sequence(
             _seg_done = 0
 
             while remaining > 0.01:
+                _vidgen_check_cancel()
                 # Equal split over the planned count; the last segment takes the
                 # time left, so frame rounding never adds a sliver segment.
                 _segs_left = max(1, _n_seg_plan - _seg_done)
@@ -7538,8 +7934,8 @@ def generate_sequence(
                         seg_frames = list(raw_frames)
                     seg_fps = FIXED_FPS * factor
 
-                seg_buf = encode_frames_to_bytes(seg_frames, fps=seg_fps, quality=int(export_quality))
-                all_segment_bufs.append(seg_buf)
+                # Encode in the background; the next segment starts denoising right away.
+                _seg_enc.submit(seg_frames, seg_fps, int(export_quality))
                 mode_label = ' [SUPERFAST]' if _SUPER_FAST_MODE else (' [FAST]' if _FAST_MODE else '')
                 print(f"Sequence part {slot_idx + 1}/{n_slots} segment {part_seg_index} "
                       f"complete ({actual_seg_duration:.2f}s, {len(seg_frames)} frames @ {seg_fps} fps{mode_label})")
@@ -7549,16 +7945,18 @@ def generate_sequence(
                 if remaining <= 0.01 or _segs_left <= 1:
                     break
 
-                nxt = _lossless_last_frame(raw_frames, seg_buf)
+                nxt = _lossless_last_frame(raw_frames, None)
                 if nxt is None:
                     print("Could not read segment tail frame  stopping chain here.")
                     break
                 current_frame = nxt
                 seg_seed = random.randint(0, MAX_SEED)
 
-        if not all_segment_bufs:
+        if len(_seg_enc) == 0:
             raise gr.Error("No video segments were produced.")
 
+        all_segment_bufs = _seg_enc.all()   # waits only for the last segment's encode
+        _vidgen_check_cancel()              # cancelled during the last segment: skip audio too
         final_buf = concatenate_videos(all_segment_bufs)
 
         total_duration = sum(s["duration"] for s in slots)
@@ -7570,7 +7968,8 @@ def generate_sequence(
                                                audio_negative_prompt_tb, ref_audio_path, dialogue_text,
                                                voice_speed=float(voice_speed),
                                                enable_sfx=_sfx_on,
-                                               enable_voice=_voice_on)
+                                               enable_voice=_voice_on,
+                                               prefetched_voice=_pf_voice)
             except Exception as e:
                 print(f"[AudioEngine] error in generate_sequence: {e}")
 
@@ -7619,7 +8018,7 @@ def generate_custom_edit_sequence(
     dialogue_text="",
     voice_speed=0.85,
     negative_prompt=None,
-    edit_steps=4,
+    edit_steps=3,
     edit_guidance=1.0,
     flow_shift_auto=True,
     flow_shift=None,
@@ -7686,7 +8085,11 @@ def generate_custom_edit_sequence(
 
     current_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
     started = time.time()
-    all_segment_bufs = []  # list[bytes] — in-memory MP4 segments
+    all_segment_bufs = []  # list[bytes] — in-memory MP4 segments (filled from _seg_enc after the loops)
+    _seg_enc = _SegmentEncoder()   # encodes each segment while the next one denoises
+    # Voice does not depend on the video: make it while Wan is denoising.
+    _pf_voice = _start_voice_prefetch(ref_audio_path, dialogue_text, voice_speed,
+                                      enabled=bool(add_audio_cb))
     n_slots = len(slots)
     total_segments = sum(_plan_segments(s["duration"])[0] for s in slots)
     seg_counter = 0
@@ -7741,6 +8144,7 @@ def generate_custom_edit_sequence(
             _seg_done = 0
 
             while remaining > 0.01:
+                _vidgen_check_cancel()
                 # Equal split over the planned count; the last segment takes the
                 # time left, so frame rounding never adds a sliver segment.
                 _segs_left = max(1, _n_seg_plan - _seg_done)
@@ -7786,8 +8190,8 @@ def generate_custom_edit_sequence(
                         seg_frames = list(raw_frames)
                     seg_fps = FIXED_FPS * factor
 
-                seg_buf = encode_frames_to_bytes(seg_frames, fps=seg_fps, quality=int(export_quality))
-                all_segment_bufs.append(seg_buf)
+                # Encode in the background; the next segment starts denoising right away.
+                _seg_enc.submit(seg_frames, seg_fps, int(export_quality))
                 print(f"Custom seq {slot_idx + 1}/{n_slots} vidgen seg {part_seg_index} "
                       f"complete ({actual_seg_duration:.2f}s, {len(seg_frames)} frames @ {seg_fps} fps"
                       f"{' [SUPERFAST]' if _SUPER_FAST_MODE else (' [FAST]' if _FAST_MODE else '')})")
@@ -7797,7 +8201,7 @@ def generate_custom_edit_sequence(
                 if remaining <= 0.01 or _segs_left <= 1:
                     break
 
-                nxt = _lossless_last_frame(raw_frames, seg_buf)
+                nxt = _lossless_last_frame(raw_frames, None)
                 if nxt is None:
                     print("Could not read segment tail frame — stopping chain here.")
                     break
@@ -7807,9 +8211,11 @@ def generate_custom_edit_sequence(
             current_first = generated_last
             current_seed = random.randint(0, MAX_SEED)
 
-        if not all_segment_bufs:
+        if len(_seg_enc) == 0:
             raise gr.Error("No video segments were produced.")
 
+        all_segment_bufs = _seg_enc.all()   # waits only for the last segment's encode
+        _vidgen_check_cancel()              # cancelled during the last segment: skip audio too
         final_buf = concatenate_videos(all_segment_bufs)
 
         total_duration = sum(s["duration"] for s in slots)
@@ -7821,7 +8227,8 @@ def generate_custom_edit_sequence(
                                                audio_negative_prompt_tb, ref_audio_path, dialogue_text,
                                                voice_speed=float(voice_speed),
                                                enable_sfx=_sfx_on,
-                                               enable_voice=_voice_on)
+                                               enable_voice=_voice_on,
+                                               prefetched_voice=_pf_voice)
             except Exception as e:
                 print(f"[AudioEngine] error in generate_custom_edit_sequence: {e}")
 
@@ -7859,7 +8266,7 @@ def autorun_generate(
     dialogue_text="",
     voice_speed=0.85,
     vid_negative_prompt=None,
-    edit_steps=4,
+    edit_steps=3,
     edit_guidance=1.0,
     flow_shift_auto=True,
     flow_shift=None,
@@ -8941,6 +9348,287 @@ def _pipe_param_gb(pipe):
     return _gb
 
 
+# ---------------------------------------------------------------------------
+# Fast model swaps (Photo Editor <-> Video Generator)
+#
+# On this card only one of Wan / Qwen fits at a time, so every tab switch
+# evicts one model and uploads the other. Page-locking the weights is off
+# (it cost a full extra pass over the model on every switch).
+#
+#   NEWGEN_SWAP_KEEP_CPU=1  -> keep a CPU copy of BOTH models (instant eviction, but
+#                              roughly doubles host RAM use; off by default)
+#   NEWGEN_SWAP_BG_EVICT=0  -> disable the background CPU move described below
+#   NEWGEN_PIN_SWAP=1       -> bring back the old page-locking step
+#
+# Default swap (low RAM, only one model's weights in host RAM at a time):
+#   1. free just enough VRAM for the incoming model by moving the outgoing model's
+#      largest parts to CPU,
+#   2. upload the incoming model right away and mark it active,
+#   3. move the rest of the outgoing model to CPU in a background thread on its
+#      own CUDA stream, so it does not hold up or slow the model already running.
+# A later switch waits for that background move to finish before it starts.
+# ---------------------------------------------------------------------------
+_SWAP_KEEP_CPU = os.environ.get("NEWGEN_SWAP_KEEP_CPU", "0") == "1"
+_SWAP_BG_EVICT = os.environ.get("NEWGEN_SWAP_BG_EVICT", "1") != "0"
+# VRAM kept free beyond the incoming model's weights before it is declared ready, so
+# its first activations cannot hit OOM while the outgoing model is still leaving.
+_SWAP_HEADROOM_GB = {"wan": 20.0, "pic": 12.0}
+_SWAP_PIN = os.environ.get("NEWGEN_PIN_SWAP", "0") == "1"
+_cpu_masters = {}    # label -> {component_attr: (params {name: cpu_tensor}, buffers {...})}
+_SWAP_COMPONENT_ATTRS = ("transformer", "transformer_2", "text_encoder", "text_encoder_2",
+                         "vae", "image_encoder", "image_projection")
+
+
+def _swap_components(pipe):
+    for _attr in _SWAP_COMPONENT_ATTRS:
+        _comp = getattr(pipe, _attr, None)
+        if _comp is not None and hasattr(_comp, "named_parameters"):
+            yield _attr, _comp
+
+
+def _record_cpu_masters(pipe, label):
+    """Remember each weight's CPU copy before the pipeline is uploaded, so
+    eviction can restore it without copying anything back from the GPU. Costs no
+    extra memory at this moment (the CPU copy already exists); it only stops that
+    copy from being freed after the upload. Skipped when host RAM is tight."""
+    if not _SWAP_KEEP_CPU:
+        return False
+    try:
+        masters, nbytes = {}, 0
+        for attr, comp in _swap_components(pipe):
+            pm, bm = {}, {}
+            for n, p in comp.named_parameters():
+                # LoRA adapter tensors are never kept: they can be swapped while a
+                # model is on the GPU, and a stale copy must not be restored over a
+                # newer one. They always take the normal copy-back path.
+                if p.device.type == "cpu" and "lora_" not in n:
+                    pm[n] = p.data
+                    nbytes += p.numel() * p.element_size()
+            for n, b in comp.named_buffers():
+                if b is not None and b.device.type == "cpu" and "lora_" not in n:
+                    bm[n] = b.data
+                    nbytes += b.numel() * b.element_size()
+            masters[attr] = (pm, bm)
+        gb = nbytes / 1024**3
+        if gb < 1.0:
+            return label in _cpu_masters      # weights already on the GPU: keep what we have
+        # Keeping a CPU copy means BOTH models end up in host RAM at once (the
+        # resident one's copy plus the evicted one). Only do it when the machine
+        # has room for both plus headroom for the OS, the audio workers and the
+        # page cache; otherwise use the old copy-back path.
+        total_ram = 1e9
+        try:
+            with open("/proc/meminfo", "r") as _mf:
+                for _line in _mf:
+                    if _line.startswith("MemTotal:"):
+                        total_ram = int(_line.split()[1]) / (1024 * 1024)
+                        break
+        except Exception:
+            pass
+        _other = pic_pipe if label == "wan" else wan_pipe
+        try:
+            other_gb = _pipe_param_gb(_other) if _other is not None else 45.0
+        except Exception:
+            other_gb = 45.0
+        need = gb + other_gb + 24.0
+        if total_ram < need:
+            print(f"    [{label}] not keeping a CPU copy: {total_ram:.0f} GB RAM, both models "
+                  f"need ~{need:.0f} GB. Switching tabs will copy the weights back (slower).")
+            _cpu_masters.pop(label, None)
+            return False
+        _cpu_masters[label] = masters
+        print(f"    [{label}] keeping the {gb:.1f} GB CPU copy ({total_ram:.0f} GB RAM, ~{need:.0f} GB "
+              f"needed for both models) so switching tabs only has to upload.")
+        return True
+    except Exception as _e:
+        print(f"    [{label}] could not keep a CPU copy ({_e}); using the copy-back path.")
+        _cpu_masters.pop(label, None)
+        return False
+
+
+def _evict_to_cpu_masters(pipe, label):
+    """Return a GPU-resident pipeline to CPU by pointing each weight back at the
+    CPU copy kept by _record_cpu_masters. No GPU->CPU copy. Any tensor without a
+    matching kept copy (for example LoRA adapter weights) is copied back the
+    normal way, so the result is always complete and correct. Returns False if the
+    kept copy is unavailable and the caller should use the old path."""
+    masters = _cpu_masters.get(label)
+    if not masters:
+        return False
+    t0 = time.time()
+    restored = copied = 0
+
+    def _find(d, n):
+        # A loaded LoRA wraps a layer, renaming "x.weight" to "x.base_layer.weight";
+        # the base weight itself is unchanged, so look it up under the original name.
+        m = d.get(n)
+        if m is None and ".base_layer." in n:
+            m = d.get(n.replace(".base_layer.", "."))
+        return m
+
+    try:
+        for attr, comp in _swap_components(pipe):
+            pm, bm = masters.get(attr, ({}, {}))
+            for n, p in comp.named_parameters():
+                if p.device.type == "cpu":
+                    continue
+                m = _find(pm, n)
+                if m is not None and m.shape == p.shape and m.dtype == p.dtype:
+                    p.data = m
+                    restored += 1
+                else:
+                    p.data = p.data.to("cpu")
+                    copied += 1
+            for n, b in comp.named_buffers():
+                if b is None or b.device.type == "cpu":
+                    continue
+                m = _find(bm, n)
+                if m is not None and m.shape == b.shape and m.dtype == b.dtype:
+                    b.data = m
+                    restored += 1
+                else:
+                    b.data = b.data.to("cpu")
+                    copied += 1
+        pipe.to("cpu")                       # catches anything outside the listed components
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+        print(f"    [Swap] {label} evicted in {time.time() - t0:.1f}s without copying weights "
+              f"({restored} restored from the kept CPU copy, {copied} copied) - {free_gb:.1f} GB VRAM free")
+        return True
+    except Exception as _e:
+        print(f"    [Swap] fast eviction failed for {label} ({_e}); using the copy-back path.")
+        return False
+
+
+_bg_evict_thread = None
+
+
+def _join_bg_evict():
+    """Wait for a background CPU move started by an earlier swap, if one is running."""
+    global _bg_evict_thread
+    _t = _bg_evict_thread
+    if _t is not None and _t is not threading.current_thread() and _t.is_alive():
+        _w0 = time.time()
+        _t.join()
+        print(f"    [Swap] waited {time.time() - _w0:.1f}s for the previous model to finish moving to CPU")
+    if _t is not threading.current_thread():
+        _bg_evict_thread = None
+
+
+def _comp_gb(comp):
+    try:
+        return (sum(p.numel() * p.element_size() for p in comp.parameters())
+                + sum(b.numel() * b.element_size() for b in comp.buffers())) / 1024**3
+    except Exception:
+        return 0.0
+
+
+def _comp_on_cuda(comp):
+    try:
+        return any(p.device.type == "cuda" for p in comp.parameters()) or \
+               any(b.device.type == "cuda" for b in comp.buffers())
+    except Exception:
+        return False
+
+
+def _can_pipeline_swap(prev_label, prev_pipe, target_label, target_pipe, target_device):
+    """True when the outgoing model can leave the GPU in two stages (see the swap
+    notes above). Only for the plain full-residency case: no offload hooks on
+    either model, a card big enough to hold the incoming model fully, and no kept
+    CPU copy (that case already evicts instantly)."""
+    if not _SWAP_BG_EVICT or not torch.cuda.is_available() or DUAL_GPU:
+        return False
+    if prev_pipe is None or target_pipe is None:
+        return False
+    if _offload_state.get(prev_label) or _offload_state.get(target_label):
+        return False
+    if prev_label in _cpu_masters:
+        return False
+    try:
+        card_gb = _device_total_vram_gb(target_device)
+        return (card_gb >= FULL_RESIDENCY_VRAM_GB
+                and _pipe_param_gb(target_pipe) + 6.0 <= card_gb)
+    except Exception:
+        return False
+
+
+def _free_vram_for_incoming(prev_label, prev_pipe, target_label, target_pipe, target_device):
+    """Stage 1 of a swap: move the outgoing model's largest parts to CPU until the
+    incoming model fits with headroom. Returns the (attr, module) pairs that are
+    still on the GPU and should be moved by _start_bg_evict after the incoming
+    model is up. If the freed space is not enough, everything is moved here."""
+    _t0 = time.time()
+    idx = torch.device(target_device).index or 0
+    card_gb = _device_total_vram_gb(target_device)
+    need_gb = _pipe_param_gb(target_pipe) + _SWAP_HEADROOM_GB.get(target_label, 12.0)
+    need_gb = min(need_gb, card_gb - 1.0)
+
+    def _free():
+        return torch.cuda.mem_get_info(idx)[0] / 1024**3
+
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    comps = [(a, c) for a, c in _swap_components(prev_pipe) if _comp_on_cuda(c)]
+    comps.sort(key=lambda ac: _comp_gb(ac[1]), reverse=True)
+    done = []
+    for attr, comp in comps:
+        if _free() >= need_gb:
+            break
+        comp.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        done.append(attr)
+    deferred = [(a, c) for a, c in comps if a not in done]
+    if _free() < need_gb:
+        # Still short (for example another process holds VRAM): finish the
+        # eviction here, exactly like a normal swap.
+        for _a, c in deferred:
+            c.to("cpu")
+        prev_pipe.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        done += [a for a, _ in deferred]
+        deferred = []
+    print(f"    [Swap] {prev_label} released {len(done)} part(s) in {time.time() - _t0:.1f}s - "
+          f"{_free():.1f} GB VRAM free (need {need_gb:.1f}); "
+          f"{len(deferred)} part(s) will move to CPU in the background")
+    return deferred
+
+
+def _start_bg_evict(prev_label, prev_pipe, deferred, target_device):
+    """Stage 3 of a swap: move what is left of the outgoing model to CPU in a
+    background thread, on its own CUDA stream, while the incoming model works."""
+    global _bg_evict_thread
+    if not deferred:
+        return
+    idx = torch.device(target_device).index or 0
+    torch.cuda.synchronize()          # nothing the outgoing model ran is still in flight
+
+    def _run():
+        _t0 = time.time()
+        try:
+            with torch.cuda.device(idx):
+                _stream = torch.cuda.Stream(device=idx)
+                with torch.cuda.stream(_stream):
+                    for _a, _c in deferred:
+                        _c.to("cpu")
+                    prev_pipe.to("cpu")       # anything outside the listed parts
+                _stream.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()          # lets other processes (audio workers) use the space
+            print(f"    [Swap] {prev_label} finished moving to CPU in the background "
+                  f"({time.time() - _t0:.1f}s)")
+        except Exception as _e:
+            print(f"    [Swap] background move of {prev_label} to CPU failed: {_e}")
+
+    _bg_evict_thread = threading.Thread(target=_run, name=f"swap-evict-{prev_label}", daemon=True)
+    _bg_evict_thread.start()
+
+
 def _enable_offload(pipe, device, label):
     """Place a pipeline on GPU: full residency on big cards, else model-CPU-offload.
 
@@ -8958,7 +9646,10 @@ def _enable_offload(pipe, device, label):
     # pass), fall through to model-CPU-offload: same numerics, just streams.
     _pipe_gb = _pipe_param_gb(pipe)
     if total_vram >= FULL_RESIDENCY_VRAM_GB and _pipe_gb + 6.0 <= total_vram:
+        _t_up = time.time()
+        _record_cpu_masters(pipe, label)
         _safe_move_to_device(pipe, device)
+        print(f"    [Swap] {label} uploaded to {device} in {time.time() - _t_up:.1f}s")
         _offload_state[label] = False
         print(f"    [{label}] full residency on {device} (card {total_vram:.0f} GB, "
               f"pipeline {_pipe_gb:.1f} GB).")
@@ -9023,6 +9714,7 @@ def _disable_offload(pipe, label, force=False):
     the new model's load would preflight-fail with a bogus "not enough memory"
     even though the swap is exactly what should happen.
     """
+    _join_bg_evict()      # a background move of this (or the other) model must finish first
     if not _offload_state.get(label):
         # No offload hooks were installed (full-residency path on big card).
         _dev = PIC_DEVICE if label == "pic" else WAN_DEVICE
@@ -9033,9 +9725,16 @@ def _disable_offload(pipe, label, force=False):
         if not force and _card_gb >= BOTH_MODELS_FIT_GB:
             # Both models fit; keep this one resident — no CPU move needed.
             return
-        # Single-model residency: move to CPU, then pin weights for fast swap.
-        _safe_offload_to_cpu(pipe, label.title())
-        _pin_pipe_cpu_weights(pipe, label)
+        # Single-model residency: send it back to CPU. Normally this just points
+        # the weights back at the CPU copy kept at upload time (no copying); the
+        # old copy-back path is the fallback. Page-locking is off by default: it
+        # re-copied the whole model on every switch (see the swap notes above).
+        _t_ev = time.time()
+        if not _evict_to_cpu_masters(pipe, label):
+            _safe_offload_to_cpu(pipe, label.title())
+        if _SWAP_PIN:
+            _pin_pipe_cpu_weights(pipe, label)
+        print(f"    [Swap] {label} eviction took {time.time() - _t_ev:.1f}s")
         return
     try:
         from accelerate.hooks import remove_hook_from_module
@@ -9411,6 +10110,7 @@ def _activate_model(target):
             return
         if _active_model == target:
             return
+        _join_bg_evict()      # an earlier swap may still be moving its outgoing model to CPU
         previous = _active_model
         previous_pipe = wan_pipe if previous == "wan" else pic_pipe if previous == "pic" else None
         target_pipe = wan_pipe if target == "wan" else pic_pipe
@@ -9460,12 +10160,25 @@ def _activate_model(target):
                 _force_evict = True
 
         _active_model = "transitioning"
+        _t_swap0 = time.time()
         try:
             _release_rife()
+            _deferred = []
             if previous_pipe is not None:
-                _take_off_gpu(previous, previous_pipe, force=_force_evict)
+                if _force_evict and _can_pipeline_swap(previous, previous_pipe, target,
+                                                       target_pipe, target_device):
+                    # Free only what the incoming model needs, bring it up now, and
+                    # let the rest of the outgoing model leave in the background.
+                    _deferred = _free_vram_for_incoming(previous, previous_pipe, target,
+                                                        target_pipe, target_device)
+                else:
+                    _take_off_gpu(previous, previous_pipe, force=_force_evict)
             _place_on_gpu(target, target_pipe)
             _active_model = target
+            print(f"    [Swap] {previous or 'nothing'} -> {target} ready in "
+                  f"{time.time() - _t_swap0:.1f}s")
+            if _deferred:
+                _start_bg_evict(previous, previous_pipe, _deferred, target_device)
         except Exception:
             try:
                 _take_off_gpu(target, target_pipe)
@@ -10782,6 +11495,7 @@ def infer(
             # FA3 handles attention; no SDPA backend selection needed.
             yield
             return
+        _cm = None
         try:
             from torch.nn.attention import sdpa_kernel, SDPBackend
             backends = []
@@ -10789,14 +11503,18 @@ def infer(
                 _b = getattr(SDPBackend, _name, None)
                 if _b is not None:
                     backends.append(_b)
-            if not backends:
-                yield
-                return
-            with sdpa_kernel(backends):
-                yield
+            if backends:
+                _cm = sdpa_kernel(backends)
         except Exception:
-            # Any failure (old torch, unsupported combo) — run without the hint.
+            _cm = None          # old torch / unsupported combo: run without the hint
+        # A single yield, so an exception raised inside the with-block (e.g. an
+        # out-of-memory error) propagates unchanged instead of being turned into
+        # "generator didn't stop after throw()".
+        if _cm is None:
             yield
+        else:
+            with _cm:
+                yield
 
     try:
         # Register the live pipe so Cancel can flip its interrupt immediately.
@@ -11766,7 +12484,7 @@ def autorun_push_generate(
     dialogue_text="",
     voice_speed=0.85,
     vid_negative_prompt=None,
-    edit_steps=4,
+    edit_steps=3,
     edit_guidance=1.0,
     flow_shift_auto=True,
     flow_shift=None,
@@ -11798,6 +12516,7 @@ def autorun_push_generate(
             _set_push_state("idle")
             return
 
+        _vidgen_cancel.clear()    # a stale Cancel from earlier must not abort this item
         completed += 1
         status = f"Push autorun: processing {filename} (#{completed})"
         print(f"\n[AutorunPush] {status}")
@@ -12037,9 +12756,11 @@ with gr.Blocks(css=css) as demo:
         return gr.update(visible=True, value=f"? Cleared {cleaned} upload(s).")
 
     def clear_storage_full():
-        """Explicit user cleanup also releases every GPU resident object."""
+        """Explicit user cleanup frees uploads and GPU caches. It leaves the active
+        model on the GPU: unloading it only made the next generation (and every tab
+        switch afterwards) re-upload the whole model."""
         cleaned = _do_clear_storage()
-        _full_gpu_cleanup(offload_pipelines=True)
+        _full_gpu_cleanup(offload_pipelines=False)
         return gr.update(visible=True, value=f"? Cleared {cleaned} upload(s) and GPU caches.")
 
 
@@ -12067,9 +12788,9 @@ with gr.Blocks(css=css) as demo:
                 gr.HTML("<div style='flex:1'></div>")  # spacer pushes checkboxes right
                 fast_mode_cb = gr.Checkbox(
                     label="⚡ Fast Mode (~2x)",
-                    value=False,
+                    value=True,
                     info=(
-                        "OFF by default. When checked, video is generated at half the "
+                        "ON by default. When checked, video is generated at half the "
                         "frames (~8 fps) and RIFE-interpolated back to 16 fps — roughly "
                         "2x faster. Tradeoff: in-between frames are interpolated, so fast "
                         "motion may show mild artifacts. A short motion-speed hint is added "
@@ -12119,6 +12840,19 @@ with gr.Blocks(css=css) as demo:
                 fn=_set_super_fast_mode,
                 inputs=[super_fast_mode_cb],
                 outputs=[fast_mode_cb],  # Uncheck fast if super fast is enabled
+            )
+
+            # The mode flags live on the server, but the checkboxes start from
+            # their defaults on every page load. Show the REAL current state when
+            # a page opens (read-only: it never changes the mode), so a refresh
+            # can't make the boxes disagree with what Generate will actually do.
+            def _sync_fast_mode_boxes():
+                return gr.update(value=bool(_FAST_MODE)), gr.update(value=bool(_SUPER_FAST_MODE))
+
+            demo.load(
+                fn=_sync_fast_mode_boxes,
+                inputs=[],
+                outputs=[fast_mode_cb, super_fast_mode_cb],
             )
 
             with gr.Row():
@@ -12195,7 +12929,7 @@ with gr.Blocks(css=css) as demo:
                         return _set_duration
 
                     with gr.Row():
-                        for _dur_preset in (3.5, 6, 12, 18, 24, 30):
+                        for _dur_preset in (3.5, 5, 10, 15, 20, 25, 30):
                             _dur_btn = gr.Button(
                                 str(_dur_preset), size="sm", min_width=40,
                             )
@@ -12207,14 +12941,14 @@ with gr.Blocks(css=css) as demo:
                     
                     with gr.Row():
                         edit_steps = gr.Slider(
-                            1, 20, value=4, step=1,
+                            1, 20, value=VIDGEN_DEFAULT_STEPS, step=1,
                             label="Generation Steps",
                             info="Auto-set by LoRAs or manually override",
                         )
 
                     with gr.Group():
                         resolution = gr.Radio(
-                            choices=["240p", "480p", "600p", "720p", "1080p"], value="480p",
+                            choices=["240p", "480p", "600p", "720p", "1080p"], value="600p",
                             label="Resolution",
                             info="240p=ultra-fast/tiny, 480p=fast, 600p=balanced, 720p=high quality, 1080p=max (slow, VRAM heavy)",
                         )
@@ -12256,8 +12990,8 @@ with gr.Blocks(css=css) as demo:
                     generate_btn = gr.Button(
                         "Generate Video", variant="primary", size="lg", elem_id="generate-btn"
                     )
-                    clear_storage_btn_vid = gr.Button(
-                        "Clear Storage", variant="secondary", size="lg",
+                    cancel_vid_btn = gr.Button(
+                        "Cancel", variant="stop", size="lg", elem_id="vidgen-cancel-btn",
                     )
                     
                     with gr.Row():
@@ -12821,7 +13555,7 @@ with gr.Blocks(css=css) as demo:
                         selected[lora_id] = lora_info
                 
                 if not selected:
-                    return gr.update(visible=False, value=""), gr.update(value=4)
+                    return gr.update(visible=False, value=""), gr.update(value=VIDGEN_DEFAULT_STEPS)
                 
                 is_compatible, message, settings = check_lora_compatibility(selected)
                 
@@ -13275,7 +14009,7 @@ with gr.Blocks(css=css) as demo:
             ] + [lora_checkboxes[k] for k in AVAILABLE_LORAS if k in lora_checkboxes]
 
 
-            def _dispatch_generate(scene_mode_val, ref_image, prompt,
+            def _dispatch_generate_inner(scene_mode_val, ref_image, prompt,
                                    end_img, dur, res, fmul, qual, sd, rsd,
                                    audio_cb, audio_pt, audio_neg_pt,
                                    ref_aud, dlg_txt, v_speed,
@@ -13360,6 +14094,27 @@ with gr.Blocks(css=css) as demo:
                         bool(en_sfx),
                         *lora_args_inner,
                     )
+
+            def _dispatch_generate(*args):
+                """Runs a video generation (any mode) and ends cleanly if Cancel
+                is pressed: the output resets and the status says it was
+                cancelled, instead of an error popping up."""
+                # A Cancel pressed while nothing was running must not kill the
+                # next run. Only one generation runs at a time (this event has a
+                # concurrency limit of 1), so a previous run cannot still be
+                # checking the flag when this clears it.
+                _vidgen_cancel.clear()
+                try:
+                    yield from _dispatch_generate_inner(*args)
+                except _VidgenCancelled:
+                    print("[Cancel] Video generation cancelled.")
+                    try:
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    yield None, None, gr.update(visible=True, value="Generation cancelled.")
 
             generate_btn.click(
                 fn=_dispatch_generate,
@@ -13478,10 +14233,12 @@ with gr.Blocks(css=css) as demo:
                 js="(show) => { document.body.classList.toggle('hide-media', !show); }",
             )
 
-            clear_storage_btn_vid.click(
-                fn=clear_storage,
+            # Cancel runs as its own event, so it works while a generation is
+            # in progress (the generate event has its own concurrency slot).
+            cancel_vid_btn.click(
+                fn=_cancel_vidgen,
                 inputs=[],
-                outputs=[clear_storage_status],
+                outputs=[autorun_status],
             )
 
             def get_frame_as_file(video_source, timestamp):
@@ -14438,6 +15195,101 @@ with gr.Blocks(css=css) as demo:
 }
 """
     demo.load(fn=None, js=_picgen_live_js)
+
+    # Drag photos OUT of the Video Generator's photo inputs, exactly like the
+    # Photo Editor's input thumbnails. Picgen's thumbnails are plain <img>
+    # elements marked draggable, so the browser's own image drag carries them
+    # to other tabs and apps. Gradio's image boxes do not do that, so this marks
+    # their images draggable and hands the browser the image address plus the
+    # image as a File (fetched ahead of time, because a drag must start
+    # synchronously). The File is what lets a drop onto picgen's drop zone, or
+    # another file-accepting page, receive the actual photo.
+    _vidgen_drag_js = r"""
+() => {
+    if (window.__vidgenDragInit) return;
+    window.__vidgenDragInit = true;
+
+    var SELECTORS = ['#vidgen-reference', '#end-frame-image', '#merge-img-a',
+                     '#merge-img-b', '#merge-output-img', '[id^="sequence-image-"]'];
+
+    function abs(u) { try { return new URL(u, location.href).href; } catch (e) { return u; } }
+    function fileName(u) {
+        var n = '';
+        try { n = decodeURIComponent(new URL(u, location.href).pathname.split('/').pop() || ''); } catch (e) {}
+        if (!n || n.indexOf('.') < 0) n = 'photo.png';
+        return n;
+    }
+
+    // Fetch the photo ahead of time and keep it as a File for dragstart.
+    function prefetch(img) {
+        var src = img.currentSrc || img.src;
+        if (!src || img._ngSrc === src) return;
+        img._ngSrc = src;
+        img._ngFile = null;
+        fetch(src, { credentials: 'same-origin' })
+            .then(function (r) { return r.ok ? r.blob() : null; })
+            .then(function (b) {
+                if (b && img._ngSrc === src) {
+                    img._ngFile = new File([b], fileName(src), { type: b.type || 'image/png' });
+                }
+            })
+            .catch(function () {});
+    }
+
+    function onDragStart(e) {
+        var c = e.currentTarget;
+        var img = (e.target && e.target.tagName === 'IMG') ? e.target : c.querySelector('img');
+        if (!img) return;
+        var src = img.currentSrc || img.src;
+        var dt = e.dataTransfer;
+        if (!src || !dt) return;
+        var url = abs(src);
+        try { dt.effectAllowed = 'copyMove'; } catch (_) {}
+        try { dt.setData('text/uri-list', url); } catch (_) {}
+        try { dt.setData('text/plain', url); } catch (_) {}
+        if (src.indexOf('data:') !== 0) {
+            try {
+                dt.setData('DownloadURL',
+                    ((img._ngFile && img._ngFile.type) || 'image/png') + ':' + fileName(src) + ':' + url);
+            } catch (_) {}
+        }
+        if (img._ngFile) { try { dt.items.add(img._ngFile); } catch (_) {} }
+        try { dt.setDragImage(img, img.clientWidth / 2, img.clientHeight / 2); } catch (_) {}
+    }
+
+    function wire() {
+        SELECTORS.forEach(function (sel) {
+            document.querySelectorAll(sel).forEach(function (c) {
+                if (!c._ngDragWired) {
+                    c.addEventListener('dragstart', onDragStart, true);
+                    c._ngDragWired = true;
+                }
+                var imgs = c.querySelectorAll('img');
+                if (!imgs.length) return;           // empty upload box: nothing to drag
+                imgs.forEach(function (img) {
+                    if (img.getAttribute('draggable') !== 'true') img.setAttribute('draggable', 'true');
+                    img.style.cursor = 'grab';
+                    prefetch(img);
+                });
+                // Some Gradio layers sit on top of the image; make them draggable too.
+                c.querySelectorAll('.image-container, .image-frame, .upload-container').forEach(function (w) {
+                    if (w.getAttribute('draggable') !== 'true') w.setAttribute('draggable', 'true');
+                });
+            });
+        });
+    }
+
+    var timer = null;
+    new MutationObserver(function () {
+        if (timer) return;
+        timer = setTimeout(function () { timer = null; wire(); }, 120);
+    }).observe(document.body, { childList: true, subtree: true,
+                                attributes: true, attributeFilter: ['src', 'draggable'] });
+    setInterval(wire, 2000);
+    wire();
+}
+"""
+    demo.load(fn=None, js=_vidgen_drag_js)
 
     _picgen_dl_intercept_js = """
 () => {
