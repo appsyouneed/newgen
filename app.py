@@ -3985,23 +3985,51 @@ def generate_lip_sync_video(
       2. Generate F5-TTS voice WAV from the dialogue script.
       3. Run MuseTalk to replace the mouth region with audio-driven synthesis.
       4. Mix Foley SFX on top via the normal add_audio_to_video path.
+      
+    IMPORTANT: Temporarily disables Fast/Super Fast modes during base video
+    generation because MuseTalk requires native 16 fps video for accurate
+    lip sync. Interpolated frames confuse the mouth detection/tracking.
     """
     print(f"[LipSync] Starting Lip-Synced Speaking mode...")
     print(f"[LipSync] Parameters: bbox_shift={lipsync_bbox_shift}, batch_size={lipsync_batch_size}")
     
-    # Step 1: generate base video (with audio=False so we control audio ourselves)
-    print(f"[LipSync] Step 1/4: Generating base video...")
-    base_result = _generate_video_blocking(
-        ref_image,
-        # Append speaking cue to prompt so Wan poses the mouth open
-        (prompt or "") + ", subject speaking, mouth moving, talking, lips moving",
-        MODE_KEEP,      # always keep scene; user can replace BG in a prior step
-        end_img, dur, res, fmul, qual, sd, rsd,
-        False,          # no audio yet — we handle it below
-        audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
-        neg_pt, esteps, eguid, fsa, fs,
-        *lora_args,
-    )
+    # Save current fast mode states and temporarily disable them for lip sync
+    # MuseTalk needs native 16 fps video for accurate mouth tracking —
+    # RIFE-interpolated frames from fast modes cause poor lip sync quality
+    global _FAST_MODE, _SUPER_FAST_MODE
+    _saved_fast_mode = _FAST_MODE
+    _saved_super_fast_mode = _SUPER_FAST_MODE
+    
+    if _FAST_MODE or _SUPER_FAST_MODE:
+        print(f"[LipSync] ? Temporarily disabling fast modes for accurate lip sync...")
+        print(f"[LipSync]   Fast Mode was: {'ON' if _FAST_MODE else 'OFF'}")
+        print(f"[LipSync]   Super Fast Mode was: {'ON' if _SUPER_FAST_MODE else 'OFF'}")
+        _FAST_MODE = False
+        _SUPER_FAST_MODE = False
+    
+    try:
+        # Step 1: generate base video (with audio=False so we control audio ourselves)
+        print(f"[LipSync] Step 1/4: Generating base video at native 16 fps...")
+        base_result = _generate_video_blocking(
+            ref_image,
+            # Append speaking cue to prompt so Wan poses the mouth open
+            (prompt or "") + ", subject speaking, mouth moving, talking, lips moving",
+            MODE_KEEP,      # always keep scene; user can replace BG in a prior step
+            end_img, dur, res, fmul, qual, sd, rsd,
+            False,          # no audio yet — we handle it below
+            audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
+            neg_pt, esteps, eguid, fsa, fs,
+            *lora_args,
+        )
+    finally:
+        # Always restore fast mode states, even if generation fails
+        if _saved_fast_mode or _saved_super_fast_mode:
+            print(f"[LipSync] ? Restoring fast mode states...")
+            _FAST_MODE = _saved_fast_mode
+            _SUPER_FAST_MODE = _saved_super_fast_mode
+            print(f"[LipSync]   Fast Mode restored to: {'ON' if _FAST_MODE else 'OFF'}")
+            print(f"[LipSync]   Super Fast Mode restored to: {'ON' if _SUPER_FAST_MODE else 'OFF'}")
+    
     if base_result is None or base_result[0] is None:
         print("[LipSync] ERROR: Base video generation returned None")
         return None, None, "Lip-sync: base video generation failed."
@@ -6365,7 +6393,7 @@ def generate_video(
     audio_negative_prompt_tb="music, noise, wind, crowd",
     ref_audio_path=None,
     dialogue_text="",
-    voice_speed=0.8,
+    voice_speed=0.27,
     negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
@@ -6687,7 +6715,7 @@ def generate_sequence(
     audio_negative_prompt_tb="music, noise, wind, crowd",
     ref_audio_path=None,
     dialogue_text="",
-    voice_speed=0.8,
+    voice_speed=0.27,
     negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
@@ -6909,7 +6937,7 @@ def generate_custom_edit_sequence(
     audio_negative_prompt_tb="music, noise, wind, crowd",
     ref_audio_path=None,
     dialogue_text="",
-    voice_speed=0.8,
+    voice_speed=0.27,
     negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
@@ -7138,7 +7166,7 @@ def autorun_generate(
     audio_negative_prompt_tb,
     ref_audio_path=None,
     dialogue_text="",
-    voice_speed=0.8,
+    voice_speed=0.27,
     vid_negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
@@ -11012,7 +11040,7 @@ def autorun_push_generate(
     audio_negative_prompt_tb,
     ref_audio_path=None,
     dialogue_text="",
-    voice_speed=0.8,
+    voice_speed=0.27,
     vid_negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
@@ -11614,25 +11642,25 @@ with gr.Blocks(css=css) as demo:
                         lines=4, scale=1,
                     )
                 # -- Voice Speed ------------------------------------------------
-                gr.Markdown("**Voice Speed** — controls how fast the cloned voice speaks. 1.0 is natural; try 0.75–0.85 if she sounds rushed.")
+                gr.Markdown("**Voice Speed** — controls how fast the cloned voice speaks. Lower values = slower speech. All speeds reduced to 1/3 for better pacing.")
                 with gr.Row():
                     voice_speed_slider = gr.Slider(
                         label="Voice Speed",
-                        minimum=0.5,
-                        maximum=1.5,
-                        step=0.05,
-                        value=0.8,
+                        minimum=0.17,
+                        maximum=0.5,
+                        step=0.01,
+                        value=0.27,
                         scale=3,
                     )
                 with gr.Row():
-                    voice_speed_very_slow_btn = gr.Button("?? Very Slow (0.6)", size="sm", scale=1)
-                    voice_speed_slow_btn      = gr.Button("?? Slow (0.75)",     size="sm", scale=1)
-                    voice_speed_normal_btn    = gr.Button("??? Normal (1.0)",    size="sm", scale=1)
-                    voice_speed_fast_btn      = gr.Button("? Fast (1.2)",       size="sm", scale=1)
-                voice_speed_very_slow_btn.click(fn=lambda: 0.6,  outputs=[voice_speed_slider])
-                voice_speed_slow_btn.click(     fn=lambda: 0.75, outputs=[voice_speed_slider])
-                voice_speed_normal_btn.click(   fn=lambda: 1.0,  outputs=[voice_speed_slider])
-                voice_speed_fast_btn.click(     fn=lambda: 1.2,  outputs=[voice_speed_slider])
+                    voice_speed_very_slow_btn = gr.Button("?? Very Slow (0.2)", size="sm", scale=1)
+                    voice_speed_slow_btn      = gr.Button("?? Slow (0.25)",     size="sm", scale=1)
+                    voice_speed_normal_btn    = gr.Button("??? Normal (0.33)",    size="sm", scale=1)
+                    voice_speed_fast_btn      = gr.Button("? Fast (0.4)",       size="sm", scale=1)
+                voice_speed_very_slow_btn.click(fn=lambda: 0.2,  outputs=[voice_speed_slider])
+                voice_speed_slow_btn.click(     fn=lambda: 0.25, outputs=[voice_speed_slider])
+                voice_speed_normal_btn.click(   fn=lambda: 0.33,  outputs=[voice_speed_slider])
+                voice_speed_fast_btn.click(     fn=lambda: 0.4,  outputs=[voice_speed_slider])
 
                 # -- F5-TTS voice control quick-insert buttons ------------------
                 gr.Markdown(
