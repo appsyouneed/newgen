@@ -1260,6 +1260,7 @@ from prompts import (
     update_vid_prompt1, update_vid_prompt2, update_vid_prompt3, update_vid_prompt4,
     update_vid_prompt5, update_vid_prompt6, update_vid_prompt7, update_vid_prompt8,
     special_prompts_dict, update_special_prompt,
+    vid_special_prompts_dict, update_vid_special_prompt,
 )
 
 
@@ -12891,6 +12892,15 @@ with gr.Blocks(css=css) as demo:
                         label="Negative Prompt", value=default_negative_prompt, lines=2,
                     )
 
+                    # Full-width "Special Prompts" dropdown sitting under the
+                    # input section, mirroring the picgen tab's special-prompts
+                    # dropdown. Selecting an entry drops its text into vid_prompt.
+                    vid_special_prompt_dropdown = gr.Dropdown(
+                        label="Special Prompts",
+                        choices=list(vid_special_prompts_dict.keys()),
+                        value=None, interactive=True,
+                    )
+
                     scene_mode = gr.Radio(
                         choices=SCENE_MODES,
                         value=MODE_KEEP,
@@ -13896,6 +13906,7 @@ with gr.Blocks(css=css) as demo:
             vid_preset_dropdown6.change(fn=update_vid_prompt6, inputs=[vid_preset_dropdown6], outputs=[vid_prompt], scroll_to_output=False)
             vid_preset_dropdown7.change(fn=update_vid_prompt7, inputs=[vid_preset_dropdown7], outputs=[vid_prompt], scroll_to_output=False)
             vid_preset_dropdown8.change(fn=update_vid_prompt8, inputs=[vid_preset_dropdown8], outputs=[vid_prompt], scroll_to_output=False)
+            vid_special_prompt_dropdown.change(fn=update_vid_special_prompt, inputs=[vid_special_prompt_dropdown], outputs=[vid_prompt], scroll_to_output=False)
 
             def _noop_download(f, auto_download):
                 """Pass-through step for the download chain. The actual download
