@@ -12,6 +12,7 @@ import time
 import gc
 import uuid
 import threading
+import re
 import json
 import base64
 import hashlib
@@ -1637,7 +1638,9 @@ def encode_frames_to_bytes(frames: list, fps: int, quality: int = 8) -> bytes:
         else:
             arr = _np.asarray(f)
             if arr.dtype != _np.uint8:
-                arr = (arr * 255).clip(0, 255).astype(_np.uint8)
+                # Round to the nearest level (plain astype truncates, which
+                # darkens every pixel by up to one level).
+                arr = _np.rint(_np.clip(arr * 255.0, 0, 255)).astype(_np.uint8)
             pil_frames.append(Image.fromarray(arr))
 
     buf = BytesIO()
@@ -1650,8 +1653,24 @@ def encode_frames_to_bytes(frames: list, fps: int, quality: int = 8) -> bytes:
     stream.width = w
     stream.height = h
     stream.pix_fmt = "yuv420p"
-    crf = max(18, min(35, 36 - int(quality * 1.8)))
+    # Top quality setting (10) used to bottom out at CRF 18; at small sizes that
+    # visibly softens faces and fine detail. Quality 10 now encodes at CRF 12.
+    # Every other slider value keeps its previous mapping.
+    if int(quality) >= 10:
+        crf = 12
+    else:
+        crf = max(18, min(35, 36 - int(quality * 1.8)))
     stream.options = {"crf": str(crf), "preset": "fast"}
+    # Tag the colour matrix the converter actually used (BT.601, limited range).
+    # Untagged HD video is assumed to be BT.709 by players, which shifts hues
+    # and skin tones at 720p and above. Best-effort: older PyAV may not expose
+    # these attributes, in which case the tags are simply skipped.
+    try:
+        _cc = stream.codec_context
+        _cc.color_range = 1       # MPEG / limited
+        _cc.colorspace = 5        # BT.470BG (same YCbCr matrix as BT.601)
+    except Exception:
+        pass
 
     for pil_frame in pil_frames:
         if pil_frame.size != (w, h):
@@ -1669,11 +1688,12 @@ def encode_frames_to_bytes(frames: list, fps: int, quality: int = 8) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Dual Audio Engine: F5-TTS (voice cloning) + HunyuanVideo-Foley (SFX/Foley)
-# Replaces MMAudio completely.
+# Audio engines: Chatterbox-Turbo (English voice cloning) and MMAudio (SFX).
+# The two are independent: each has its own checkbox and its own venv.
 #
-# F5-TTS    — installed into its own venv at /root/newgen/.f5tts-venv and
-#              invoked via subprocess (isolated on purpose, see below).
+# Chatterbox — own venv (.chatterbox-venv), persistent GPU worker process
+#              (see _ensure_chatterbox / _run_chatterbox below).
+# (HunyuanVideo-Foley below is legacy and no longer used for SFX.)
 # HunyuanVideo-Foley — cloned repo at /root/newgen/HunyuanVideo-Foley,
 #              called via subprocess (it has no installable Python package).
 # ---------------------------------------------------------------------------
@@ -1696,9 +1716,22 @@ FOLEY_MODEL_DIR = Path(SCRIPT_DIR) / "HunyuanVideo-Foley-weights"
 # sys.executable is NEVER passed to pip for any of these engines.
 # ---------------------------------------------------------------------------
 
-# F5-TTS venv — isolated: protobuf>=6.33 conflict with Foley's <5.0
-F5_VENV_DIR = Path(SCRIPT_DIR) / ".f5tts-venv"
-F5_VENV_PY  = F5_VENV_DIR / "bin" / "python"
+# ---------------------------------------------------------------------------
+# Chatterbox-Turbo (English-only voice cloning, in-process on GPU).
+# Replaces the old F5-TTS subprocess/venv approach entirely.
+# Model is loaded once, kept resident on WAN_DEVICE, and reused for every
+# voice generation call — no subprocess spawn, no venv, no warm-up penalty.
+# ---------------------------------------------------------------------------
+# Runs in its OWN venv (chatterbox-tts pins torch==2.6.0 / transformers==5.2.0 /
+# numpy<2, which would downgrade the app's torch 2.8+cu128) as a persistent
+# worker process: the model loads onto the GPU once and stays resident.
+CHATTERBOX_VENV_DIR      = Path(SCRIPT_DIR) / ".chatterbox-venv"
+CHATTERBOX_VENV_PY       = CHATTERBOX_VENV_DIR / "bin" / "python"
+CHATTERBOX_WORKER_SCRIPT = Path(SCRIPT_DIR) / ".chatterbox_worker.py"
+_chatterbox_ready        = False
+_chatterbox_setup_lock   = threading.Lock()
+_chatterbox_daemon       = None
+_chatterbox_daemon_lock  = threading.RLock()
 
 # HunyuanVideo-Foley venv — isolated: protobuf<5.0, own torch copy
 FOLEY_VENV_DIR = Path(SCRIPT_DIR) / ".foley-venv"
@@ -1711,7 +1744,7 @@ MUSETALK_VENV_PY  = MUSETALK_VENV_DIR / "bin" / "python"
 
 # ---------------------------------------------------------------------------
 # MMAudio (video-to-audio SFX/ambience) — REPLACES HunyuanVideo-Foley for the
-# vidgen SFX branch. F5-TTS voice cloning is unchanged and still mixed on top.
+# vidgen SFX branch. Chatterbox voice cloning is independent and mixed on top.
 #
 # Uses the official hkchengrex/MMAudio framework (cloned + pip install -e .)
 # in its own isolated venv, driven by MMAudio's demo.py. The model weights are
@@ -1720,7 +1753,7 @@ MUSETALK_VENV_PY  = MUSETALK_VENV_DIR / "bin" / "python"
 # from hkchengrex/MMAudio.
 #
 # Everything here is installed/downloaded LAZILY at runtime — only the first
-# time a video is generated with "Add Audio" enabled — never at startup, and
+# time a video is generated with the SFX checkbox enabled — never at startup, and
 # never when vidgen is disabled (--novidgen).
 # ---------------------------------------------------------------------------
 MMAUDIO_REPO_DIR   = Path(SCRIPT_DIR) / "MMAudio"
@@ -1893,148 +1926,20 @@ def _ensure_audio_engines():
             print("[AudioEngine] Failed to pin huggingface-hub in Foley venv: "
                   f"{_foley_hub_result.stderr[-500:]}")
 
-    # --- F5-TTS (isolated venv) -----------------------------------------
-    # F5-TTS's dependency chain (via cached_path -> google-cloud-storage ->
-    # google-api-core) needs protobuf>=6.33.5, while HunyuanVideo-Foley's
-    # descript-audiotools dependency pins protobuf<5.0.0. Both requirements
-    # are real for the code paths that use them, so they cannot share one
-    # site-packages: installing whichever runs second just uninstalls the
-    # other's protobuf on disk. Worse, even if that install "worked", the
-    # main app process would still have the OLD protobuf module cached in
-    # sys.modules from whatever imported it first at startup ? a pip install
-    # after import never takes effect in the same process. So F5-TTS gets
-    # its own venv (like HunyuanVideo-Foley gets its own subprocess/cwd) and
-    # is invoked as a subprocess via _run_f5tts(), never imported in-process.
-    # If the venv exists but has a broken f5-tts install (e.g. 1.1.4 with
-    # missing configs/), reinstall the correct version automatically.
-    if F5_VENV_PY.exists():
-        _f5_check = subprocess.run(
-            [str(F5_VENV_PY), "-c",
-             "from f5_tts.api import F5TTS; import pathlib, f5_tts; "
-             "p=pathlib.Path(f5_tts.__file__).parent/'configs'/'F5-TTS.yaml'; "
-             "exit(0 if p.exists() else 1)"],
-            capture_output=True,
-        )
-        if _f5_check.returncode != 0:
-            print("[AudioEngine] f5-tts configs missing in existing venv — reinstalling correct version...")
-            result = subprocess.run(
-                [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-                 "--disable-pip-version-check", "--root-user-action=ignore",
-                 "f5-tts==1.1.22", "openai-whisper"],
-                capture_output=True,
-            )
-            if result.returncode == 0:
-                print("[AudioEngine] f5-tts reinstalled.")
-            else:
-                print("[AudioEngine] f5-tts reinstall failed — worker will write missing yaml at runtime.")
-
-    if not F5_VENV_PY.exists():
-        # Deliberately NOT --system-site-packages: if the venv could see the
-        # main env's protobuf, pip would treat it as "already satisfied" and
-        # skip installing the venv's own copy, defeating the isolation this
-        # venv exists for. Torch/torchaudio get reinstalled here too (an
-        # extra multi-GB download, one-time) so the venv's site-packages are
-        # fully self-contained and immune to whatever the main env does later.
-        print("[AudioEngine] Creating isolated venv for F5-TTS (this downloads "
-              "torch/torchaudio again, ~one-time cost, for full isolation)...")
-        subprocess.run([sys.executable, "-m", "venv", str(F5_VENV_DIR)], check=True)
-        subprocess.run(
-            [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-             "--disable-pip-version-check", "--root-user-action=ignore",
-             "--upgrade", "pip"],
-            check=True, capture_output=True,
-        )
-        subprocess.run(
-            [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-             "--disable-pip-version-check", "--root-user-action=ignore",
-             "torch", "torchaudio"],
-            check=True, capture_output=True,
-        )
-        # 1.1.22: latest stable. configs/ may not be bundled by pip, but the
-        # worker script writes the missing yaml itself at runtime if needed.
-        subprocess.run(
-            [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-             "--disable-pip-version-check", "--root-user-action=ignore",
-             "f5-tts==1.1.22"],
-            capture_output=True,
-        )
-        # openai-whisper: auto-transcribes the reference clip so F5-TTS knows
-        # the language and content of the voice sample it is cloning from.
-        subprocess.run(
-            [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-             "--disable-pip-version-check", "--root-user-action=ignore",
-             "openai-whisper"],
-            check=True, capture_output=True,
-        )
-        print("[AudioEngine] F5-TTS venv ready.")
-
-    # NOTE: SFX/ambience is now handled by MMAudio (see _ensure_mmaudio /
-    # _run_mmaudio), installed lazily on first audio-enabled video generation.
-    # HunyuanVideo-Foley is no longer set up here. This function now only
-    # provisions the F5-TTS voice-cloning venv.
-
-    _AUDIO_ENGINE_AVAILABLE = True
-    print("[AudioEngine] Voice engine ready (F5-TTS). SFX via MMAudio (lazy).")
+    # NOTE: this function is shadowed by the later _ensure_audio_engines
+    # definition below. Voice cloning (Chatterbox) is set up there.
+    _ensure_chatterbox()
 
 
 def _ensure_f5tts():
-    """One-time setup for F5-TTS voice cloning venv. Called lazily only when voice is requested."""
-    global _AUDIO_ENGINE_AVAILABLE
-
-    # Voice cloning is vidgen-only. Never set it up when vidgen is disabled.
-    if VIDGEN_DISABLED:
-        print("[AudioEngine] F5-TTS setup skipped — vidgen disabled (--novidgen).")
-        return
-
-    # F5-TTS venv setup (isolated from main app to avoid protobuf conflicts)
-    if F5_VENV_PY.exists():
-        _f5_check = subprocess.run(
-            [str(F5_VENV_PY), "-c",
-             "from f5_tts.api import F5TTS; import pathlib, f5_tts; "
-             "p=pathlib.Path(f5_tts.__file__).parent/'configs'/'F5-TTS.yaml'; "
-             "exit(0 if p.exists() else 1)"],
-            capture_output=True,
-        )
-        if _f5_check.returncode != 0:
-            print("[AudioEngine] f5-tts configs missing — reinstalling...")
-            subprocess.run(
-                [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-                 "--disable-pip-version-check", "--root-user-action=ignore",
-                 "f5-tts==1.1.22", "openai-whisper"],
-                capture_output=True,
-            )
-        _AUDIO_ENGINE_AVAILABLE = True
-        return
-
-    print("[AudioEngine] Creating isolated venv for F5-TTS (voice cloning, on-demand)...")
-    subprocess.run([sys.executable, "-m", "venv", str(F5_VENV_DIR)], check=True)
-    subprocess.run(
-        [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-         "--disable-pip-version-check", "--root-user-action=ignore",
-         "--upgrade", "pip"],
-        check=True, capture_output=True,
-    )
-    print("[AudioEngine] Installing torch/torchaudio into F5-TTS venv...")
-    subprocess.run(
-        [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-         "--disable-pip-version-check", "--root-user-action=ignore",
-         "torch", "torchaudio"],
-        check=True, capture_output=True,
-    )
-    print("[AudioEngine] Installing f5-tts...")
-    subprocess.run(
-        [str(F5_VENV_PY), "-m", "pip", "install", "--quiet",
-         "--disable-pip-version-check", "--root-user-action=ignore",
-         "f5-tts==1.1.22", "openai-whisper"],
-        capture_output=True,
-    )
-    print("[AudioEngine] F5-TTS venv ready (voice cloning).")
-    _AUDIO_ENGINE_AVAILABLE = True
+    """Compatibility shim (F5-TTS was replaced by Chatterbox-Turbo)."""
+    return _ensure_chatterbox()
 
 
 def _ensure_audio_engines():
-    """DEPRECATED: Kept for backward compatibility. Use _ensure_f5tts() or _ensure_mmaudio() instead."""
-    _ensure_f5tts()
+    """Set up the voice-cloning engine (Chatterbox-Turbo). SFX (MMAudio) is
+    set up lazily on its own."""
+    return _ensure_chatterbox()
 
 
 def _audio_engine_ready_for(add_audio_cb):
@@ -2046,215 +1951,491 @@ def _audio_engine_ready_for(add_audio_cb):
     audio still works. Never raises."""
     if not add_audio_cb:
         return False
-    if _AUDIO_ENGINE_AVAILABLE:
-        return True
-    try:
-        print("[AudioEngine] Audio requested — setting up engine on demand...")
-        _ensure_audio_engines()
-    except Exception as _e:
-        print(f"[AudioEngine] on-demand setup failed (non-fatal): {_e}")
-    return _AUDIO_ENGINE_AVAILABLE
+    # Voice (Chatterbox) and SFX (MMAudio) each set themselves up lazily at the
+    # point of use (_run_chatterbox / _run_mmaudio) and fail independently, so
+    # one engine failing never blocks the other.
+    return not VIDGEN_DISABLED
 
 
-F5_INFER_SCRIPT = Path(SCRIPT_DIR) / ".f5tts_infer_worker.py"
-
-_F5_INFER_WORKER_SOURCE = '''\
-"""Standalone F5-TTS inference worker. Run inside F5_VENV_PY only.
-Args: <json_payload_file>
-JSON keys: ref_file, gen_text, out_wav, ref_text (optional), speed (optional, default 1.0)
+# ---------------------------------------------------------------------------
+# Chatterbox-Turbo voice cloning (English only) -- persistent GPU worker.
+# ---------------------------------------------------------------------------
+_CHATTERBOX_WORKER_SOURCE = r'''
+"""Persistent Chatterbox-Turbo worker. Runs ONLY inside CHATTERBOX_VENV_PY.
+Usage: worker.py --daemon <device>
+stdin : one JSON job per line  {"ref","text","out_wav"} or {"cmd":"shutdown"}
+stdout: one JSON reply per line {"ready":true} / {"ok":bool,"error":str}
+All library noise is redirected to stderr.
 """
-import sys, json, os, pathlib, importlib.util, importlib.machinery, types as _types
+import sys, os, json, re, subprocess, tempfile, traceback
+_proto = sys.stdout
+sys.stdout = sys.stderr
 
-# ---------------------------------------------------------------------------
-# Stub wandb before any f5_tts import.
-# f5_tts.model.trainer does `import wandb` at module level (training dep,
-# not needed for inference). That triggers:
-#   wandb -> pydantic_core -> typing_extensions.Sentinel (missing on old system)
-# We replace wandb in sys.modules with a no-op stub BEFORE f5_tts is loaded.
-#
-# Critical: __spec__ must be a real ModuleSpec, NOT None.
-# accelerate/tracking.py calls importlib.util.find_spec("wandb") which does:
-#   if wandb.__spec__ is None: raise ValueError
-# A ModuleSpec("wandb", None) satisfies find_spec without triggering a real import.
-# ---------------------------------------------------------------------------
-_wandb_stub = _types.ModuleType("wandb")
-_wandb_stub.__spec__ = importlib.machinery.ModuleSpec("wandb", None)
-_wandb_stub.__version__ = "0.0.0"
-_wandb_stub.init   = lambda *a, **kw: None
-_wandb_stub.log    = lambda *a, **kw: None
-_wandb_stub.finish = lambda *a, **kw: None
-_wandb_stub.run    = None
-for _mod in list(sys.modules.keys()):
-    if _mod == "wandb" or _mod.startswith("wandb."):
-        sys.modules.pop(_mod, None)
-sys.modules["wandb"] = _wandb_stub
-# ---------------------------------------------------------------------------
+def send(obj):
+    _proto.write(json.dumps(obj) + "\n")
+    _proto.flush()
 
-def find_f5_pkg_dir():
-    spec = importlib.util.find_spec("f5_tts")
-    if spec and spec.submodule_search_locations:
-        return pathlib.Path(list(spec.submodule_search_locations)[0])
-    import f5_tts
-    if getattr(f5_tts, "__file__", None):
-        return pathlib.Path(f5_tts.__file__).parent
-    return pathlib.Path(list(f5_tts.__path__)[0])
+def split_text(text, max_chars=280):
+    text = " ".join(text.split())
+    sents = re.split(r"(?<=[.!?])\s+", text)
+    chunks, cur = [], ""
+    for s in sents:
+        s = s.strip()
+        while len(s) > max_chars:
+            cut = s.rfind(",", 0, max_chars)
+            if cut < 40:
+                cut = s.rfind(" ", 0, max_chars)
+            if cut < 1:
+                cut = max_chars - 1
+            piece, s = s[:cut + 1].strip(), s[cut + 1:].strip()
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            if piece:
+                chunks.append(piece)
+        if not s:
+            continue
+        if cur and len(cur) + 1 + len(s) > max_chars:
+            chunks.append(cur)
+            cur = s
+        else:
+            cur = (cur + " " + s).strip()
+    if cur:
+        chunks.append(cur)
+    return chunks
 
-def ensure_config():
-    pkg_dir  = find_f5_pkg_dir()
-    cfg_dir  = pkg_dir / "configs"
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    cfg_file = cfg_dir / "F5TTS_v1_Base.yaml"
-    if not cfg_file.exists():
-        # Exact structure required by api.py:
-        #   model_cfg.model.backbone  -> class name under f5_tts.model.*
-        #   model_cfg.model.arch      -> kwargs passed to model constructor
-        #   model_cfg.model.mel_spec  -> mel spectrogram settings
-        cfg_lines = [
-            "model:",
-            "  backbone: DiT",
-            "  arch:",
-            "    dim: 1024",
-            "    depth: 22",
-            "    heads: 16",
-            "    ff_mult: 2",
-            "    text_dim: 512",
-            "    conv_layers: 4",
-            "  mel_spec:",
-            "    target_sample_rate: 24000",
-            "    n_mel_channels: 100",
-            "    hop_length: 256",
-            "    win_length: 1024",
-            "    n_fft: 1024",
-            "    mel_spec_type: vocos",
-        ]
-        cfg_file.write_text(chr(10).join(cfg_lines) + chr(10))
-        print(f"[F5Worker] Wrote {cfg_file}")
-    return cfg_file
+def prepare_reference(ref, sr):
+    """Convert ANY input (wav/mp3/m4a/mp4...) to mono wav, trim leading/trailing
+    silence, and loop it up to >5.5 s (Chatterbox rejects prompts <= 5 s)."""
+    import numpy as np, soundfile as sf, librosa
+    tmp_in = tempfile.mktemp(suffix=".wav")
+    src = ref
+    try:
+        r = subprocess.run(["ffmpeg", "-y", "-i", ref, "-vn", "-ac", "1", "-ar", str(sr), tmp_in],
+                           capture_output=True)
+        if r.returncode == 0 and os.path.exists(tmp_in):
+            src = tmp_in
+    except Exception:
+        pass
+    y, _ = librosa.load(src, sr=sr, mono=True)
+    try:
+        os.unlink(tmp_in)
+    except Exception:
+        pass
+    if y.size == 0:
+        raise RuntimeError("reference audio is empty/unreadable")
+    yt, _ = librosa.effects.trim(y, top_db=35)
+    if yt.size > sr:
+        y = yt
+    min_len = int(5.6 * sr)
+    if y.size < min_len:
+        gap = np.zeros(int(0.15 * sr), dtype=y.dtype)
+        parts = [y]
+        total = y.size
+        while total < min_len:
+            parts += [gap, y]
+            total += gap.size + y.size
+        y = np.concatenate(parts)
+    out = tempfile.mktemp(suffix=".wav")
+    sf.write(out, y, sr)
+    return out
+
+PAUSE_RE = re.compile(
+    r"\[\s*(?:(very long|short|long)\s+)?pause(?:\s+(\d+(?:\.\d+)?)\s*s?)?\s*\]", re.I)
+PAUSE_SECS = {"": 0.6, "short": 0.3, "long": 1.2, "very long": 2.5}
+PARA_SECS = 0.8
+
+def parse_script(text):
+    """Split the script into ("text", str) and ("pause", seconds) parts.
+    Pause markers ([short pause], [pause], [long pause], [very long pause],
+    [pause 2s]) and blank lines (paragraph breaks) become real silence of an
+    exact length. They are removed from the text, so the model never sees them."""
+    parts = []
+
+    def add_text(seg):
+        paras = re.split(r"\n\s*\n", seg)
+        for k, p in enumerate(paras):
+            if k:
+                parts.append(("pause", PARA_SECS))
+            if p.strip():
+                parts.append(("text", p))
+
+    pos = 0
+    for m in PAUSE_RE.finditer(text):
+        add_text(text[pos:m.start()])
+        if m.group(2):
+            secs = float(m.group(2))
+        else:
+            secs = PAUSE_SECS[(m.group(1) or "").lower()]
+        parts.append(("pause", max(0.05, min(10.0, secs))))
+        pos = m.end()
+    add_text(text[pos:])
+    return parts
 
 def main():
-    with open(sys.argv[1], "r", encoding="utf-8") as fh:
-        p = json.load(fh)
-
-    ref_file = p["ref_file"]
-    gen_text = p["gen_text"]
-    out_wav  = p["out_wav"]
-    ref_text = p.get("ref_text", "").strip()
-    speed    = float(p.get("speed", 1.0))
-
-    if not ref_text:
+    device = sys.argv[2] if len(sys.argv) > 2 else "cuda:0"
+    import torch, numpy as np, soundfile as sf
+    from chatterbox.tts_turbo import ChatterboxTurboTTS
+    print("[CBWorker] loading Chatterbox-Turbo onto", device, flush=True)
+    model = ChatterboxTurboTTS.from_pretrained(device=device)
+    # Warm-up so the first real job is fast (CUDA kernels/autotune).
+    try:
+        warm = np.random.randn(int(6 * model.sr)).astype("float32") * 0.01
+        wp = tempfile.mktemp(suffix=".wav")
+        sf.write(wp, warm, model.sr)
+        model.generate("Warm up.", audio_prompt_path=wp)
+        os.unlink(wp)
+    except Exception as e:
+        print("[CBWorker] warm-up skipped:", e, flush=True)
+    send({"ready": True})
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
         try:
-            import whisper
-            result = whisper.load_model("base").transcribe(ref_file, language="en")
-            ref_text = result.get("text", "").strip()
-            print(f"[F5Worker] ref_text: {ref_text!r}")
+            job = json.loads(line)
+        except Exception:
+            continue
+        if job.get("cmd") == "shutdown":
+            break
+        ref_clean = None
+        try:
+            text = (job["text"] or "").strip()
+            if not text:
+                raise RuntimeError("empty text")
+            ref_clean = prepare_reference(job["ref"], model.sr)
+            model.prepare_conditionals(ref_clean)
+            parts = parse_script(text)
+            if not any(kind == "text" for kind, _ in parts):
+                raise RuntimeError("no speakable text (the script only contains pause markers)")
+            gap = np.zeros(int(0.18 * model.sr), dtype="float32")
+            pieces = []
+            n_chunks = 0
+            for kind, val in parts:
+                if kind == "pause":
+                    pieces.append(np.zeros(int(val * model.sr), dtype="float32"))
+                    continue
+                chunks = split_text(val)
+                for i, ch in enumerate(chunks):
+                    wav = model.generate(ch)  # conditionals already prepared
+                    arr = wav.squeeze(0).detach().cpu().numpy().astype("float32")
+                    if i:
+                        pieces.append(gap)
+                    pieces.append(arr)
+                    n_chunks += 1
+            print("[CBWorker] %d chunk(s), %d pause(s)" % (
+                n_chunks, sum(1 for k, _ in parts if k == "pause")), flush=True)
+            audio = np.concatenate(pieces)
+            peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+            if peak > 0.99:
+                audio = audio * (0.99 / peak)
+            sf.write(job["out_wav"], audio, model.sr)
+            send({"ok": True, "seconds": float(audio.size) / model.sr})
         except Exception as e:
-            print(f"[F5Worker] Whisper failed ({e}), using empty ref_text.")
-            ref_text = ""
-
-    ensure_config()
-
-    from f5_tts.api import F5TTS
-    model = F5TTS(model="F5TTS_v1_Base")
-    model.infer(
-        ref_file=ref_file,
-        ref_text=ref_text,
-        gen_text=gen_text,
-        file_wave=out_wav,
-        remove_silence=True,
-        speed=speed,
-    )
+            traceback.print_exc()
+            send({"ok": False, "error": str(e)})
+        finally:
+            if ref_clean:
+                try:
+                    os.unlink(ref_clean)
+                except Exception:
+                    pass
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
 '''
 
 
-def _run_f5tts(ref_file: str, gen_text: str, out_wav: str, speed: float = 1.0) -> bool:
-    """Run F5-TTS voice cloning in its isolated venv via subprocess.
-
-    Passes all arguments via a JSON temp file so spaces / special characters
-    in gen_text are never mangled by shell argument splitting.
-
-    speed < 1.0 slows the voice down; speed > 1.0 speeds it up (default 1.0).
-
-    Returns True if out_wav was produced with nonzero size.
-    """
-    print(f"[LipSync?F5-TTS] Starting voice generation...")
-    print(f"[LipSync?F5-TTS]   ref_file: {ref_file}")
-    print(f"[LipSync?F5-TTS]   gen_text: {gen_text[:100]}{'...' if len(gen_text) > 100 else ''}")
-    print(f"[LipSync?F5-TTS]   out_wav: {out_wav}")
-    print(f"[LipSync?F5-TTS]   speed: {speed}")
-    
-    if not F5_VENV_PY.exists():
-        print(f"[LipSync?F5-TTS] ERROR: F5-TTS venv missing at {F5_VENV_PY}")
+def _ensure_chatterbox() -> bool:
+    """Create the isolated Chatterbox venv and install everything it needs
+    (torch matching this GPU + chatterbox-tts with its pinned deps kept OUT of
+    the main environment). Idempotent. Returns True when usable."""
+    global _chatterbox_ready, _AUDIO_ENGINE_AVAILABLE
+    if VIDGEN_DISABLED:
+        print("[Chatterbox] setup skipped -- vidgen disabled (--novidgen).")
         return False
-    
-    if not os.path.exists(ref_file):
-        print(f"[LipSync?F5-TTS] ERROR: Reference audio file not found: {ref_file}")
-        return False
-    
-    ref_size = os.path.getsize(ref_file)
-    print(f"[LipSync?F5-TTS] Reference audio size: {ref_size / 1024:.1f} KB")
-    
-    # Always rewrite the worker script so fixes take effect without a server restart
-    F5_INFER_SCRIPT.write_text(_F5_INFER_WORKER_SOURCE)
-
-    # Write payload to a temp JSON file — avoids ALL shell-splitting issues
-    import tempfile
-    payload = {"ref_file": ref_file, "gen_text": gen_text, "out_wav": out_wav, "speed": float(speed)}
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tf:
-        json.dump(payload, tf)
-        payload_path = tf.name
-    
-    print(f"[LipSync?F5-TTS] Payload written to: {payload_path}")
-
-    try:
-        cmd = [str(F5_VENV_PY), str(F5_INFER_SCRIPT), payload_path]
-        print(f"[LipSync?F5-TTS] Running command: {' '.join(cmd)}")
-        print(f"[LipSync?F5-TTS] Starting inference (timeout: 300s)...")
-        
-        start_time = time.time()
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        elapsed = time.time() - start_time
-        
-        print(f"[LipSync?F5-TTS] Process completed in {elapsed:.1f}s with return code {result.returncode}")
-        
-        if result.stdout.strip():
-            print(f"[LipSync?F5-TTS] STDOUT: {result.stdout[-1000:]}")
-        
-        if result.returncode != 0:
-            print(f"[LipSync?F5-TTS] ERROR: Process failed with return code {result.returncode}")
-            print(f"[LipSync?F5-TTS] STDERR: {result.stderr[-2000:]}")
-            return False
-        
-        if not os.path.exists(out_wav):
-            print(f"[LipSync?F5-TTS] ERROR: Output WAV file was not created: {out_wav}")
-            return False
-        
-        out_size = os.path.getsize(out_wav)
-        print(f"[LipSync?F5-TTS] Output WAV size: {out_size / 1024:.1f} KB")
-        
-        if out_size == 0:
-            print(f"[LipSync?F5-TTS] ERROR: Output WAV file is empty")
-            return False
-        
-        print(f"[LipSync?F5-TTS] ? SUCCESS - Voice generation complete")
-        return True
-        
-    except subprocess.TimeoutExpired:
-        print("[LipSync?F5-TTS] ERROR: Process timed out after 300s")
-        return False
-    except Exception as e:
-        print(f"[LipSync?F5-TTS] ERROR: Exception occurred: {e}")
-        import traceback
-        print(f"[LipSync?F5-TTS] Traceback:\n{traceback.format_exc()}")
-        return False
-    finally:
+    with _chatterbox_setup_lock:
+        if _chatterbox_ready:
+            return True
         try:
-            os.unlink(payload_path)
-            print(f"[LipSync?F5-TTS] Cleaned up payload file")
-        except Exception as e:
-            print(f"[LipSync?F5-TTS] Failed to cleanup payload (non-fatal): {e}")
+            _PIP = ["--quiet", "--disable-pip-version-check",
+                    "--root-user-action=ignore", "--no-warn-conflicts"]
+
+            def _importable():
+                r = subprocess.run(
+                    [str(CHATTERBOX_VENV_PY), "-c",
+                     "import torch; assert torch.cuda.is_available(), 'CUDA not available in venv torch'; "
+                     "import chatterbox.tts_turbo, soundfile, librosa, perth"],
+                    capture_output=True, text=True, cwd="/tmp")
+                if r.returncode != 0:
+                    print(f"[Chatterbox] venv check failed: {r.stderr[-600:]}")
+                return r.returncode == 0
+
+            # Self-heal: a venv whose python is missing/broken is rebuilt from
+            # scratch; a venv without a working CUDA torch gets torch reinstalled
+            # (covers installs interrupted half-way through).
+            def _venv_python_ok():
+                if not CHATTERBOX_VENV_PY.exists():
+                    return False
+                return subprocess.run([str(CHATTERBOX_VENV_PY), "-c", "import sys"],
+                                      capture_output=True, cwd="/tmp").returncode == 0
+
+            if not _venv_python_ok():
+                print("[Chatterbox] Creating isolated venv ...")
+                shutil.rmtree(CHATTERBOX_VENV_DIR, ignore_errors=True)
+                subprocess.run([sys.executable, "-m", "venv", str(CHATTERBOX_VENV_DIR)], check=True)
+                subprocess.run([str(CHATTERBOX_VENV_PY), "-m", "pip", "install"] + _PIP +
+                               ["--upgrade", "pip", "setuptools", "wheel"],
+                               check=False, capture_output=True)
+
+            if subprocess.run([str(CHATTERBOX_VENV_PY), "-c", "import torch, torchaudio"],
+                              capture_output=True, cwd="/tmp").returncode != 0:
+                print(f"[Chatterbox] Installing torch/torchaudio ({GPU_TORCH_IDX}) ...")
+                subprocess.run([str(CHATTERBOX_VENV_PY), "-m", "pip", "install"] + _PIP +
+                               ["--index-url", GPU_TORCH_IDX, "torch", "torchaudio"],
+                               check=True, capture_output=True)
+
+            if not _importable():
+                # Pin torch/torchaudio so nothing below can swap the CUDA build.
+                _v = subprocess.run(
+                    [str(CHATTERBOX_VENV_PY), "-c",
+                     "import torch, torchaudio; print(torch.__version__); print(torchaudio.__version__)"],
+                    capture_output=True, text=True, cwd="/tmp")
+                _lines = [l.strip() for l in _v.stdout.splitlines() if l.strip()]
+                _cons = CHATTERBOX_VENV_DIR / "constraints.txt"
+                if len(_lines) >= 2:
+                    _cons.write_text(f"torch=={_lines[0]}\ntorchaudio=={_lines[1]}\n")
+                _c = ["-c", str(_cons)] if _cons.exists() else []
+
+                print("[Chatterbox] Installing chatterbox-tts (no-deps) + dependencies ...")
+                _r = subprocess.run(
+                    [str(CHATTERBOX_VENV_PY), "-m", "pip", "install"] + _PIP + _c +
+                    ["--no-deps", "chatterbox-tts"],
+                    capture_output=True, text=True)
+                if _r.returncode != 0:
+                    print(f"[Chatterbox] chatterbox-tts install failed: {_r.stderr[-1000:]}")
+                    return False
+                _deps = [
+                    "numpy>=1.24.0,<2.0.0; python_version < '3.13'",
+                    "numpy>=2.0.0; python_version >= '3.13'",
+                    "librosa==0.11.0", "s3tokenizer", "transformers==5.2.0",
+                    "diffusers==0.29.0", "conformer==0.3.2", "safetensors==0.5.3",
+                    "spacy-pkuseg", "pykakasi==2.3.0", "pyloudnorm", "omegaconf",
+                    "soundfile", "huggingface_hub", "einops", "onnx",
+                ]
+                _r = subprocess.run(
+                    [str(CHATTERBOX_VENV_PY), "-m", "pip", "install"] + _PIP + _c + _deps,
+                    capture_output=True, text=True)
+                if _r.returncode != 0:
+                    print(f"[Chatterbox] dependency install failed: {_r.stderr[-1500:]}")
+                    return False
+                # Watermarker used by chatterbox (PyPI first, git fallback).
+                _r = subprocess.run(
+                    [str(CHATTERBOX_VENV_PY), "-m", "pip", "install"] + _PIP + _c + ["resemble-perth"],
+                    capture_output=True, text=True)
+                if _r.returncode != 0:
+                    _r = subprocess.run(
+                        [str(CHATTERBOX_VENV_PY), "-m", "pip", "install"] + _PIP + _c +
+                        ["git+https://github.com/resemble-ai/Perth.git@master"],
+                        capture_output=True, text=True)
+                    if _r.returncode != 0:
+                        print(f"[Chatterbox] resemble-perth install failed: {_r.stderr[-1000:]}")
+                        return False
+                if not _importable():
+                    return False
+
+            _chatterbox_ready = True
+            _AUDIO_ENGINE_AVAILABLE = True
+            print("[Chatterbox] Ready (English voice cloning).")
+            return True
+        except Exception as _e:
+            import traceback as _tb
+            print(f"[Chatterbox] setup failed: {_e}\n{_tb.format_exc()}")
+            return False
+
+
+def _chatterbox_daemon_alive():
+    return _chatterbox_daemon is not None and _chatterbox_daemon.poll() is None
+
+
+def _start_chatterbox_daemon() -> bool:
+    """Start (or reuse) the persistent worker; blocks until the model is loaded
+    on the GPU and warmed up."""
+    global _chatterbox_daemon
+    import time as _t
+    with _chatterbox_daemon_lock:
+        if _chatterbox_daemon_alive():
+            return True
+        CHATTERBOX_WORKER_SCRIPT.write_text(_CHATTERBOX_WORKER_SOURCE)
+        _env = {k: v for k, v in os.environ.items()}
+        _env["PYTHONUNBUFFERED"] = "1"
+        _env["TOKENIZERS_PARALLELISM"] = "false"
+        print(f"[Chatterbox] starting persistent worker on {PIC_DEVICE} (model stays resident) ...")
+        try:
+            _chatterbox_daemon = subprocess.Popen(
+                [str(CHATTERBOX_VENV_PY), "-u", str(CHATTERBOX_WORKER_SCRIPT), "--daemon", PIC_DEVICE],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
+                env=_env, text=True, bufsize=1, cwd="/tmp",
+            )
+        except Exception as _e:
+            print(f"[Chatterbox] failed to start worker: {_e}")
+            _chatterbox_daemon = None
+            return False
+        _deadline = _t.time() + 900
+        while _t.time() < _deadline:
+            line = _chatterbox_daemon.stdout.readline()
+            if not line:
+                if _chatterbox_daemon.poll() is not None:
+                    print("[Chatterbox] worker exited during startup.")
+                    _chatterbox_daemon = None
+                    return False
+                continue
+            try:
+                msg = json.loads(line.strip())
+            except Exception:
+                continue
+            if msg.get("ready"):
+                print("[Chatterbox] worker ready (model resident on GPU).")
+                return True
+        print("[Chatterbox] worker did not report ready in time.")
+        try:
+            _chatterbox_daemon.kill()
+        except Exception:
+            pass
+        _chatterbox_daemon = None
+        return False
+
+
+def _chatterbox_job(payload, timeout=900):
+    """Send one job to the worker; returns the reply dict or None."""
+    global _chatterbox_daemon
+    import time as _t
+    with _chatterbox_daemon_lock:
+        for _attempt in range(2):
+            if not _start_chatterbox_daemon():
+                return None
+            try:
+                _chatterbox_daemon.stdin.write(json.dumps(payload) + "\n")
+                _chatterbox_daemon.stdin.flush()
+            except Exception as _e:
+                print(f"[Chatterbox] write failed ({_e}); restarting worker ...")
+                try:
+                    _chatterbox_daemon.kill()
+                except Exception:
+                    pass
+                _chatterbox_daemon = None
+                continue
+            _deadline = _t.time() + timeout
+            reply = None
+            while _t.time() < _deadline:
+                line = _chatterbox_daemon.stdout.readline()
+                if not line:
+                    if _chatterbox_daemon.poll() is not None:
+                        print("[Chatterbox] worker died mid-job.")
+                        break
+                    continue
+                try:
+                    msg = json.loads(line.strip())
+                except Exception:
+                    continue
+                if "ok" in msg:
+                    reply = msg
+                    break
+            if reply is None:
+                try:
+                    if _chatterbox_daemon is not None:
+                        _chatterbox_daemon.kill()
+                except Exception:
+                    pass
+                _chatterbox_daemon = None
+                continue
+            return reply
+    return None
+
+
+def _shutdown_chatterbox_daemon():
+    global _chatterbox_daemon
+    with _chatterbox_daemon_lock:
+        d = _chatterbox_daemon
+        _chatterbox_daemon = None
+        if d is None:
+            return
+        try:
+            if d.poll() is None:
+                try:
+                    d.stdin.write(json.dumps({"cmd": "shutdown"}) + "\n")
+                    d.stdin.flush()
+                    d.wait(timeout=5)
+                except Exception:
+                    d.kill()
+        except Exception:
+            pass
+
+
+import atexit as _atexit_cb
+_atexit_cb.register(_shutdown_chatterbox_daemon)
+
+
+def _run_chatterbox(ref_file: str, gen_text: str, out_wav: str,
+                    speed: float = 1.0) -> bool:
+    """Speak gen_text in the voice cloned from ref_file (English only) and write
+    a WAV to out_wav. speed: 1.0 = natural pace of the reference voice, applied
+    as a pitch-preserving tempo change (clamped 0.5-2.0). Returns True on success."""
+    print("[Chatterbox] Starting voice generation ...")
+    print(f"[Chatterbox]   ref_file: {ref_file}")
+    print(f"[Chatterbox]   gen_text: {gen_text[:120]}{'...' if len(gen_text) > 120 else ''}")
+    print(f"[Chatterbox]   speed   : {speed}")
+    if not gen_text or not gen_text.strip():
+        print("[Chatterbox] ERROR: empty dialogue text.")
+        return False
+    if not ref_file or not os.path.exists(ref_file):
+        print(f"[Chatterbox] ERROR: reference audio not found: {ref_file}")
+        return False
+    if not _ensure_chatterbox():
+        print("[Chatterbox] ERROR: engine not available.")
+        return False
+
+    import time as _t
+    _t0 = _t.time()
+    reply = _chatterbox_job({"ref": str(ref_file), "text": gen_text.strip(), "out_wav": out_wav})
+    if not reply or not reply.get("ok"):
+        print(f"[Chatterbox] ERROR: generation failed: {(reply or {}).get('error', 'no reply from worker')}")
+        return False
+    print(f"[Chatterbox] generated {reply.get('seconds', 0):.1f}s of speech in {_t.time() - _t0:.1f}s")
+
+    # Honour the Voice Speed slider (Turbo has no native speed control).
+    try:
+        spd = max(0.5, min(2.0, float(speed)))
+    except Exception:
+        spd = 1.0
+    if abs(spd - 1.0) > 0.02:
+        tmp_out = out_wav + ".tempo.wav"
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", out_wav, "-filter:a", f"atempo={spd:.4f}", tmp_out],
+            capture_output=True, text=True)
+        if r.returncode == 0 and os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 0:
+            os.replace(tmp_out, out_wav)
+        else:
+            print(f"[Chatterbox] tempo adjust failed (using unadjusted audio): {r.stderr[-300:]}")
+            try:
+                os.unlink(tmp_out)
+            except Exception:
+                pass
+
+    ok = os.path.exists(out_wav) and os.path.getsize(out_wav) > 0
+    print(f"[Chatterbox] {'SUCCESS' if ok else 'ERROR: output missing/empty'}: {out_wav}")
+    return ok
+
+
+def _run_f5tts(ref_file: str, gen_text: str, out_wav: str, speed: float = 1.0) -> bool:
+    """Compatibility alias (F5-TTS was replaced by Chatterbox-Turbo)."""
+    return _run_chatterbox(ref_file, gen_text, out_wav, speed=speed)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -2311,6 +2492,9 @@ def _build():
                 _dl_if_needed(_p)
             except Exception as _e:
                 _log(f"aux download note: {_e}")
+    for _p in (cfg.vae_path, cfg.synchformer_ckpt, cfg.bigvgan_16k_path):
+        if _p is not None and not Path(_p).exists():
+            raise RuntimeError(f"required MMAudio weight is missing: {_p}")
 
     seq_cfg = cfg.seq_cfg
     net = get_my_mmaudio(cfg.model_name).to(device, dtype).eval()
@@ -2416,6 +2600,15 @@ def _daemon():
             import traceback; _log(traceback.format_exc())
             sys.stdout.write(json.dumps({"ok": False, "error": str(_e)}) + "\\n")
         sys.stdout.flush()
+        # Keep the model weights resident (no reload cost), but hand the job's
+        # cached activation memory back to the GPU so an idle worker does not
+        # sit on gigabytes the video model needs.
+        try:
+            import gc as _gc
+            _gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 # One-shot mode (legacy): a single JSON payload file arg. Kept as a fallback.
 @torch.inference_mode()
@@ -2555,6 +2748,51 @@ def _ensure_mmaudio() -> bool:
             # need to place the NSFW model checkpoint as large_44k here.
             MMAUDIO_WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
             MMAUDIO_EXT_WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+
+            # MMAudio's own downloader fetches v1-44.pth and
+            # synchformer_state_dict.pth from github.com release URLs, which
+            # fails on hosts where github.com does not resolve at runtime
+            # (the worker then crashes on the missing file). Fetch the identical
+            # files from HuggingFace instead and verify them against MMAudio's
+            # published MD5s, so the worker's downloader finds valid files and
+            # never needs github.com.
+            import hashlib as _hashlib
+            _AUX_MD5 = {
+                "v1-44.pth": "fab020275fa44c6589820ce025191600",
+                "synchformer_state_dict.pth": "5b2f5594b0730f70e41e549b7c94390c",
+            }
+
+            def _md5_of(_path):
+                _h = _hashlib.md5()
+                with open(_path, "rb") as _fh:
+                    for _blk in iter(lambda: _fh.read(1 << 20), b""):
+                        _h.update(_blk)
+                return _h.hexdigest()
+
+            for _aux_name, _aux_sum in _AUX_MD5.items():
+                _aux_dst = MMAUDIO_EXT_WEIGHTS_DIR / _aux_name
+                if _aux_dst.exists() and _md5_of(_aux_dst) == _aux_sum:
+                    continue
+                print(f"[MMAudio] Downloading {_aux_name} from HuggingFace ...")
+                _aux_ok = False
+                for _tok in (None, MMAUDIO_HF_TOKEN or None):
+                    try:
+                        hf_hub_download(
+                            repo_id="hkchengrex/MMAudio",
+                            filename=f"ext_weights/{_aux_name}",
+                            local_dir=str(MMAUDIO_REPO_DIR),
+                            token=_tok,
+                        )
+                        _aux_ok = True
+                        break
+                    except Exception as _e_aux:
+                        print(f"[MMAudio] {_aux_name} download attempt failed: {_e_aux}")
+                if not _aux_ok or not _aux_dst.exists():
+                    print(f"[MMAudio] could not fetch required weight {_aux_name}")
+                    return False
+                if _md5_of(_aux_dst) != _aux_sum:
+                    print(f"[MMAudio] WARNING: {_aux_name} MD5 differs from MMAudio's "
+                          "published value; using it anyway.")
 
             nsfw_ckpt = MMAUDIO_WEIGHTS_DIR / MMAUDIO_NSFW_FILE
             if not nsfw_ckpt.exists():
@@ -2963,14 +3201,18 @@ def add_audio_to_video(
     ref_audio_path: str | None = None,
     dialogue_text: str = "",
     voice_speed: float = 1.0,
+    enable_sfx: bool = True,
+    enable_voice: bool = True,
 ) -> bytes:
     """Dual-engine audio synthesis for a generated video.
 
     Branch A (SFX)    — MMAudio (NSFW large_44k) reads the video frames and
                         generates synchronized sound effects / ambience.
-                        Installed lazily on first use (only when audio is on).
-    Branch B (Voice)  — F5-TTS clones the supplied reference voice and speaks
-                        the dialogue_text. Skipped when either field is empty.
+                        Runs only when enable_sfx is True. Installed lazily.
+    Branch B (Voice)  — Chatterbox clones the supplied reference voice and speaks
+                        the dialogue_text (English). Runs only when enable_voice
+                        is True AND both a reference clip and dialogue are given.
+                        Fully independent of Branch A.
 
     Both branches produce a .wav file; FFmpeg mixes them and muxes into the
     original video container. Falls back to returning the original bytes on any error.
@@ -2981,6 +3223,10 @@ def add_audio_to_video(
     # Vidgen-only feature: never do anything when the video tab is disabled.
     if VIDGEN_DISABLED:
         return video_buf
+
+    print(f"[AudioEngine] Plan: voice={'ON' if enable_voice else 'OFF'}, "
+          f"MMAudio SFX={'ON' if enable_sfx else 'OFF'} "
+          "(MMAudio is only installed/loaded when SFX is ON)")
 
     # Release Wan VRAM before loading Foley/F5-TTS models.
     # After video generation the Wan transformer + VAE are still resident in
@@ -3028,15 +3274,28 @@ def add_audio_to_video(
         # ---- Branch A: MMAudio / SFX ---------------------------------
         # (Variable kept as has_foley/foley_wav to avoid churn in the mixer
         #  logic below; the engine is now MMAudio, installed lazily on demand.)
-        print("[AudioEngine] Running MMAudio (SFX/ambience)...")
-        has_foley = _run_mmaudio(
-            vid_tmp, sfx_prompt, foley_wav,
-            negative_prompt=audio_negative_prompt, duration_sec=duration_sec,
-        )
-        if has_foley:
-            print("[AudioEngine] MMAudio SFX track generated.")
+        if not enable_sfx:
+            print("[AudioEngine] MMAudio SFX skipped (enable_sfx=False).")
+            has_foley = False
         else:
-            print("[AudioEngine] MMAudio failed/unavailable — continuing without SFX track.")
+            # Always include speech/voice suppression in the negative prompt so
+            # MMAudio does not generate its own talking/narration on top of any
+            # F5-TTS voice track (or on a silent video when no voice is wanted).
+            _sfx_base_neg = "speech, talking, voice, narration, singing, vocal, dialogue, words"
+            _combined_neg = (
+                f"{audio_negative_prompt}, {_sfx_base_neg}"
+                if audio_negative_prompt and audio_negative_prompt.strip()
+                else _sfx_base_neg
+            )
+            print(f"[AudioEngine] Running MMAudio (SFX/ambience)... neg='{_combined_neg}'")
+            has_foley = _run_mmaudio(
+                vid_tmp, sfx_prompt, foley_wav,
+                negative_prompt=_combined_neg, duration_sec=duration_sec,
+            )
+            if has_foley:
+                print("[AudioEngine] MMAudio SFX track generated.")
+            else:
+                print("[AudioEngine] MMAudio failed/unavailable — continuing without SFX track.")
 
         # ---- Branch B: Voice cloning ---------------------------------
         # gr.File (Gradio 3.x) returns an object with .name; gr.Audio returns a path string.
@@ -3049,30 +3308,29 @@ def add_audio_to_video(
                 _ref_path = str(ref_audio_path) if ref_audio_path else None
 
         voice_active = (
-            _ref_path
+            enable_voice
+            and _ref_path
             and os.path.exists(_ref_path)
             and dialogue_text
             and dialogue_text.strip()
         )
+        if enable_voice and not voice_active:
+            if not (dialogue_text and dialogue_text.strip()):
+                print("[AudioEngine] Voice skipped: no dialogue text entered.")
+            else:
+                print("[AudioEngine] Voice skipped: no voice reference clip uploaded.")
         if voice_active:
             try:
-                # Lazily ensure the F5-TTS voice-cloning venv exists (builds it
-                # on first use, when voice is actually requested).
-                # Only runs when voice is actually used; respects --novidgen gate.
-                if not F5_VENV_PY.exists():
-                    print("[AudioEngine] F5-TTS venv missing — setting up on demand (voice requested)...")
-                    try:
-                        _ensure_f5tts()
-                    except Exception as _e:
-                        print(f"[AudioEngine] F5-TTS setup failed (non-fatal): {_e}")
-                print(f"[AudioEngine] Running F5-TTS voice clone... (speed={voice_speed:.2f})")
-                has_voice = _run_f5tts(_ref_path, dialogue_text.strip(), voice_wav, speed=voice_speed)
+                # Lazily ensure Chatterbox-Turbo is installed and loaded.
+                # _run_chatterbox handles installation + GPU load on first call.
+                print(f"[AudioEngine] Running Chatterbox-Turbo voice clone... (speed={voice_speed:.2f})")
+                has_voice = _run_chatterbox(_ref_path, dialogue_text.strip(), voice_wav, speed=voice_speed)
                 if has_voice:
                     print("[AudioEngine] Voice track generated.")
                 else:
-                    print("[AudioEngine] F5-TTS produced no output — continuing without voice track.")
+                    print("[AudioEngine] Chatterbox produced no output — continuing without voice track.")
             except Exception as ve:
-                print(f"[AudioEngine] F5-TTS failed: {ve}")
+                print(f"[AudioEngine] Chatterbox failed: {ve}")
                 has_voice = False
 
         # ---- Detect whether the input video already carries audio --------
@@ -3104,26 +3362,78 @@ def add_audio_to_video(
             _cleanup()
             return video_buf
 
+        # ---- Probe exact video duration from the written file --------
+        # Use the actual encoded video duration (not the requested duration_sec)
+        # so that audio is trimmed/padded to exactly match the real video length.
+        try:
+            _vdur_str = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", vid_tmp],
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            _video_dur = float(_vdur_str) if _vdur_str else float(duration_sec)
+        except Exception:
+            _video_dur = float(duration_sec)
+        print(f"[AudioEngine] Video duration for sync: {_video_dur:.3f}s")
+
+        # ---- Never cut the dialogue off ------------------------------
+        # Every audio input is trimmed to the video length below. If the spoken
+        # dialogue is longer than the clip (common with short clips in Fast /
+        # Super Fast mode), its ending would be silently chopped. Instead the
+        # video's last frame is held for the missing time so the whole line is
+        # heard. This only re-encodes the video when an extension is needed.
+        _target_dur = _video_dur
+        _extend_by = 0.0
+        if has_voice:
+            try:
+                _voice_dur = float(subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", voice_wav],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout.strip())
+            except Exception:
+                _voice_dur = 0.0
+            if _voice_dur > _video_dur - 0.05:
+                _target_dur = _voice_dur + 0.3          # short tail after the last word
+                _extend_by = _target_dur - _video_dur
+                print(f"[AudioEngine] Dialogue ({_voice_dur:.2f}s) is longer than the video "
+                      f"({_video_dur:.2f}s): holding the last frame for {_extend_by:.2f}s "
+                      "so the speech is not cut off.")
+
         # ---- FFmpeg mix & mux ----------------------------------------
         # Build the list of audio sources to mix: the video's own existing
         # audio (if any), the new voice track (if any), the new foley track
         # (if any). Always mix rather than blindly overwrite.
+        #
+        # Every audio input is trimmed to _video_dur seconds and then padded
+        # with silence to exactly _video_dur so the final mix matches the
+        # video frame-for-frame with no audio overhang or early cutoff.
         extra_inputs = []      # extra -i args, in order, after vid_tmp
         filter_parts = []      # per-source volume/label filters
         mix_labels = []        # labels to feed into amix
         next_in = 1
 
+        # Helper: build an atrim+apad filter string for one input stream
+        def _sync_filter(stream_idx: int, label: str, vol: float, dur: float) -> str:
+            return (
+                f"[{stream_idx}:a]"
+                f"atrim=start=0:end={dur:.6f},"          # cut any overhang
+                f"apad=whole_dur={dur:.6f},"              # pad silence to match
+                f"volume={vol:.3f}"
+                f"[{label}]"
+            )
+
         if has_input_audio:
-            filter_parts.append("[0:a]volume=1.0[existing]")
+            filter_parts.append(_sync_filter(0, "existing", 1.0, _target_dur))
             mix_labels.append("[existing]")
         if has_voice:
             extra_inputs.append(voice_wav)
-            filter_parts.append(f"[{next_in}:a]volume=1.0[voice]")
+            filter_parts.append(_sync_filter(next_in, "voice", 1.0, _target_dur))
             mix_labels.append("[voice]")
             next_in += 1
         if has_foley:
             extra_inputs.append(foley_wav)
-            filter_parts.append(f"[{next_in}:a]volume=0.65[foley]")
+            filter_parts.append(_sync_filter(next_in, "foley", 0.55, _target_dur))
             mix_labels.append("[foley]")
             next_in += 1
 
@@ -3132,22 +3442,38 @@ def add_audio_to_video(
             ffmpeg_cmd += ["-i", _extra]
 
         if len(mix_labels) == 1:
-            # Only one audio source in play — no amix needed, just relabel it.
+            # Only one audio source — no amix needed, just route it out.
             filter_complex = ";".join(filter_parts) + f";{mix_labels[0]}anull[aout]"
         else:
+            # normalize=0 keeps per-track volumes as set above rather than
+            # scaling everything down to unity, which makes the voice too quiet.
             filter_complex = (
                 ";".join(filter_parts)
-                + f";{''.join(mix_labels)}amix=inputs={len(mix_labels)}:duration=longest[aout]"
+                + f";{''.join(mix_labels)}amix=inputs={len(mix_labels)}"
+                  f":duration=first:normalize=0[aout]"
             )
 
-        ffmpeg_cmd += [
-            "-filter_complex", filter_complex,
-            "-map", "0:v",
-            "-map", "[aout]",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k",
-            out_vid_tmp,
-        ]
+        if _extend_by > 0.0:
+            # Hold the last frame (re-encode needed); video stream goes through
+            # the same filter graph so the audio and video lengths match.
+            filter_complex += (f";[0:v]tpad=stop_mode=clone:stop_duration={_extend_by:.3f}[vout]")
+            ffmpeg_cmd += [
+                "-filter_complex", filter_complex,
+                "-map", "[vout]",
+                "-map", "[aout]",
+                "-c:v", "libx264", "-crf", "16", "-preset", "fast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                out_vid_tmp,
+            ]
+        else:
+            ffmpeg_cmd += [
+                "-filter_complex", filter_complex,
+                "-map", "0:v",
+                "-map", "[aout]",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k",
+                out_vid_tmp,
+            ]
 
         mix_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=120)
         if mix_result.returncode != 0:
@@ -3177,25 +3503,49 @@ def add_audio_to_video(
 #   • picgen mode: do NOT run it at import time (it would block picgen from
 #     even starting). Instead run it on a background thread that waits on the
 #     vidgen-assets gate, so it only begins after picgen is fully up and idle.
+def _prefetch_chatterbox_weights():
+    """Download the Chatterbox-Turbo weights into the HF cache (no GPU use) so
+    the first voice generation doesn't wait on a download."""
+    _code = (
+        "from huggingface_hub import snapshot_download as s\n"
+        "s(repo_id='ResembleAI/chatterbox-turbo', "
+        "allow_patterns=['*.safetensors','*.json','*.txt','*.pt','*.model'])\n"
+    )
+    for _extra in ({}, {"HF_HUB_DISABLE_XET": "1"}):
+        _env = {k: v for k, v in os.environ.items()}
+        _env.update(_extra)
+        r = subprocess.run([str(CHATTERBOX_VENV_PY), "-c", _code],
+                           capture_output=True, text=True, cwd="/tmp", env=_env)
+        if r.returncode == 0:
+            print("[Chatterbox] model weights present.")
+            return True
+        print(f"[Chatterbox] weight prefetch failed: {r.stderr[-400:]}")
+    return False
+
+
+def _chatterbox_startup_selfheal():
+    """Startup self-heal: installs/repairs the Chatterbox venv and weights if
+    anything is missing or broken. Runs in the background so the UI starts
+    immediately; a generation requested before it finishes simply waits on the
+    same setup lock. Respects --novidgen and the picgen vidgen-assets gate."""
+    if not _await_vidgen_assets_gate("Chatterbox voice engine self-heal"):
+        return
+    try:
+        print("[Chatterbox] startup self-heal: checking voice engine ...")
+        if _ensure_chatterbox():
+            _prefetch_chatterbox_weights()
+        else:
+            print("[Chatterbox] startup self-heal could not complete; "
+                  "will retry on first voice generation.")
+    except Exception as _e:
+        print(f"[Chatterbox] startup self-heal failed (non-fatal): {_e}")
+
+
 if VIDGEN_DISABLED:
     print("[AudioEngine] skipped — vidgen disabled (--novidgen).")
-elif not _EAGER_VIDGEN_ASSETS:
-    # Lazy by default: don't build the audio engines at startup. The first
-    # video generation with the audio box checked calls _audio_engine_ready_for()
-    # which sets them up on demand, so nothing downloads unless audio is used.
-    print("[AudioEngine] lazy — will set up on first use (audio box checked). "
-          "Set NEWGEN_EAGER_VIDGEN_ASSETS=1 to pre-download at startup.")
-elif STARTUP_MODE == "picgen":
-    def _gated_ensure_audio_engines():
-        if not _await_vidgen_assets_gate("audio engines setup (F5-TTS + HunyuanVideo-Foley)"):
-            return
-        try:
-            _ensure_audio_engines()
-        except Exception as _e:
-            print(f"[AudioEngine] gated setup failed (non-fatal): {_e}")
-    threading.Thread(target=_gated_ensure_audio_engines, daemon=True).start()
 else:
-    _ensure_audio_engines()
+    threading.Thread(target=_chatterbox_startup_selfheal, daemon=True,
+                     name="chatterbox-selfheal").start()
 
 
 # -- MuseTalk (lip-sync post-processor) ---------------------------------------
@@ -3977,12 +4327,13 @@ def generate_lip_sync_video(
     audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
     neg_pt, esteps, eguid, fsa, fs,
     lipsync_bbox_shift, lipsync_batch_size,
+    enable_sfx=True,
     *lora_args,
 ):
     """
     Lip-Synced Speaking mode:
       1. Generate video normally (using dialogue_text in the motion prompt).
-      2. Generate F5-TTS voice WAV from the dialogue script.
+      2. Generate the Chatterbox voice WAV from the dialogue script.
       3. Run MuseTalk to replace the mouth region with audio-driven synthesis.
       4. Mix Foley SFX on top via the normal add_audio_to_video path.
       
@@ -4019,6 +4370,7 @@ def generate_lip_sync_video(
             False,          # no audio yet — we handle it below
             audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
             neg_pt, esteps, eguid, fsa, fs,
+            False,          # enable_sfx: no SFX on the base video (added in step 4)
             *lora_args,
         )
     finally:
@@ -4062,24 +4414,24 @@ def generate_lip_sync_video(
         print(f"[LipSync] Reference audio path resolved to: {_ref_path}")
         
         if _ref_path and os.path.exists(str(_ref_path)):
-            print(f"[LipSync] ? Reference audio file exists")
-            print(f"[LipSync] Generating F5-TTS voice WAV for dialogue:")
+            print(f"[LipSync] ✓ Reference audio file exists")
+            print(f"[LipSync] Generating Chatterbox voice WAV for dialogue:")
             print(f"[LipSync]   Full text: {dlg_txt.strip()}")
             print(f"[LipSync]   Text length: {len(dlg_txt.strip())} characters")
             print(f"[LipSync]   Voice speed: {v_speed}")
             
-            ok = _run_f5tts(str(_ref_path), dlg_txt.strip(), _voice_wav_path, speed=float(v_speed))
+            ok = _run_chatterbox(str(_ref_path), dlg_txt.strip(), _voice_wav_path, speed=float(v_speed))
             
             if ok and Path(_voice_wav_path).exists() and Path(_voice_wav_path).stat().st_size > 0:
                 voice_wav = _voice_wav_path
                 wav_size_kb = Path(voice_wav).stat().st_size // 1024
-                print(f"[LipSync] ? F5-TTS voice WAV ready: {wav_size_kb} KB")
+                print(f"[LipSync] ? Chatterbox voice WAV ready: {wav_size_kb} KB")
                 print(f"[LipSync] ? Voice WAV will be used for lip-sync: {voice_wav}")
             else:
-                print("[LipSync] ? F5-TTS produced no output — will do lip sync without voice WAV.")
+                print("[LipSync] ? Chatterbox produced no output — will do lip sync without voice WAV.")
         else:
             print(f"[LipSync] ? Voice reference path not found or doesn't exist: {_ref_path!r}")
-            print(f"[LipSync]   Skipping F5-TTS voice generation")
+            print(f"[LipSync]   Skipping Chatterbox voice generation")
     else:
         print("[LipSync] ? Missing requirements for voice generation:")
         if not ref_aud:
@@ -4096,6 +4448,7 @@ def generate_lip_sync_video(
             _video_bytes = _f.read()
         final = add_audio_to_video(
             _video_bytes, audio_pt, float(dur), audio_neg_pt, ref_aud, dlg_txt, float(v_speed),
+            enable_sfx=bool(enable_sfx),
         )
         out_path = str(_lipsync_tmp / f"lipsync_out_{uuid.uuid4().hex}.mp4")
         if final:
@@ -4121,38 +4474,98 @@ def generate_lip_sync_video(
     if ls_ok:
         print(f"[LipSync] MuseTalk succeeded — lip-synced video at {ls_out}")
     else:
-        print("[LipSync] MuseTalk failed or returned no output — using base video with F5-TTS audio.")
+        print("[LipSync] MuseTalk failed or returned no output — using base video with Chatterbox audio.")
 
     # Step 4: mix audio on top of the (attempted) lip-synced video.
     print(f"[LipSync] Step 4/4: Mixing final audio tracks...")
-    #   If MuseTalk succeeded, the voice is already embedded in the video
-    #   frames/audio it produced — only add Foley SFX on top.
-    #   If MuseTalk failed, synced_video is just the silent base video, so
-    #   the F5-TTS voice_wav generated in Step 2 was NEVER embedded anywhere.
-    #   Re-mix it here (along with Foley) instead of discarding it, or the
-    #   dialogue never makes it into the output at all.
+    #
+    # MuseTalk outputs a video that already has the F5-TTS voice baked in as its
+    # audio track. We then mix SFX on top via add_audio_to_video (voice=None so
+    # F5-TTS is NOT re-run — we don't want a second voice clone pass).
+    #
+    # When MuseTalk failed, synced_video == base_video_path (silent). We already
+    # have voice_wav from Step 2. Rather than passing ref_aud/dlg_txt (which
+    # would trigger a costly and potentially different F5-TTS re-run), we mux
+    # the existing voice_wav directly into the video with ffmpeg, then call
+    # add_audio_to_video with no voice args to only layer SFX on top.
     with open(synced_video, "rb") as _f:
         _synced_bytes = _f.read()
     print(f"[LipSync] Read synced video: {len(_synced_bytes)} bytes")
-    
+
     if ls_ok:
         # MuseTalk already baked the voice into the lip-synced video.
-        # Only add Foley SFX on top — pass None/empty to skip F5-TTS re-run.
-        print("[LipSync] Adding Foley SFX to lip-synced video...")
+        # Only add SFX on top — pass None/empty to skip F5-TTS re-run.
+        print("[LipSync] Adding SFX to lip-synced video (voice already embedded by MuseTalk)...")
         final = add_audio_to_video(
             _synced_bytes, audio_pt, float(dur), audio_neg_pt,
-            None, "",   # skip F5-TTS — voice already embedded by MuseTalk
+            None, "",   # skip F5-TTS — voice already in MuseTalk output
             float(v_speed),
+            enable_sfx=bool(enable_sfx),
         )
     else:
-        # MuseTalk never ran — the base video is silent. Mix the F5-TTS voice
-        # (generated above) plus Foley SFX into the base video.
-        print("[LipSync] Re-mixing F5-TTS voice + Foley into base video...")
-        final = add_audio_to_video(
-            _synced_bytes, audio_pt, float(dur), audio_neg_pt,
-            ref_aud, dlg_txt,   # re-run F5-TTS inside add_audio_to_video
-            float(v_speed),
-        )
+        # MuseTalk failed — synced_video is silent. We have voice_wav from Step 2.
+        # Mux it directly into the video with ffmpeg (no F5-TTS re-run), then
+        # layer SFX on top via add_audio_to_video.
+        print("[LipSync] MuseTalk failed — muxing pre-generated voice WAV into base video...")
+        _premixed_path = str(_lipsync_tmp / f"lipsync_premix_{uuid.uuid4().hex}.mp4")
+        try:
+            # Probe actual video duration for sync
+            _vdur_str = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", synced_video],
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            _vdur = float(_vdur_str) if _vdur_str else float(dur)
+
+            # Mux voice WAV into the silent video using the voice as the timing
+            # reference (shortest=0 = pad/trim to video length).
+            _mux_r = subprocess.run(
+                ["ffmpeg", "-y",
+                 "-i", synced_video,
+                 "-i", voice_wav,
+                 "-filter_complex",
+                 f"[1:a]atrim=start=0:end={_vdur:.6f},apad=whole_dur={_vdur:.6f}[va]",
+                 "-map", "0:v", "-map", "[va]",
+                 "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                 "-shortest",
+                 _premixed_path],
+                capture_output=True, text=True, timeout=120,
+            )
+            if _mux_r.returncode == 0 and Path(_premixed_path).exists():
+                print(f"[LipSync] Voice muxed into video: {_premixed_path}")
+                with open(_premixed_path, "rb") as _f:
+                    _premixed_bytes = _f.read()
+                # Now only layer SFX — voice is already in the video
+                final = add_audio_to_video(
+                    _premixed_bytes, audio_pt, float(dur), audio_neg_pt,
+                    None, "",   # voice already muxed — skip F5-TTS
+                    float(v_speed),
+                    enable_sfx=bool(enable_sfx),
+                )
+            else:
+                print(f"[LipSync] Direct mux failed ({_mux_r.stderr[-300:]}), "
+                      "falling back to add_audio_to_video with voice ref...")
+                final = add_audio_to_video(
+                    _synced_bytes, audio_pt, float(dur), audio_neg_pt,
+                    ref_aud, dlg_txt,
+                    float(v_speed),
+                    enable_sfx=bool(enable_sfx),
+                )
+        except Exception as _mux_e:
+            print(f"[LipSync] Direct mux exception: {_mux_e} — falling back to add_audio_to_video...")
+            final = add_audio_to_video(
+                _synced_bytes, audio_pt, float(dur), audio_neg_pt,
+                ref_aud, dlg_txt,
+                float(v_speed),
+                enable_sfx=bool(enable_sfx),
+            )
+        finally:
+            try:
+                if Path(_premixed_path).exists():
+                    os.unlink(_premixed_path)
+            except Exception:
+                pass
+
     out_path = str(_lipsync_tmp / f"lipsync_final_{uuid.uuid4().hex}.mp4")
     if final:
         with open(out_path, "wb") as _f:
@@ -4670,12 +5083,28 @@ for lora_id, info in AVAILABLE_LORAS.items():
 FIXED_FPS = 16
 
 WAN_STEPS = 3  # Default fallback, actual steps come from UI slider
-WAN_FLOW_SHIFT = 6.9
+# 3.0 is the flow shift the WAMU Wan 2.2 I2V Lightning 4-step model ships with
+# (its scheduler_config.json). At 4 steps it puts 2 steps on the high-noise
+# expert and 2 on the low-noise (detail) expert.
+WAN_FLOW_SHIFT = 3.0
 WAN_GUIDANCE = 1.0
 
 MIN_FRAMES_MODEL = 8
-MAX_FRAMES_MODEL = 97       # 6s per segment (97 frames 16 fps = 6.06s)  keeps quality high
-SEGMENT_DURATION = round(MAX_FRAMES_MODEL / FIXED_FPS, 1)   # ~6.1s per segment
+MAX_FRAMES_MODEL = 81       # 5s per segment (81 frames @ 16 fps = 5.06s): the clip length Wan 2.2 is built for
+SEGMENT_DURATION = float(int(MAX_FRAMES_MODEL / FIXED_FPS))   # 5.0s per segment
+
+
+def _plan_segments(total_seconds: float):
+    """Split a clip into the fewest EQUAL segments of at most MAX_FRAMES_MODEL
+    frames each. Returns (segment_count, seconds_per_segment).
+
+    Equal parts avoid the old pattern of a full-length segment plus a tiny
+    leftover one (each extra segment is a seam where the face can drift), e.g.
+    6s becomes 2 x 3s and not 5s + 1s. A clip that fits in one segment stays one."""
+    total = max(0.0, float(total_seconds))
+    frames_needed = int(round(total * FIXED_FPS))
+    n = max(1, math.ceil(frames_needed / MAX_FRAMES_MODEL))
+    return n, total / n
 MIN_DURATION = round(MIN_FRAMES_MODEL / FIXED_FPS, 1)
 MAX_DURATION = 600.0        # 10 minutes max via chaining
 
@@ -4725,6 +5154,34 @@ def _set_super_fast_mode(enabled: bool):
         _FAST_MODE = False  # Disable fast if super fast is enabled
     print(f"[SuperFastMode] {'ENABLED — generating at ~%d fps + RIFE x%d to %d fps (fastest).' % (_SUPER_FAST_MODE_FPS, _SUPER_FAST_RIFE_FACTOR, FIXED_FPS) if _SUPER_FAST_MODE else 'disabled.'}")
     return gr.update(value=False) if enabled else gr.update()  # Return update for fast_mode_cb
+
+
+# Fast / Super Fast make Wan produce only 1/2 or 1/4 of the frames, which RIFE
+# then stretches back over the full duration. Wan thinks those few frames are a
+# short natural-speed clip, so without help the motion plays 2x / 4x slower than
+# the prompt describes and the described actions barely happen. A short
+# positive motion-speed hint (the Lightning model runs with guidance 1.0, so a
+# negative prompt has no effect) pushes the model toward quicker movement so the
+# prompt's actions still play out. Set NEWGEN_FAST_MOTION_CUE=0 to disable.
+_FAST_MOTION_CUE_ENABLED = os.environ.get("NEWGEN_FAST_MOTION_CUE", "1") != "0"
+_FAST_MOTION_CUE = "brisk, real-time movement with clearly visible motion"
+_SUPER_FAST_MOTION_CUE = "quick, fast-paced real-time movement with clearly visible motion"
+
+
+def _apply_fast_motion_cue(prompt: str) -> str:
+    """Append a motion-speed hint to the prompt when Fast / Super Fast is on."""
+    if not _FAST_MOTION_CUE_ENABLED or not (_FAST_MODE or _SUPER_FAST_MODE):
+        return prompt
+    import re  # local import: this module has no top-level `import re`
+    base = (prompt or "").strip()
+    if re.search(r"\bslow(ly|-motion)?\b|slow motion|\bin slow\b", base, re.I):
+        print("[FastMode] Prompt already asks for slow movement; motion-speed hint not added.")
+        return prompt
+    cue = _SUPER_FAST_MOTION_CUE if _SUPER_FAST_MODE else _FAST_MOTION_CUE
+    sep = "" if (not base or base.endswith((",", ".", ";"))) else ","
+    out = f"{base}{sep} {cue}".strip()
+    print(f"[FastMode] Motion-speed hint added to prompt: \"{cue}\"")
+    return out
 
 
 def _fast_num_frames(duration_seconds: float) -> int:
@@ -4907,6 +5364,72 @@ _current_merge_output_path = None
 _merge_output_lock = threading.Lock()
 
 
+_FLOW_SHIFT_CAP_ENABLED = os.environ.get("NEWGEN_FLOW_SHIFT_CAP", "1") != "0"
+
+
+def _wan_noise_schedule(flow_shift, steps):
+    """Timesteps (0-1000) the Wan scheduler uses for `steps` steps at this flow
+    shift: evenly spaced sigmas warped by shift*s / (1 + (shift-1)*s)."""
+    steps = max(1, int(steps))
+    fs = float(flow_shift)
+    sig = np.linspace(1.0, 1.0 / 1000.0, steps + 1)[:-1]
+    sig = fs * sig / (1.0 + (fs - 1.0) * sig)
+    return [int(x * 1000.0) for x in sig]
+
+
+def _wan_expert_split(flow_shift, steps, boundary_ratio=0.9):
+    """How many steps run on Wan 2.2's high-noise expert (structure/motion)
+    and on its low-noise expert (fine detail, faces). The pipeline switches
+    experts when the timestep falls below boundary_ratio * 1000."""
+    ts = _wan_noise_schedule(flow_shift, steps)
+    boundary = float(boundary_ratio) * 1000.0
+    n_high = sum(1 for t in ts if t >= boundary)
+    return ts, n_high, len(ts) - n_high
+
+
+def _guard_flow_shift(flow_shift, steps, boundary_ratio=None):
+    """Log how the denoise steps are split between Wan's two experts and keep
+    the flow shift from starving the low-noise (detail) expert.
+
+    With a high flow shift the schedule stays noisy for longer, so more of the
+    few steps run on the high-noise expert. At 4 steps, anything above about 9
+    leaves just ONE low-noise step to build detail; the final step then has to
+    clean up very noisy frames, which softens detail and faces. The shift is
+    lowered, in 0.1 steps, only as far as needed to leave at least half the
+    steps on the low-noise expert. Values that already satisfy that (including
+    the 3.0 auto default) are never touched. NEWGEN_FLOW_SHIFT_CAP=0 turns the
+    capping off (the log line stays)."""
+    if flow_shift is None:
+        return flow_shift
+    try:
+        br = float(boundary_ratio) if boundary_ratio is not None else 0.9
+        steps = max(1, int(steps))
+        fs = float(flow_shift)
+        ts, n_high, n_low = _wan_expert_split(fs, steps, br)
+        need_low = max(1, steps // 2)
+        old_low = n_low
+        capped_from = None
+        if _FLOW_SHIFT_CAP_ENABLED and n_low < need_low:
+            cand = round(fs - 0.1, 1)
+            while cand >= 1.0:
+                c_ts, c_high, c_low = _wan_expert_split(cand, steps, br)
+                if c_low >= need_low:
+                    capped_from, fs = fs, cand
+                    ts, n_high, n_low = c_ts, c_high, c_low
+                    break
+                cand = round(cand - 0.1, 1)
+        if capped_from is not None:
+            print(f"[FlowShift] {capped_from:.1f} would leave only {old_low} of "
+                  f"{steps} steps on the low-noise (detail) expert, which softens detail and faces. "
+                  f"Using {fs:.1f} instead. (Set NEWGEN_FLOW_SHIFT_CAP=0 to disable.)")
+        print(f"[FlowShift] shift {fs:.1f}, {steps} steps -> timesteps {ts} | "
+              f"high-noise expert: {n_high} step(s), low-noise expert: {n_low} step(s)")
+        return fs
+    except Exception as _e:
+        print(f"[FlowShift] check skipped ({_e})")
+        return flow_shift
+
+
 def _set_flow_shift(pipe, flow_shift):
     """
     Rebuild the scheduler with a different flow shift.
@@ -4975,6 +5498,88 @@ def _from_pretrained_cached(repo: str, **kwargs):
         return WanImageToVideoPipeline.from_pretrained(repo, **kwargs)
 
 
+_WAN_VAE_FP32_ENABLED = os.environ.get("NEWGEN_WAN_VAE_FP32", "1") != "0"
+
+
+def _set_wan_vae_precision(pipeline, full_precision: bool) -> bool:
+    """Put the Wan VAE in float32 (and shield its encode/decode from the bf16
+    autocast used around the pipeline call), or restore bf16. Never raises."""
+    try:
+        vae = pipeline.vae
+        if full_precision and not _WAN_VAE_FP32_ENABLED:
+            return False
+        vae.to(torch.float32 if full_precision else torch.bfloat16)
+        if full_precision and not getattr(vae, "_ng_autocast_shield", False):
+            def _make_encode(orig):
+                def _encode(*a, **kw):
+                    with torch.autocast(device_type="cuda", enabled=False):
+                        return orig(*a, **kw)
+                return _encode
+
+            def _make_decode(orig, _vae):
+                def _decode(*a, **kw):
+                    # Decode is the biggest single allocation of a generation and
+                    # runs right after the denoise loop. Hand the denoise
+                    # activations back to the driver first (milliseconds) so the
+                    # decode has the whole card, which is what keeps the card
+                    # from filling up when other workers share it.
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    _res = None
+                    _oom_hit = False
+                    try:
+                        with torch.autocast(device_type="cuda", enabled=False):
+                            _res = orig(*a, **kw)
+                    except (torch.cuda.OutOfMemoryError, RuntimeError) as _oom:
+                        if not (isinstance(_oom, torch.cuda.OutOfMemoryError)
+                                or "out of memory" in str(_oom).lower()):
+                            raise
+                        _oom_hit = True
+                    if not _oom_hit:
+                        return _res
+                    # The exception is cleared here, so the failed attempt's
+                    # tensors can actually be released before the retry.
+                    # Retry just this decode in bf16 (same footprint as before the
+                    # precision change). The denoise result is kept, so nothing is
+                    # regenerated and no speed is lost.
+                    print("[VAE] full-precision decode ran out of memory; retrying "
+                          "this decode in bf16 (no re-generation)...")
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    _vae.to(torch.bfloat16)
+                    try:
+                        a2 = a
+                        if a and torch.is_tensor(a[0]):
+                            a2 = (a[0].to(torch.bfloat16),) + tuple(a[1:])
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            return orig(*a2, **kw)
+                    finally:
+                        _vae.to(torch.float32)
+                        torch.cuda.empty_cache()
+                return _decode
+
+            _orig_enc = getattr(vae, "encode")
+            _orig_dec = getattr(vae, "decode")
+            setattr(vae, "encode", _make_encode(_orig_enc))
+            setattr(vae, "decode", _make_decode(_orig_dec, vae))
+            setattr(vae, "_ng_orig_encode", _orig_enc)
+            setattr(vae, "_ng_orig_decode", _orig_dec)
+            vae._ng_autocast_shield = True
+        elif not full_precision and getattr(vae, "_ng_autocast_shield", False):
+            for _name in ("encode", "decode"):
+                _orig = getattr(vae, f"_ng_orig_{_name}", None)
+                if _orig is not None:
+                    setattr(vae, _name, _orig)
+            vae._ng_autocast_shield = False
+        print(f" WAN VAE: {'float32 (full precision, autocast-shielded)' if full_precision else 'bfloat16'}.")
+        return True
+    except Exception as _e:
+        print(f" WAN VAE: precision change skipped ({_e}).")
+        return False
+
+
 def _build_wan_pipeline(target_device="cpu"):
     global wan_pipe, _wan_loaded, _wan_scheduler_config
 
@@ -5034,6 +5639,16 @@ def _build_wan_pipeline(target_device="cpu"):
             pass
         print(f" WAN VAE: defaulting to tiled decode ({_e}).")
     
+    # Full-precision VAE. The Wan I2V pipeline encodes the reference frame
+    # (your face) and decodes every output frame through this VAE; the diffusers
+    # Wan docs require it in float32 and say bf16 costs detail. The whole
+    # pipeline was loaded in bf16, and the generation call also runs inside a
+    # bf16 autocast block that would re-lower the VAE convolutions anyway, so
+    # both are handled: weights to float32, and encode/decode shielded from
+    # autocast. Costs a little decode time and ~1 GB; set
+    # NEWGEN_WAN_VAE_FP32=0 to turn it off.
+    _set_wan_vae_precision(pipeline, True)
+
     # VAE memory format optimization: channels-last is 1.3-1.4x faster on Ampere
     # for conv3d operations (VAE decoder). Quality-neutral (same math, better memory access).
     try:
@@ -5096,6 +5711,38 @@ def _ensure_pil(image):
     return image
 
 
+def _wan_dims_for(src_w: int, src_h: int, max_area: int):
+    """Pick (width, height), both multiples of 16 (the Wan VAE scale 8 x patch 2),
+    that keep the source aspect ratio as exactly as possible at about max_area
+    pixels. The old code rounded each side down to 16 and then each UP to 32
+    separately, which could stretch or squash the picture (e.g. a 3:4 photo at
+    240p became 352x288, a 9% distortion of every face). This searches the
+    16-multiple grid instead, so the aspect error stays well under 2%."""
+    aspect = src_h / src_w
+    m = MULTIPLE_OF
+    min_side = m * 8
+    best = None
+    h0 = int(round(np.sqrt(max_area * aspect)))
+    # Search heights around the ideal one; for each, the best matching width.
+    for h in range(max(min_side, (h0 // m - 6) * m), (h0 // m + 7) * m, m):
+        w_ideal = h / aspect
+        for w in (int(w_ideal // m) * m, (int(w_ideal // m) + 1) * m):
+            if w < min_side:
+                continue
+            area = w * h
+            if area > max_area * 1.10 or area < max_area * 0.90:
+                continue
+            asp_err = abs((h / w) - aspect) / aspect
+            score = asp_err + 0.15 * abs(area - max_area) / max_area
+            if best is None or score < best[0]:
+                best = (score, w, h)
+    if best is None:  # extreme aspect ratios: fall back to plain rounding
+        h = max(min_side, int(round(np.sqrt(max_area * aspect))) // m * m)
+        w = max(min_side, int(round(np.sqrt(max_area / aspect))) // m * m)
+        return w, h
+    return best[1], best[2]
+
+
 def resize_image_for_wan(image: Image.Image, resolution: str = "720p") -> Image.Image:
     """
     Fit an image to a target pixel area while preserving aspect ratio.
@@ -5121,18 +5768,8 @@ def resize_image_for_wan(image: Image.Image, resolution: str = "720p") -> Image.
     else:
         max_area = AREA_720P
 
-    aspect = image.height / image.width
-    height = int(round(np.sqrt(max_area * aspect))) // MULTIPLE_OF * MULTIPLE_OF
-    width = int(round(np.sqrt(max_area / aspect))) // MULTIPLE_OF * MULTIPLE_OF
+    width, height = _wan_dims_for(image.width, image.height, max_area)
 
-    height = max(MULTIPLE_OF * 8, height)  # Increased minimum for VAE compatibility
-    width = max(MULTIPLE_OF * 8, width)   # Increased minimum for VAE compatibility
-    
-    if height % 32 != 0:
-        height = (height // 32 + 1) * 32
-    if width % 32 != 0:
-        width = (width // 32 + 1) * 32
-    
     resized = image.resize((width, height), Image.LANCZOS)
     
     _cache_resized(image, resolution, resized)
@@ -5823,12 +6460,12 @@ def merge_photos_fn(img_a, img_b, bg_choice: str | None = None,
 def get_num_frames(duration_seconds: float) -> int:
     """
     Frame count for a duration, snapped to the NEAREST 4n+1 layout Wan's VAE
-    requires and capped at MAX_FRAMES_MODEL (97 frames = ~6s) to stay within
+    requires and capped at MAX_FRAMES_MODEL (81 frames = ~5s) to stay within
     the quality window before prompt degradation occurs.
 
     Snapping to the nearest 4n+1 (rather than always rounding down) keeps each
     segment's real length as close as possible to what was asked for, so the
-    chained total doesn't drift short. e.g. 6.06s (97 frames) is reachable
+    chained total doesn't drift short. e.g. 5.06s (81 frames) is reachable
     instead of collapsing to 93 frames / 5.81s.
     """
     raw = int(round(float(duration_seconds) * FIXED_FPS))
@@ -6010,10 +6647,19 @@ def animate_frame(
         if prompt != original_prompt:
             print(f"[LoRA] Prompt modified: ...{prompt[-80:]}")
 
+    # Fast / Super Fast: keep the described motion from turning into slow motion.
+    prompt = _apply_fast_motion_cue(prompt)
+
     steps = wan_steps if wan_steps is not None else WAN_STEPS
 
     with torch.cuda.device(WAN_DEVICE):
-        _set_flow_shift(wan_pipe, flow_shift if flow_shift is not None else WAN_FLOW_SHIFT)
+        # Show the expert split for this run and keep a very high flow shift
+        # (manual slider or a LoRA recommendation) from leaving the detail
+        # expert with a single step. Applies to every video mode.
+        _fs_checked = _guard_flow_shift(
+            flow_shift if flow_shift is not None else WAN_FLOW_SHIFT,
+            steps, getattr(wan_pipe.config, "boundary_ratio", None))
+        _set_flow_shift(wan_pipe, _fs_checked)
 
         print(f"[2/2] Wan animating {num_frames} frames at {frame.size}...")
         print(f"Seed: {seed} | Steps: {steps}")
@@ -6090,6 +6736,17 @@ def animate_frame(
                     except Exception:
                         pass
                     return _call_pipe(**kw)
+                # Safety net for the full-precision VAE: if some part of this
+                # stack rejects float32 inputs, fall back to the old bf16 VAE
+                # once and retry rather than failing the generation.
+                _dtype_err = (("dtype" in _msg or "expected scalar type" in _msg
+                               or "input type" in _msg or "same dtype" in _msg)
+                              and getattr(wan_pipe.vae, "_ng_autocast_shield", False))
+                if _dtype_err:
+                    print(f"[2/2] Full-precision VAE rejected ({type(e).__name__}: {e}); "
+                          "falling back to bf16 VAE and retrying once...")
+                    _set_wan_vae_precision(wan_pipe, False)
+                    return _call_pipe(**kw)
                 raise
 
         if last_frame is None:
@@ -6158,6 +6815,22 @@ def concatenate_videos(segment_bufs: list) -> bytes:
                 os.unlink(p)
             except Exception:
                 pass
+
+
+def _lossless_last_frame(raw_frames, seg_buf=None):
+    """Last frame of a finished segment, taken from the model's own decoded
+    frames (lossless) instead of from the encoded MP4. Reading it back from the
+    video meant every chained segment started from an x264-compressed,
+    chroma-subsampled copy of the previous one, so faces softened and drifted
+    a little more with each segment. Falls back to the MP4 if needed."""
+    try:
+        a = np.asarray(raw_frames[-1])
+        if a.dtype != np.uint8:
+            a = np.rint(np.clip(a, 0.0, 1.0) * 255.0).astype(np.uint8)
+        return Image.fromarray(a)
+    except Exception as _e:
+        print(f"[chain] lossless last frame unavailable ({_e}); using encoded video frame.")
+        return _last_frame_of(seg_buf) if seg_buf else None
 
 
 def _last_frame_of(video_buf: bytes):
@@ -6393,12 +7066,13 @@ def generate_video(
     audio_negative_prompt_tb="music, noise, wind, crowd",
     ref_audio_path=None,
     dialogue_text="",
-    voice_speed=0.27,
+    voice_speed=0.85,
     negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
     flow_shift_auto=True,
     flow_shift=None,
+    enable_sfx=True,
     *lora_args,  # Variable number of LoRA checkbox states
     progress=gr.Progress(track_tqdm=True),
 ):
@@ -6455,21 +7129,14 @@ def generate_video(
         raise gr.Error("Please enter a prompt describing the motion and scene.")
     
     if flow_shift_auto:
-        if duration_seconds <= 6.0:
-            adaptive_flow_shift = 6.9
-        elif duration_seconds <= 10.0:
-            adaptive_flow_shift = 5.5
-        elif duration_seconds <= 20.0:
-            adaptive_flow_shift = 4.5
-        else:
-            adaptive_flow_shift = 4.0
-        
-        print(f" Auto flow_shift: {adaptive_flow_shift:.1f} (duration: {duration_seconds}s)")
-        flow_shift = adaptive_flow_shift
+        # Every segment is now at most ~5s, so one value fits all durations: the
+        # flow shift the WAMU Wan 2.2 4-step model ships with.
+        flow_shift = WAN_FLOW_SHIFT
+        print(f" Auto flow_shift: {flow_shift:.1f} (WAMU Wan 2.2 4-step default)")
     else:
         if flow_shift is None:
             flow_shift = WAN_FLOW_SHIFT
-        print(f" Manual flow_shift: {flow_shift} (user override)")
+        print(f" Manual flow_shift: {flow_shift} (Auto Flow Shift is off; a ticked LoRA's recommended value replaces the slider)")
 
     if not negative_prompt or not str(negative_prompt).strip():
         negative_prompt = default_negative_prompt
@@ -6504,14 +7171,19 @@ def generate_video(
         # progress bar reflects overall progress across ALL segments (and, for
         # a single segment, spans the whole 0.15->0.90 range as its steps run)
         # instead of freezing at the segment's start percentage.
-        import math as _math
-        total_segments = max(1, _math.ceil(float(duration_seconds) / SEGMENT_DURATION))
+        total_segments, _ = _plan_segments(float(duration_seconds))
+        _n_seg_plan = total_segments
+        _seg_done = 0
         # Progress band reserved for animation (after the 0.15 setup, before the
         # final 0.90->1.0 encode/audio).
         _P_START, _P_END = 0.15, 0.90
 
         while remaining > 0.01:
-            seg_duration = min(remaining, SEGMENT_DURATION)
+            # Equal split over the planned segment count; the last one takes
+            # whatever time is left, so frame rounding can never add a sliver
+            # segment (an extra seam).
+            _segs_left = max(1, _n_seg_plan - _seg_done)
+            seg_duration = remaining if _segs_left <= 1 else remaining / _segs_left
             # Fast/Super Fast mode: generate at reduced fps, then RIFE interpolate
             # back to 16 fps. The segment's real playback length must be measured
             # at the rate we GENERATED so the chain accounts for true duration.
@@ -6532,7 +7204,7 @@ def generate_video(
             # (e.g. asking for 18s and getting ~15s).
             actual_seg_duration = num_frames / _gen_fps
             seg_index += 1
-            is_last_segment = (remaining - actual_seg_duration) <= 0.01
+            is_last_segment = (_segs_left <= 1) or (remaining - actual_seg_duration) <= 0.01
 
             seg_end = processed_end if is_last_segment else None
 
@@ -6601,10 +7273,11 @@ def generate_video(
             # ------------------------------------------------------------------
 
             remaining -= actual_seg_duration
-            if remaining <= 0.01:
+            _seg_done += 1
+            if remaining <= 0.01 or _segs_left <= 1:
                 break
 
-            nxt = _last_frame_of(seg_buf)
+            nxt = _lossless_last_frame(raw_frames, seg_buf)
             if nxt is None:
                 print("Could not read segment tail frame  stopping chain here.")
                 break
@@ -6616,12 +7289,18 @@ def generate_video(
 
         final_buf = concatenate_videos(segment_bufs)
 
-        if _audio_engine_ready_for(add_audio_cb):
+        # Voice and SFX are independent switches. enable_sfx=None means a legacy
+        # caller that never passed it: SFX then follows add_audio_cb as before.
+        _voice_on = bool(add_audio_cb)
+        _sfx_on = _voice_on if enable_sfx is None else bool(enable_sfx)
+        if _audio_engine_ready_for(_voice_on or _sfx_on):
             try:
                 final_buf = add_audio_to_video(
                     final_buf, audio_prompt_tb, float(duration_seconds),
                     audio_negative_prompt_tb, ref_audio_path, dialogue_text,
                     voice_speed=float(voice_speed),
+                    enable_sfx=_sfx_on,
+                    enable_voice=_voice_on,
                 )
             except Exception as e:
                 print(f"[AudioEngine] error in generate_video: {e}")
@@ -6715,12 +7394,13 @@ def generate_sequence(
     audio_negative_prompt_tb="music, noise, wind, crowd",
     ref_audio_path=None,
     dialogue_text="",
-    voice_speed=0.27,
+    voice_speed=0.85,
     negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
     flow_shift_auto=True,
     flow_shift=None,
+    enable_sfx=None,   # None = legacy callers: SFX follows add_audio_cb
     *lora_args,
     progress=gr.Progress(track_tqdm=True),
 ):
@@ -6784,9 +7464,7 @@ def generate_sequence(
 
     try:
         n_slots = len(slots)
-        total_segments = sum(
-            max(1, math.ceil((s["duration"] - 0.01) / SEGMENT_DURATION)) for s in slots
-        )
+        total_segments = sum(_plan_segments(s["duration"])[0] for s in slots)
         seg_counter = 0
 
         for slot_idx, slot in enumerate(slots):
@@ -6795,15 +7473,7 @@ def generate_sequence(
                           desc=f"Sequence part {slot_idx + 1}/{n_slots}: preparing frame")
 
             if flow_shift_auto:
-                d = slot["duration"]
-                if d <= 6.0:
-                    slot_flow_shift = 6.9
-                elif d <= 10.0:
-                    slot_flow_shift = 5.5
-                elif d <= 20.0:
-                    slot_flow_shift = 4.5
-                else:
-                    slot_flow_shift = 4.0
+                slot_flow_shift = WAN_FLOW_SHIFT   # WAMU Wan 2.2 4-step default
             else:
                 slot_flow_shift = flow_shift if flow_shift is not None else WAN_FLOW_SHIFT
 
@@ -6821,9 +7491,14 @@ def generate_sequence(
             current_frame = start_frame
             seg_seed = current_seed
             part_seg_index = 0
+            _n_seg_plan, _ = _plan_segments(remaining)
+            _seg_done = 0
 
             while remaining > 0.01:
-                seg_duration = min(remaining, SEGMENT_DURATION)
+                # Equal split over the planned count; the last segment takes the
+                # time left, so frame rounding never adds a sliver segment.
+                _segs_left = max(1, _n_seg_plan - _seg_done)
+                seg_duration = remaining if _segs_left <= 1 else remaining / _segs_left
                 if _SUPER_FAST_MODE:
                     _gen_fps = _SUPER_FAST_MODE_FPS
                     num_frames = _fast_num_frames(seg_duration)
@@ -6836,7 +7511,7 @@ def generate_sequence(
                 actual_seg_duration = num_frames / _gen_fps
                 part_seg_index += 1
                 seg_counter += 1
-                is_last_segment_of_part = (remaining - actual_seg_duration) <= 0.01
+                is_last_segment_of_part = (_segs_left <= 1) or (remaining - actual_seg_duration) <= 0.01
                 seg_end = target_end if is_last_segment_of_part else None
 
                 if progress is not None:
@@ -6870,10 +7545,11 @@ def generate_sequence(
                       f"complete ({actual_seg_duration:.2f}s, {len(seg_frames)} frames @ {seg_fps} fps{mode_label})")
 
                 remaining -= actual_seg_duration
-                if remaining <= 0.01:
+                _seg_done += 1
+                if remaining <= 0.01 or _segs_left <= 1:
                     break
 
-                nxt = _last_frame_of(seg_buf)
+                nxt = _lossless_last_frame(raw_frames, seg_buf)
                 if nxt is None:
                     print("Could not read segment tail frame  stopping chain here.")
                     break
@@ -6886,11 +7562,15 @@ def generate_sequence(
         final_buf = concatenate_videos(all_segment_bufs)
 
         total_duration = sum(s["duration"] for s in slots)
-        if _audio_engine_ready_for(add_audio_cb):
+        _voice_on = bool(add_audio_cb)
+        _sfx_on = _voice_on if enable_sfx is None else bool(enable_sfx)
+        if _audio_engine_ready_for(_voice_on or _sfx_on):
             try:
                 final_buf = add_audio_to_video(final_buf, audio_prompt_tb, float(total_duration),
                                                audio_negative_prompt_tb, ref_audio_path, dialogue_text,
-                                               voice_speed=float(voice_speed))
+                                               voice_speed=float(voice_speed),
+                                               enable_sfx=_sfx_on,
+                                               enable_voice=_voice_on)
             except Exception as e:
                 print(f"[AudioEngine] error in generate_sequence: {e}")
 
@@ -6937,12 +7617,13 @@ def generate_custom_edit_sequence(
     audio_negative_prompt_tb="music, noise, wind, crowd",
     ref_audio_path=None,
     dialogue_text="",
-    voice_speed=0.27,
+    voice_speed=0.85,
     negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
     flow_shift_auto=True,
     flow_shift=None,
+    enable_sfx=None,   # None = legacy callers: SFX follows add_audio_cb
     *lora_args,
     progress=gr.Progress(track_tqdm=True),
 ):
@@ -7007,9 +7688,7 @@ def generate_custom_edit_sequence(
     started = time.time()
     all_segment_bufs = []  # list[bytes] — in-memory MP4 segments
     n_slots = len(slots)
-    total_segments = sum(
-        max(1, math.ceil((s["duration"] - 0.01) / SEGMENT_DURATION)) for s in slots
-    )
+    total_segments = sum(_plan_segments(s["duration"])[0] for s in slots)
     seg_counter = 0
 
     current_first = first_image
@@ -7050,15 +7729,7 @@ def generate_custom_edit_sequence(
                 )
 
             if flow_shift_auto:
-                d = slot["duration"]
-                if d <= 6.0:
-                    slot_flow_shift = 6.9
-                elif d <= 10.0:
-                    slot_flow_shift = 5.5
-                elif d <= 20.0:
-                    slot_flow_shift = 4.5
-                else:
-                    slot_flow_shift = 4.0
+                slot_flow_shift = WAN_FLOW_SHIFT   # WAMU Wan 2.2 4-step default
             else:
                 slot_flow_shift = flow_shift if flow_shift is not None else WAN_FLOW_SHIFT
 
@@ -7066,15 +7737,27 @@ def generate_custom_edit_sequence(
             current_frame = sized_first
             seg_seed = current_seed
             part_seg_index = 0
+            _n_seg_plan, _ = _plan_segments(remaining)
+            _seg_done = 0
 
             while remaining > 0.01:
-                seg_duration = min(remaining, SEGMENT_DURATION)
-                _gen_fps = _FAST_MODE_FPS if _FAST_MODE else FIXED_FPS
-                num_frames = _fast_num_frames(seg_duration) if _FAST_MODE else get_num_frames(seg_duration)
+                # Equal split over the planned count; the last segment takes the
+                # time left, so frame rounding never adds a sliver segment.
+                _segs_left = max(1, _n_seg_plan - _seg_done)
+                seg_duration = remaining if _segs_left <= 1 else remaining / _segs_left
+                if _SUPER_FAST_MODE:
+                    _gen_fps = _SUPER_FAST_MODE_FPS
+                    num_frames = _fast_num_frames(seg_duration)
+                elif _FAST_MODE:
+                    _gen_fps = _FAST_MODE_FPS
+                    num_frames = _fast_num_frames(seg_duration)
+                else:
+                    _gen_fps = FIXED_FPS
+                    num_frames = get_num_frames(seg_duration)
                 actual_seg_duration = num_frames / _gen_fps
                 part_seg_index += 1
                 seg_counter += 1
-                is_last_segment_of_part = (remaining - actual_seg_duration) <= 0.01
+                is_last_segment_of_part = (_segs_left <= 1) or (remaining - actual_seg_duration) <= 0.01
                 seg_end = processed_end if is_last_segment_of_part else None
 
                 if progress is not None:
@@ -7089,7 +7772,10 @@ def generate_custom_edit_sequence(
                     lora_selections, selected_loras_info, progress,
                 )
 
-                if _FAST_MODE:
+                if _SUPER_FAST_MODE:
+                    seg_frames = interpolate_bits(raw_frames, multiplier=_SUPER_FAST_RIFE_FACTOR)
+                    seg_fps = _SUPER_FAST_MODE_FPS * _SUPER_FAST_RIFE_FACTOR
+                elif _FAST_MODE:
                     seg_frames = interpolate_bits(raw_frames, multiplier=_FAST_RIFE_FACTOR)
                     seg_fps = _FAST_MODE_FPS * _FAST_RIFE_FACTOR
                 else:
@@ -7104,13 +7790,14 @@ def generate_custom_edit_sequence(
                 all_segment_bufs.append(seg_buf)
                 print(f"Custom seq {slot_idx + 1}/{n_slots} vidgen seg {part_seg_index} "
                       f"complete ({actual_seg_duration:.2f}s, {len(seg_frames)} frames @ {seg_fps} fps"
-                      f"{' [FAST]' if _FAST_MODE else ''})")
+                      f"{' [SUPERFAST]' if _SUPER_FAST_MODE else (' [FAST]' if _FAST_MODE else '')})")
 
                 remaining -= actual_seg_duration
-                if remaining <= 0.01:
+                _seg_done += 1
+                if remaining <= 0.01 or _segs_left <= 1:
                     break
 
-                nxt = _last_frame_of(seg_buf)
+                nxt = _lossless_last_frame(raw_frames, seg_buf)
                 if nxt is None:
                     print("Could not read segment tail frame — stopping chain here.")
                     break
@@ -7126,11 +7813,15 @@ def generate_custom_edit_sequence(
         final_buf = concatenate_videos(all_segment_bufs)
 
         total_duration = sum(s["duration"] for s in slots)
-        if _audio_engine_ready_for(add_audio_cb):
+        _voice_on = bool(add_audio_cb)
+        _sfx_on = _voice_on if enable_sfx is None else bool(enable_sfx)
+        if _audio_engine_ready_for(_voice_on or _sfx_on):
             try:
                 final_buf = add_audio_to_video(final_buf, audio_prompt_tb, float(total_duration),
                                                audio_negative_prompt_tb, ref_audio_path, dialogue_text,
-                                               voice_speed=float(voice_speed))
+                                               voice_speed=float(voice_speed),
+                                               enable_sfx=_sfx_on,
+                                               enable_voice=_voice_on)
             except Exception as e:
                 print(f"[AudioEngine] error in generate_custom_edit_sequence: {e}")
 
@@ -7166,12 +7857,13 @@ def autorun_generate(
     audio_negative_prompt_tb,
     ref_audio_path=None,
     dialogue_text="",
-    voice_speed=0.27,
+    voice_speed=0.85,
     vid_negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
     flow_shift_auto=True,
     flow_shift=None,
+    enable_sfx=None,   # None = SFX follows add_audio_cb
     *lora_args,
     progress=gr.Progress(track_tqdm=True),
 ):
@@ -7220,11 +7912,13 @@ def autorun_generate(
                 audio_negative_prompt_tb,
                 ref_audio_path,
                 dialogue_text,
+                voice_speed,
                 vid_negative_prompt,
                 edit_steps,
                 edit_guidance,
                 flow_shift_auto,
                 flow_shift,
+                enable_sfx,
                 *lora_args,
                 progress=progress,
             )
@@ -8315,6 +9009,9 @@ def _disable_offload(pipe, label, force=False):
     """Remove model-CPU-offload hooks (if any) and return the pipeline to CPU.
 
     Must run before the other model takes the GPU, so stale hooks can't fire.
+    On high-VRAM cards (>=40 GB) wherl-CPU-offload hooks (if any) and return the pipeline to CPU.
+
+    Must run before the other model takes the GPU, so stale hooks can't fire.
     On high-VRAM cards (>=40 GB) where full residency was used (no hooks), we
     normally skip the CPU move IF both models fit simultaneously — but below
     120GB VRAM only ONE model can be resident at a time, so we MUST evict to
@@ -8960,6 +9657,28 @@ def _set_picgen_progress(step, total, desc, running=True):
 def _get_picgen_progress():
     with _picgen_progress_lock:
         return dict(_picgen_progress)
+
+
+# Live image channel. Gradio streams generator results over its own queue
+# connection, which Cloudflare Tunnel buffers until the whole response ends, so
+# on a tunnel the images only appeared at the very end. This list is published
+# over a plain one-shot JSON endpoint (/picgen/live/poll) that no proxy can
+# buffer; the page polls it and shows each image the moment it is saved.
+_picgen_live_lock = threading.Lock()
+_picgen_live = {"run": 0, "paths": []}
+
+
+def _picgen_live_reset():
+    with _picgen_live_lock:
+        _picgen_live["run"] += 1
+        _picgen_live["paths"] = []
+
+
+def _picgen_live_add(paths):
+    with _picgen_live_lock:
+        for p in paths or []:
+            if p and p not in _picgen_live["paths"]:
+                _picgen_live["paths"].append(p)
 
 
 def _hash_images(images):
@@ -10809,7 +11528,7 @@ body.hide-media #picgen-result-gallery video { visibility: hidden !important; }
 .gradio-container .tab-nav button:nth-child(1) { order: 2 !important; }
 .gradio-container .tab-nav button:nth-child(2) { order: 1 !important; }
 /* Center all section title / heading text (Markdown headings used as
-   section titles, e.g. "### F5-TTS Voice Controls") on both tabs. */
+   section titles, e.g. "### Voice Script Controls") on both tabs. */
 .gradio-container .prose h1,
 .gradio-container .prose h2,
 .gradio-container .prose h3,
@@ -10842,6 +11561,11 @@ body.hide-media #picgen-result-gallery video { visibility: hidden !important; }
   border: 1px solid var(--color-accent) !important; border-radius: 10px !important;
   text-align: center !important;
 }
+/* Live image strip (tunnel-safe): hidden until JS finds finished images that
+   the Gradio gallery is not yet showing. */
+#picgen-live { display: none; width: 100% !important; margin: 8px 0 0 0 !important; }
+#picgen-live-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+#picgen-live-grid img { width: 100%; height: auto; border-radius: 6px; display: block; }
 #picgen-progress * { color: #fff !important; }
 #picgen-progress code { font-size: 15px !important; letter-spacing: 1px !important;
   background: transparent !important; color: #fff !important; }
@@ -11040,12 +11764,13 @@ def autorun_push_generate(
     audio_negative_prompt_tb,
     ref_audio_path=None,
     dialogue_text="",
-    voice_speed=0.27,
+    voice_speed=0.85,
     vid_negative_prompt=None,
     edit_steps=4,
     edit_guidance=1.0,
     flow_shift_auto=True,
     flow_shift=None,
+    enable_sfx=None,   # None = SFX follows add_audio_cb
     *lora_args,
     progress=gr.Progress(track_tqdm=True),
 ):
@@ -11095,11 +11820,13 @@ def autorun_push_generate(
                 audio_negative_prompt_tb,
                 ref_audio_path,
                 dialogue_text,
+                voice_speed,
                 vid_negative_prompt,
                 edit_steps,
                 edit_guidance,
                 flow_shift_auto,
                 flow_shift,
+                enable_sfx,
                 *lora_args,
                 progress=progress,
             )
@@ -11345,7 +12072,9 @@ with gr.Blocks(css=css) as demo:
                         "OFF by default. When checked, video is generated at half the "
                         "frames (~8 fps) and RIFE-interpolated back to 16 fps — roughly "
                         "2x faster. Tradeoff: in-between frames are interpolated, so fast "
-                        "motion may show mild artifacts. Takes effect on the next Generate."
+                        "motion may show mild artifacts. A short motion-speed hint is added "
+                        "to your prompt automatically so movement does not turn into slow "
+                        "motion. Takes effect on the next Generate."
                     ),
                     elem_id="fast-mode-cb",
                     scale=0,
@@ -11356,7 +12085,10 @@ with gr.Blocks(css=css) as demo:
                     info=(
                         "OFF by default. When checked, video is generated at quarter "
                         "frames (~4 fps) and RIFE-interpolated x4 back to 16 fps — roughly "
-                        "4x faster. Tradeoff: more interpolation = more potential artifacts. "
+                        "4x faster. Tradeoff: more interpolation = more potential artifacts, "
+                        "so Fast Mode is the better choice when clarity matters most. A "
+                        "motion-speed hint is added to your prompt automatically so movement "
+                        "does not turn into slow motion. "
                         "Mutually exclusive with Fast Mode. Takes effect on next Generate."
                     ),
                     elem_id="super-fast-mode-cb",
@@ -11434,13 +12166,13 @@ with gr.Blocks(css=css) as demo:
                             "uses Generation Steps and Frame-Edit Guidance sliders. "
                             "Lip-Synced Speaking = generate video then run MuseTalk "
                             "(TMElyralab) to drive mouth movements from your Dialogue Script — "
-                            "requires Voice Reference Clip + Dialogue Script in the Sound section."
+                            "requires Voice Reference Clip + Dialogue Script in the audio section."
                         ),
                     )
 
                     with gr.Row():
                         duration_seconds = gr.Slider(
-                            MIN_DURATION, MAX_DURATION, value=6.0, step=0.5,
+                            MIN_DURATION, MAX_DURATION, value=5.0, step=0.5,
                             label="Duration (seconds)",
                             info=f"Over {SEGMENT_DURATION}s is produced by chaining segments.",
                             scale=2,
@@ -11453,7 +12185,7 @@ with gr.Blocks(css=css) as demo:
                             flow_shift = gr.Slider(
                                 1.0, 12.0, value=WAN_FLOW_SHIFT, step=0.1,
                                 label="Flow Shift",
-                                info="Lower = better prompt. Higher = more motion.",
+                                info="Lower = better prompt. Higher = more motion. 3.0 is the WAMU Wan 2.2 4-step default; values above ~9 are lowered automatically.",
                                 interactive=False,
                             )
 
@@ -11617,94 +12349,170 @@ with gr.Blocks(css=css) as demo:
                         )
 
             with gr.Group():
-                add_audio_cb = gr.Checkbox(label="Add Audio (F5-TTS voice + MMAudio SFX)", value=False)
-                # -- Top row: all four panels side-by-side ----------------------
                 with gr.Row():
-                    audio_prompt_tb = gr.Textbox(
-                        label="Sound Effects / SFX Prompt (MMAudio)", value="quiet ambience, soft room tone",
-                        lines=4, scale=1,
+                    add_audio_cb = gr.Checkbox(
+                        label="🎤 Voice Cloning + Dialogue (Chatterbox, English)",
+                        value=True,
+                        info="Speaks the Dialogue Script in the voice cloned from the Voice Reference Clip. "
+                             "Works on its own, no sound effects needed. Does nothing until BOTH a reference "
+                             "clip and dialogue are provided.",
                     )
-                    audio_negative_prompt_tb = gr.Textbox(
-                        label="Audio Negative Prompt", value="music, noise, wind, crowd",
-                        placeholder="e.g. music, noise, wind, crowd",
-                        lines=4, scale=1,
+                    enable_sfx_cb = gr.Checkbox(
+                        label="🔊 Sound Effects / Ambience (MMAudio)",
+                        value=False,
+                        info="Generates sound effects and ambience from the video using the SFX prompt below. "
+                             "Independent of voice. Leave off for a voice-only result.",
                     )
-                    with gr.Column(scale=1):
-                        gr.Markdown("**Voice Cloning (optional)** — upload a 5-10s reference clip and type the dialogue to speak. Leave blank to skip.")
-                        ref_audio_input = gr.File(
-                            label="Voice Reference Clip (upload .wav/.mp3, 5-10s)",
-                            file_types=[".wav", ".mp3", ".flac", ".ogg", ".m4a"],
-                            file_count="single",
+                # -- Two independent sections: SFX (left) and Voice (right) -----
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        gr.Markdown("**Sound Effects / Ambience (MMAudio)** — used only when the 🔊 box above is checked.")
+                        with gr.Row():
+                            audio_prompt_tb = gr.Textbox(
+                                label="SFX / Ambience Prompt", value="quiet ambience, soft room tone",
+                                lines=4, scale=1,
+                            )
+                            audio_negative_prompt_tb = gr.Textbox(
+                                label="SFX Negative Prompt", value="music, noise, wind, crowd",
+                                placeholder="e.g. music, noise, wind, crowd",
+                                lines=4, scale=1,
+                            )
+                    with gr.Column(scale=2):
+                        gr.Markdown(
+                            "**Voice Cloning (Chatterbox, English only)** — used when the 🎤 box above is checked. "
+                            "Upload a sample of the voice and type what it should say. Both are required."
                         )
-                    dialogue_text_tb = gr.Textbox(
-                        label="Dialogue Script",
-                        placeholder="Leave blank to skip voice cloning",
-                        lines=4, scale=1,
-                    )
+                        with gr.Row():
+                            ref_audio_input = gr.File(
+                                label="Voice Reference Clip (5-15s of clean speech; wav/mp3/flac/ogg/m4a)",
+                                file_types=[".wav", ".mp3", ".flac", ".ogg", ".m4a"],
+                                file_count="single",
+                            )
+                            dialogue_text_tb = gr.Textbox(
+                                label="Dialogue Script (spoken in the cloned voice)",
+                                placeholder="Type exactly what the voice should say. Needs a Voice Reference Clip.",
+                                lines=4, scale=1,
+                            )
                 # -- Voice Speed ------------------------------------------------
-                gr.Markdown("**Voice Speed** — controls how fast the cloned voice speaks. Lower values = slower speech. All speeds reduced to 1/3 for better pacing.")
+                gr.Markdown(
+                    "**Voice Speed** — 0.85 = default natural pace. "
+                    "1.0 = the pace of your reference clip. "
+                    "Lower = slower / more deliberate, higher = faster (pitch is preserved). "
+                    "Range 0.5–1.3. If speech sounds rushed, try 0.75–0.80."
+                )
                 with gr.Row():
                     voice_speed_slider = gr.Slider(
                         label="Voice Speed",
-                        minimum=0.17,
-                        maximum=0.5,
-                        step=0.01,
-                        value=0.27,
+                        minimum=0.5,
+                        maximum=1.3,
+                        step=0.05,
+                        value=0.85,
                         scale=3,
                     )
                 with gr.Row():
-                    voice_speed_very_slow_btn = gr.Button("?? Very Slow (0.2)", size="sm", scale=1)
-                    voice_speed_slow_btn      = gr.Button("?? Slow (0.25)",     size="sm", scale=1)
-                    voice_speed_normal_btn    = gr.Button("??? Normal (0.33)",    size="sm", scale=1)
-                    voice_speed_fast_btn      = gr.Button("? Fast (0.4)",       size="sm", scale=1)
-                voice_speed_very_slow_btn.click(fn=lambda: 0.2,  outputs=[voice_speed_slider])
-                voice_speed_slow_btn.click(     fn=lambda: 0.25, outputs=[voice_speed_slider])
-                voice_speed_normal_btn.click(   fn=lambda: 0.33,  outputs=[voice_speed_slider])
-                voice_speed_fast_btn.click(     fn=lambda: 0.4,  outputs=[voice_speed_slider])
+                    voice_speed_very_slow_btn = gr.Button("🐢 Very Slow (0.6)", size="sm", scale=1)
+                    voice_speed_slow_btn      = gr.Button("🐌 Slow (0.75)",     size="sm", scale=1)
+                    voice_speed_normal_btn    = gr.Button("🎙️ Default (0.85)",  size="sm", scale=1)
+                    voice_speed_fast_btn      = gr.Button("⚡ Fast (1.1)",      size="sm", scale=1)
+                voice_speed_very_slow_btn.click(fn=lambda: 0.6,  outputs=[voice_speed_slider])
+                voice_speed_slow_btn.click(     fn=lambda: 0.75, outputs=[voice_speed_slider])
+                voice_speed_normal_btn.click(   fn=lambda: 0.85, outputs=[voice_speed_slider])
+                voice_speed_fast_btn.click(     fn=lambda: 1.1,  outputs=[voice_speed_slider])
 
-                # -- F5-TTS voice control quick-insert buttons ------------------
+                # -- Chatterbox voice control quick-insert buttons --------------
                 gr.Markdown(
-                    "### ??? F5-TTS Voice Controls — click any button to insert into Dialogue Script"
+                    "### 🎙️ Voice Script Controls (Chatterbox) — click any button to add it to the Dialogue Script"
                 )
-                gr.Markdown("**Punctuation for pacing & breath:**")
-                with gr.Row():
-                    _ins_comma  = gr.Button(", — short pause / breath beat",              size="sm")
-                    _ins_period = gr.Button(". / ! / ? — longer pause, sentence boundary", size="sm")
-                    _ins_ellip  = gr.Button("... — extended pause / trailing off",         size="sm")
-                    _ins_emdash = gr.Button("— (em-dash) — abrupt cut / interruption",    size="sm")
+                voice_insert_where = gr.Radio(
+                    choices=["End of script", "Start of script"],
+                    value="End of script",
+                    label="Where the buttons insert",
+                    info="End of script: build the line left to right (click a style, then type the words). "
+                         "Start of script: puts the tag at the very beginning.",
+                )
 
-                def _append_to_dialogue(current_text, insert_str):
-                    """Append insert_str to whatever is already in the dialogue box."""
-                    return (current_text or "") + insert_str
+                # Every control Chatterbox-Turbo supports. Tags are the model's own
+                # tag list (its tokenizer vocabulary); pauses are timed silence
+                # that the voice worker inserts (the markers never reach the model).
+                _VOICE_BUTTON_SECTIONS = [
+                    ("Pauses & breaks (exact length)", [
+                        ("⏸ Short pause (0.3s)",      "[short pause] "),
+                        ("⏸ Pause (0.6s)",            "[pause] "),
+                        ("⏸ Long pause (1.2s)",       "[long pause] "),
+                        ("⏸ Very long pause (2.5s)",  "[very long pause] "),
+                        ("⏸ Custom pause (2s)",       "[pause 2s] "),
+                        ("¶ New paragraph (0.8s)",    "\n\n"),
+                    ]),
+                    ("Punctuation (natural phrasing)", [
+                        ("New sentence  .",            ". "),
+                        ("Comma  ,  (breath beat)",    ", "),
+                        ("Question  ?",                "? "),
+                        ("Exclamation  !",             "! "),
+                        ("Trailing off  ...",          "... "),
+                        ("Interruption  -",            " - "),
+                    ]),
+                    ("Speaking style (put it before the words it should affect)", [
+                        ("🤫 Whispering",    "[whispering] "),
+                        ("😠 Angry",         "[angry] "),
+                        ("😨 Fear",          "[fear] "),
+                        ("😮 Surprised",     "[surprised] "),
+                        ("😊 Happy",         "[happy] "),
+                        ("😏 Sarcastic",     "[sarcastic] "),
+                        ("😢 Crying",        "[crying] "),
+                        ("🎭 Dramatic",      "[dramatic] "),
+                        ("📖 Narration",     "[narration] "),
+                        ("📢 Advertisement", "[advertisement] "),
+                    ]),
+                    ("Non-verbal sounds (can go anywhere in a sentence)", [
+                        ("😂 Laugh",          "[laugh] "),
+                        ("😄 Chuckle",        "[chuckle] "),
+                        ("😷 Cough",          "[cough] "),
+                        ("😮‍💨 Sigh",          "[sigh] "),
+                        ("😲 Gasp",           "[gasp] "),
+                        ("😩 Groan",          "[groan] "),
+                        ("👃 Sniff",          "[sniff] "),
+                        ("🗣 Clear throat",   "[clear throat] "),
+                        ("🤫 Shush",          "[shush] "),
+                    ]),
+                ]
 
-                _ins_comma.click(
-                    fn=lambda t: _append_to_dialogue(t, ", "),
-                    inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
-                )
-                _ins_period.click(
-                    fn=lambda t: _append_to_dialogue(t, ". "),
-                    inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
-                )
-                _ins_ellip.click(
-                    fn=lambda t: _append_to_dialogue(t, "... "),
-                    inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
-                )
-                _ins_emdash.click(
-                    fn=lambda t: _append_to_dialogue(t, " — "),
-                    inputs=[dialogue_text_tb], outputs=[dialogue_text_tb],
-                )
+                def _insert_into_dialogue(current_text, where, snippet):
+                    """Add a snippet to the dialogue box, at the start or the end."""
+                    cur = current_text or ""
+                    if where == "Start of script":
+                        return snippet + cur
+                    # Keep a space between existing words and a [tag].
+                    if snippet.startswith("[") and cur and not cur[-1].isspace():
+                        snippet = " " + snippet
+                    return cur + snippet
+
+                for _vs_title, _vs_items in _VOICE_BUTTON_SECTIONS:
+                    gr.Markdown(f"**{_vs_title}:**")
+                    for _row_start in range(0, len(_vs_items), 5):
+                        with gr.Row():
+                            for _vs_label, _vs_snippet in _vs_items[_row_start:_row_start + 5]:
+                                _vs_btn = gr.Button(_vs_label, size="sm")
+                                _vs_btn.click(
+                                    fn=lambda t, w, s=_vs_snippet: _insert_into_dialogue(t, w, s),
+                                    inputs=[dialogue_text_tb, voice_insert_where],
+                                    outputs=[dialogue_text_tb],
+                                )
 
                 gr.Markdown(
-                    "**Capitalization for emphasis:** F5 is sensitive to capitalization for stress — "
-                    "`I LOVE this` will make LOVE land harder than `I love this`. Not perfect, but noticeable.\n\n"
-                    "**Repetition for elongation:** Stretch a vowel by writing it as you'd say it — "
-                    "`nooo`, `pleease`, `yeeees`. F5 treats the extra letters as held phonemes.\n\n"
-                    "**Phonetic spelling for tricky pronunciation:** If a word sounds wrong, spell it "
-                    "phonetically — `Anth-ro-pic` instead of `Anthropic`, `eye-kon` instead of `icon`. "
-                    "Hyphens help segment syllables.\n\n"
-                    "**Whispered / breathy tone:** F5 clones the reference voice's character — so the "
-                    "clearest lever is your reference clip itself. A breathy 5-second clip ? breathy output. "
-                    "An excited clip ? excited clone. Record different reference clips for different moods."
+                    "**How these work:** pause buttons add exact-length silence (the marker is removed "
+                    "before the voice is made). Style and sound buttons add a tag that Chatterbox-Turbo "
+                    "reads from the script, e.g. `[whispering] Come closer. [laugh] I missed you.` "
+                    "A custom length works too: `[pause 1.5s]`. A blank line is a paragraph break.\n\n"
+                    "**Always English:** Chatterbox-Turbo is an English-only model, so the dialogue is always "
+                    "spoken in English no matter what language the reference clip is in. Only the voice "
+                    "(tone, accent, timbre) is copied from the clip.\n\n"
+                    "**Reference clip:** use clean speech with one speaker and no music or background noise. "
+                    "Clips shorter than ~5s are looped automatically. The clip's mood also shapes the output, "
+                    "so a calm clip gives a calmer clone than an excited one.\n\n"
+                    "**Tricky pronunciation:** spell the word phonetically, e.g. `Anth-ro-pic` for `Anthropic`.\n\n"
+                    "_Only `[laugh]`, `[chuckle]` and `[cough]` are named in the model's documentation; the other "
+                    "tags come from the model's own tag list, and how strongly each one shows up depends on the "
+                    "tag and on the reference voice._"
                 )
 
             with gr.Group(visible=False) as sequence_group:
@@ -11735,7 +12543,7 @@ with gr.Blocks(css=css) as demo:
                             elem_id=f"sequence-prompt-{_seq_i}",
                         )
                         _seq_dur = gr.Slider(
-                            MIN_DURATION, MAX_DURATION, value=6.0, step=0.5,
+                            MIN_DURATION, MAX_DURATION, value=5.0, step=0.5,
                             label=f"Part {_seq_i + 1} duration (s)",
                             scale=1,
                             elem_id=f"sequence-duration-{_seq_i}",
@@ -11775,7 +12583,7 @@ with gr.Blocks(css=css) as demo:
                             elem_id=f"custom-seq-picgen-{_csi}",
                         )
                         _cs_dur = gr.Slider(
-                            MIN_DURATION, MAX_DURATION, value=6.0, step=0.5,
+                            MIN_DURATION, MAX_DURATION, value=5.0, step=0.5,
                             label=f"Seg {_csi + 1} duration (s)",
                             scale=1,
                             elem_id=f"custom-seq-duration-{_csi}",
@@ -11789,10 +12597,12 @@ with gr.Blocks(css=css) as demo:
                     "**Lip-Synced Speaking** — generates video with subject speaking, "
                     "then runs **MuseTalk** (TMElyralab) to replace the mouth region "
                     "with audio-driven synthesis locked to your Dialogue Script. "
-                    "Requires a Voice Reference Clip + Dialogue Script in the Sound section above. "
+                    "Requires a Voice Reference Clip + Dialogue Script in the audio section above "
+                    "(the 🎤 box does not need to be checked here, voice is always generated in this mode). "
+                    "Fast / Super Fast modes are switched off automatically for this mode so the mouth tracks correctly. "
                     "MuseTalk downloads automatically (several GB) on first use.\n\n"
-                    "Pipeline: Wan generates video -> F5-TTS generates voice WAV -> "
-                    "MuseTalk drives mouth -> MMAudio SFX mixed on top."
+                    "Pipeline: Wan generates video -> Chatterbox generates the voice WAV -> "
+                    "MuseTalk drives mouth -> MMAudio SFX mixed on top (only if 🔊 is checked)."
                 )
                 with gr.Row():
                     lipsync_steps_sl = gr.Slider(
@@ -12461,6 +13271,7 @@ with gr.Blocks(css=css) as demo:
                 ref_audio_input, dialogue_text_tb, voice_speed_slider,
                 vid_negative_prompt, edit_steps, edit_guidance,
                 flow_shift_auto, flow_shift,
+                enable_sfx_cb,
             ] + [lora_checkboxes[k] for k in AVAILABLE_LORAS if k in lora_checkboxes]
 
 
@@ -12471,6 +13282,7 @@ with gr.Blocks(css=css) as demo:
                                    neg_pt, esteps, eguid,
                                    fsa, fs,
                                    lipsync_steps, lipsync_cfg,
+                                   en_sfx,
                                    *rest_args):
                 """Route to normal generate_video, folder-Autorun, Sequence, Custom Edit Sequence, or Lip-Synced Speaking."""
                 # Release the previous player media key before clearing storage,
@@ -12481,6 +13293,8 @@ with gr.Blocks(css=css) as demo:
                         _media_store.pop(_current_player_media_key, None)
                     _current_player_media_key = None
                 _do_clear_storage()
+                print(f"[Audio] UI switches received: voice(🎤)={bool(audio_cb)}, "
+                      f"MMAudio SFX(🔊)={bool(en_sfx)}")
                 n = SEQUENCE_MAX_SLOTS
                 c = CUSTOM_SEQ_MAX_SLOTS
                 seq_imgs = list(rest_args[0:n])
@@ -12498,6 +13312,7 @@ with gr.Blocks(css=css) as demo:
                         audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
                         neg_pt, esteps, eguid, fsa, fs,
                         lipsync_steps, lipsync_cfg,
+                        bool(en_sfx),
                         *lora_args_inner,
                     )
                     # Check if result is a tuple (success case) or error
@@ -12513,6 +13328,7 @@ with gr.Blocks(css=css) as demo:
                         dur, res, fmul, qual, sd, rsd,
                         audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
                         neg_pt, esteps, eguid, fsa, fs,
+                        bool(en_sfx),
                         *lora_args_inner,
                     )
                 elif scene_mode_val == MODE_SEQUENCE:
@@ -12521,6 +13337,7 @@ with gr.Blocks(css=css) as demo:
                         res, fmul, qual, sd, rsd,
                         audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
                         neg_pt, esteps, eguid, fsa, fs,
+                        bool(en_sfx),
                         *lora_args_inner,
                     )
                     yield result[0], result[1], ""
@@ -12530,6 +13347,7 @@ with gr.Blocks(css=css) as demo:
                         res, fmul, qual, sd, rsd,
                         audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
                         neg_pt, esteps, eguid, fsa, fs,
+                        bool(en_sfx),
                         *lora_args_inner,
                     )
                     yield result[0], result[1], ""
@@ -12539,6 +13357,7 @@ with gr.Blocks(css=css) as demo:
                         end_img, dur, res, fmul, qual, sd, rsd,
                         audio_cb, audio_pt, audio_neg_pt, ref_aud, dlg_txt, v_speed,
                         neg_pt, esteps, eguid, fsa, fs,
+                        bool(en_sfx),
                         *lora_args_inner,
                     )
 
@@ -12553,6 +13372,7 @@ with gr.Blocks(css=css) as demo:
                     vid_negative_prompt, edit_steps, edit_guidance,
                     flow_shift_auto, flow_shift,
                     lipsync_steps_sl, lipsync_cfg_sl,
+                    enable_sfx_cb,
                 ] + sequence_images + sequence_prompts + sequence_durations
                   + custom_seq_motion_prompts + custom_seq_picgen_prompts + custom_seq_durations
                   + [lora_checkboxes[k] for k in AVAILABLE_LORAS if k in lora_checkboxes],
@@ -12587,6 +13407,7 @@ with gr.Blocks(css=css) as demo:
                     vid_negative_prompt, edit_steps, edit_guidance,
                     flow_shift_auto, flow_shift,
                     lipsync_steps_sl, lipsync_cfg_sl,
+                    enable_sfx_cb,
                 ] + sequence_images + sequence_prompts + sequence_durations
                   + custom_seq_motion_prompts + custom_seq_picgen_prompts + custom_seq_durations
                   + [lora_checkboxes[k] for k in AVAILABLE_LORAS if k in lora_checkboxes],
@@ -12931,6 +13752,16 @@ with gr.Blocks(css=css) as demo:
                         # stream through here). It starts visible+empty so the
                         # DOM element always exists for the JS to target; the JS
                         # hides it while idle and reveals it during generation.
+                        # Live image strip: filled by client-side JS polling
+                        # /picgen/live/poll (plain JSON, so it works through
+                        # Cloudflare Tunnel where Gradio's own streamed gallery
+                        # updates are buffered until the end). It only appears
+                        # when the gallery above does not already show the
+                        # images, so on direct localhost nothing is duplicated.
+                        pic_live = gr.HTML(
+                            '<div id="picgen-live-grid"></div>',
+                            visible=True, elem_id="picgen-live",
+                        )
                         pic_progress = gr.Markdown(
                             "", visible=True, elem_id="picgen-progress"
                         )
@@ -13032,6 +13863,7 @@ with gr.Blocks(css=css) as demo:
 
                     _total = max(1, num_inference_steps)
                     _picgen_cancel.clear()
+                    _picgen_live_reset()
                     _set_picgen_progress(0, _total, "Preparing", running=True)
                     
                     # Generate images one at a time and yield after each
@@ -13051,6 +13883,9 @@ with gr.Blocks(css=css) as demo:
                                 1, None, face_match=face_match,
                             )
                             all_filepaths.extend(filepaths)
+                            # Publish immediately over the proxy-safe JSON channel
+                            # (see _picgen_live above) so tunnel users see it now.
+                            _picgen_live_add(filepaths)
                             
                             # Yield the accumulated results as a raw list.
                             # The JavaScript watchPicgenGallery() handles selection:
@@ -13525,6 +14360,84 @@ with gr.Blocks(css=css) as demo:
 }
 """
     demo.load(fn=None, js=_picgen_progress_js)
+
+    # Live images over a proxy that buffers streamed responses (Cloudflare
+    # Tunnel). Gradio delivers generator results over its own queue stream,
+    # which the tunnel holds until the whole run ends. This polls our plain
+    # JSON endpoint instead and shows each image as soon as it is saved.
+    _picgen_live_js = r"""
+() => {
+    if (window.__picgenLiveInit) return;
+    window.__picgenLiveInit = true;
+
+    var lastRun = -1, lastKey = "";
+
+    function baseName(u) {
+        var last = String(u).split("?")[0].split("/").pop();
+        try { return decodeURIComponent(last); } catch (e) { return last; }
+    }
+    function outer() { return document.getElementById("picgen-live"); }
+    function grid()  { return document.getElementById("picgen-live-grid"); }
+    function gallery() { return document.getElementById("picgen-result-gallery"); }
+
+    // True when every live image is already present in the Gradio gallery.
+    function covered(urls) {
+        var g = gallery();
+        if (!g) return false;
+        var srcs = Array.prototype.map.call(g.querySelectorAll("img"), function (i) {
+            try { return decodeURIComponent(i.src); } catch (e) { return i.src; }
+        });
+        return urls.every(function (u) {
+            var b = baseName(u);
+            return srcs.some(function (s) { return s.indexOf(b) !== -1; });
+        });
+    }
+
+    function render(st) {
+        var o = outer(), gr_ = grid(), g = gallery();
+        if (!o || !gr_) return;
+        var urls = st.urls || [];
+        if (st.run !== lastRun) {
+            lastRun = st.run;
+            lastKey = "";
+            gr_.innerHTML = "";
+        }
+        var uncovered = urls.length > 0 && !covered(urls);
+        if (!uncovered) {
+            o.style.display = "none";
+            if (g) g.style.display = "";
+            return;
+        }
+        var key = urls.join("|");
+        if (key !== lastKey) {
+            lastKey = key;
+            gr_.innerHTML = "";
+            urls.forEach(function (u) {
+                var a = document.createElement("a");
+                a.href = u; a.target = "_blank"; a.rel = "noopener";
+                var im = document.createElement("img");
+                im.src = u; im.alt = "generated image";
+                a.appendChild(im);
+                gr_.appendChild(a);
+            });
+        }
+        o.style.display = "block";
+        // While running, the old gallery content points at files that were
+        // deleted when Generate was clicked, so hide it until Gradio's final
+        // update arrives (it then covers every live image and this hides).
+        if (g) g.style.display = st.running ? "none" : "";
+    }
+
+    function tick() {
+        fetch("/picgen/live/poll", { cache: "no-store", credentials: "same-origin" })
+            .then(function (r) { return r.json(); })
+            .then(render)
+            .catch(function () {});
+    }
+    setInterval(tick, 500);
+}
+"""
+    demo.load(fn=None, js=_picgen_live_js)
 
     _picgen_dl_intercept_js = """
 () => {
@@ -14601,6 +15514,28 @@ async def _picgen_progress_poll():
     )
 
 
+async def _picgen_live_poll():
+    """Images finished so far in the current picgen run, as /file= URLs.
+    One-shot JSON (no streaming), so it works through Cloudflare Tunnel."""
+    from urllib.parse import quote as _quote
+    with _picgen_live_lock:
+        run = _picgen_live["run"]
+        paths = list(_picgen_live["paths"])
+    urls = []
+    for p in paths:
+        try:
+            if os.path.exists(p):
+                urls.append("/file=" + _quote(p))
+        except Exception:
+            pass
+    st = _get_picgen_progress()
+    return _FastAPIResponse(
+        content=json.dumps({"run": run, "running": bool(st.get("running")), "urls": urls}),
+        media_type="application/json",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
 async def _picgen_progress_stream(request: _FastAPIRequest):
     """SSE stream of picgen progress, guaranteed to flush in real time."""
     from fastapi.responses import StreamingResponse as _StreamingResponse
@@ -14664,6 +15599,8 @@ def _register_picgen_progress_routes():
         existing = {getattr(r, "path", None) for r in app.routes}
         if "/picgen/progress/poll" not in existing:
             app.add_api_route("/picgen/progress/poll", _picgen_progress_poll, methods=["GET"])
+        if "/picgen/live/poll" not in existing:
+            app.add_api_route("/picgen/live/poll", _picgen_live_poll, methods=["GET"])
         if "/picgen/stash" not in existing:
             app.add_api_route("/picgen/stash", _picgen_stash_put, methods=["POST"])
         if "/picgen/progress/stream" not in existing:
@@ -15046,7 +15983,7 @@ if __name__ == "__main__":
                       "sets up on first use with audio checked.")
             else:
                 try:
-                    if _await_vidgen_assets_gate("audio engine pre-download (F5-TTS + Foley)"):
+                    if _await_vidgen_assets_gate("audio engine pre-download (Chatterbox + MMAudio)"):
                         if not _AUDIO_ENGINE_AVAILABLE:
                             print("[Predownload] Downloading audio engine assets...")
                             _ensure_audio_engines()
@@ -15054,8 +15991,4 @@ if __name__ == "__main__":
                         else:
                             print("[Predownload] Audio engine already ready — OK.")
                 except Exception as _e:
-                    print(f"[Predownload] Audio engine failed (non-fatal): {_e}")
-
-            print("[Predownload] All background pre-downloads complete.")
-
-        threading.Thread(target=_bg_predownload_assets, daemon=True).start()
+                    print(f"[Predownload] Audio engine failed: {_e}")
