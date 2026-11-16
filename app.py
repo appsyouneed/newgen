@@ -30,6 +30,20 @@ logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 logging.getLogger("torch.utils._pytree").setLevel(logging.ERROR)
 logging.getLogger("absl").setLevel(logging.ERROR)
 
+# DEBUG flag: pass -debug or --debug in run command to enable detailed startup logging
+# Define at module level so it's available throughout initialization
+_DEBUG_STARTUP = "-debug" in sys.argv or "--debug" in sys.argv
+if _DEBUG_STARTUP:
+    print(f"[DEBUG] sys.argv = {sys.argv}")
+    sys.stdout.flush()
+
+# CPU-ONLY flag: pass -nogpu or --nogpu to force CPU-only execution (no GPU memory usage)
+_CPU_ONLY_MODE = "-nogpu" in sys.argv or "--nogpu" in sys.argv
+if _CPU_ONLY_MODE:
+    print(f"[CPU-ONLY] CPU-only mode enabled. Generation will run entirely on CPU.", flush=True)
+    sys.stdout.flush()
+
+
 # Suppress MediaPipe verbose logging (EGL, GL context, TensorFlow Lite warnings)
 os.environ['GLOG_minloglevel'] = '3'  # Suppress GLOG (Google logging) - only FATAL
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logs
@@ -172,8 +186,13 @@ def _parse_novidgen(argv):
 
 STARTUP_MODE = _parse_startup_mode(sys.argv)
 VIDGEN_DISABLED = _parse_novidgen(sys.argv)
+
+# In picgen mode, automatically disable vidgen unless explicitly enabled with -vidgen
+if STARTUP_MODE == "picgen" and not VIDGEN_DISABLED:
+    VIDGEN_DISABLED = True
+
 if VIDGEN_DISABLED:
-    print("[Mode] --novidgen: vidgen is DISABLED for this session — no Wan / "
+    print("[Mode] vidgen is DISABLED for this session — no Wan / "
           "F5-TTS / Foley / MuseTalk files will be downloaded or loaded. "
           "Restart without -novidgen to enable the video tab.")
 
@@ -287,7 +306,9 @@ def _read_cloudflare_url():
 def _print_ready_banner(what: str = "READY"):
     """Print the final clickable access-URL banner. Falls back to the local URL
     if the Cloudflare file isn't present (e.g. launched without run.sh)."""
+    if _DEBUG_STARTUP: print(f"[_print_ready_banner] Called with what='{what}'", flush=True)
     url = _read_cloudflare_url() or "http://0.0.0.0:7860"
+    if _DEBUG_STARTUP: print(f"[_print_ready_banner] url={url}", flush=True)
     line = f"  OPEN IN BROWSER:  {url}"
     bar = "=" * max(58, len(line) + 2)
     try:
@@ -297,7 +318,9 @@ def _print_ready_banner(what: str = "READY"):
         print(line)
         print(bar)
         print("")
-    except Exception:
+        if _DEBUG_STARTUP: print(f"[_print_ready_banner] Banner printed successfully", flush=True)
+    except Exception as _e:
+        if _DEBUG_STARTUP: print(f"[_print_ready_banner] Exception: {_e}", flush=True)
         pass
 
 # ---------------------------------------------------------------------------
@@ -526,7 +549,9 @@ def _self_heal_gradio_version():
                 f"  The app will attempt to continue but may crash due to API mismatches."
             )
         else:
-            print(f"[VersionCheck] gradio {_cur_gradio} ?")
+            if _DEBUG_STARTUP:
+                print(f"[VersionCheck] gradio {_cur_gradio} ?")
+
         # Always reapply file patches — they are idempotent and touch only
         # the gradio/gradio_client source files inside the venv, not packages.
         _self_heal_patch_gradio_oauth()
@@ -568,7 +593,9 @@ def _self_heal_transformers_version():
                 f"  Run setup.sh to rebuild the app venv with the correct versions."
             )
         else:
-            print(f"[VersionCheck] transformers {_cur} ?")
+            if _DEBUG_STARTUP:
+                print(f"[VersionCheck] transformers {_cur} ?")
+
     except Exception as _e:
         print(f"[VersionCheck] transformers version check failed (non-fatal): {_e}")
 
@@ -624,7 +651,9 @@ def _self_heal_opencv():
                 pass
         
         # CascadeClassifier missing or broken - reinstall opencv-python
-        print("[SelfHeal] OpenCV missing CascadeClassifier (likely opencv-python-headless) — reinstalling opencv-python...")
+        if _DEBUG_STARTUP:
+            print("[SelfHeal] OpenCV missing CascadeClassifier (likely opencv-python-headless) — reinstalling opencv-python...")
+
         
         # Step 1: Uninstall all opencv variants to ensure clean slate
         _r = subprocess.run(
@@ -636,14 +665,17 @@ def _self_heal_opencv():
         
         # Step 2: Install opencv-python WITH dependencies (pip will preserve numpy
         # if it already satisfies opencv's requirement, which it does)
-        print("[SelfHeal] Installing opencv-python...")
+        if _DEBUG_STARTUP:
+            print("[SelfHeal] Installing opencv-python...")
+
         _r = subprocess.run(
             [sys.executable, "-m", "pip", "install", "--no-cache-dir", "opencv-python>=4.5.0,<5.0"],
             capture_output=True, text=True,
         )
         if _r.returncode != 0:
-            print(f"[SelfHeal] opencv-python install failed: {_r.stderr.strip()}")
-            print("[SelfHeal] Face blending will be disabled this session.")
+            if _DEBUG_STARTUP:
+                print(f"[SelfHeal] opencv-python install failed: {_r.stderr.strip()}")
+                print("[SelfHeal] Face blending will be disabled this session.")
             return
         
         # Don't try to reimport cv2 here - Python's import system caches
@@ -695,7 +727,9 @@ def _self_heal_diffusers_version():
                 f"  Run setup.sh to rebuild the app venv with the correct versions."
             )
         else:
-            print(f"[VersionCheck] diffusers {_cur} ?")
+            if _DEBUG_STARTUP:
+                print(f"[VersionCheck] diffusers {_cur} ?")
+
     except Exception as _e:
         print(f"[VersionCheck] diffusers version check failed (non-fatal): {_e}")
 
@@ -783,23 +817,31 @@ import numpy as np
 import torch
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
+
+# CRITICAL: If CPU-only mode, disable CUDA entirely before any model loading
+# This must happen immediately after torch import so diffusers/accelerate never tries GPU
+if "-nogpu" in sys.argv or "--nogpu" in sys.argv:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    torch.cuda.is_available = lambda: False
+
 # cudnn.benchmark=True lets cuDNN autotune the fastest conv algorithm for each
 # input shape. Video generation uses fixed shapes within a run (same resolution
 # across all steps/segments), so autotuning pays off after the first step and
 # speeds every subsequent conv — quality-neutral (same math, faster kernel).
-torch.backends.cudnn.benchmark = True
-# TF32 (Tensor Float 32) on Ampere/Ada: 8x faster matmuls than fp32, maintains
-# bf16-equivalent precision (10-bit mantissa), zero quality loss. Native hardware
-# format on GA100/GA102+ tensor cores. Massive speedup for video generation.
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-# Persistent CUDA allocator: keep freed memory in the cache longer, reducing
-# expensive cudaMalloc/cudaFree calls during video generation (many segments).
-# Trades slightly higher baseline memory for 10-20% faster repeated allocations.
-try:
-    torch.cuda.memory.set_per_process_memory_fraction(0.95)  # Use 95% of VRAM
-except Exception:
-    pass
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    # TF32 (Tensor Float 32) on Ampere/Ada: 8x faster matmuls than fp32, maintains
+    # bf16-equivalent precision (10-bit mantissa), zero quality loss. Native hardware
+    # format on GA100/GA102+ tensor cores. Massive speedup for video generation.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # Persistent CUDA allocator: keep freed memory in the cache longer, reducing
+    # expensive cudaMalloc/cudaFree calls during video generation (many segments).
+    # Trades slightly higher baseline memory for 10-20% faster repeated allocations.
+    try:
+        torch.cuda.memory.set_per_process_memory_fraction(0.95)  # Use 95% of VRAM
+    except Exception:
+        pass
 
 
 _SDPA_STATE = {"order": None}
@@ -823,7 +865,14 @@ def _get_sdpa_order():
             raise RuntimeError("CUDA not available")
         dev = f"cuda:{torch.cuda.current_device()}"
         gen = torch.Generator(device=dev).manual_seed(1234)
-        shape = (1, 40, 4096, 128)          # Wan 14B: 40 heads, head_dim 128
+        # Use a smaller probe shape on small-VRAM cards to avoid eating into the
+        # ~11 GB budget with a 480 MB benchmark allocation before generation.
+        # The timing result is still representative — relative kernel speed is
+        # shape-independent on the same GPU.
+        _probe_vram = _device_total_vram_gb(dev) if torch.cuda.is_available() else 0.0
+        shape = ((1, 40, 4096, 128)   # Wan 14B nominal shape (160 MB per tensor)
+                 if _probe_vram >= 20.0
+                 else (1, 16, 512, 64))  # small-VRAM probe (~4 MB per tensor)
         q = torch.randn(shape, device=dev, dtype=torch.bfloat16, generator=gen)
         k = torch.randn(shape, device=dev, dtype=torch.bfloat16, generator=gen)
         v = torch.randn(shape, device=dev, dtype=torch.bfloat16, generator=gen)
@@ -834,11 +883,18 @@ def _get_sdpa_order():
             with sdpa_kernel([SDPBackend.MATH]):
                 ref = torch.nn.functional.scaled_dot_product_attention(
                     q[:, :1].float(), k[:, :1].float(), v[:, :1].float())
+        # On Pascal (sm_61) and older, FLASH_ATTENTION has no kernel — trying it
+        # raises "No available kernel" and wastes time.  Gate it on sm>=8.0.
+        _sm_major_sdpa = GPU_CC[0] if GPU_CC else 0
         results = []
         notes = []
         for _name in ("CUDNN_ATTENTION", "FLASH_ATTENTION", "EFFICIENT_ATTENTION"):
             _b = getattr(SDPBackend, _name, None)
             if _b is None:
+                continue
+            if _name == "FLASH_ATTENTION" and _sm_major_sdpa < 8:
+                notes.append("flash: skipped (requires sm>=8.0, this GPU is sm_"
+                              f"{_sm_major_sdpa}x)")
                 continue
             try:
                 with torch.autocast(device_type="cuda", enabled=False), sdpa_kernel([_b]):
@@ -1219,7 +1275,7 @@ VIDGEN_TMP_DIR = Path(os.path.join(SCRIPT_DIR, "tmp", "gradio"))
 def _write_video_tmp(data: bytes, filename: str) -> str:
     """Write video bytes to the RAM filesystem and return the absolute path.
     
-    Uses /root/newgen/tmp/gradio/ which is in allowed_paths so Gradio can serve it via /file=.
+    Uses /media/dev/Storage 2/system/generators/newgen/tmp/gradio/ which is in allowed_paths so Gradio can serve it via /file=.
     """
     VIDGEN_TMP_DIR.mkdir(parents=True, exist_ok=True)
     path = VIDGEN_TMP_DIR / filename
@@ -1477,16 +1533,27 @@ def _heal_torchvision():
 
 _heal_torchvision()
 
-sys.path.append(os.path.join(SCRIPT_DIR, "train_log"))
-from train_log.RIFE_HDv3 import Model
+# Only import RIFE_HDv3 if vidgen is NOT disabled
+if not VIDGEN_DISABLED:
+    sys.path.append(os.path.join(SCRIPT_DIR, "train_log"))
+    from train_log.RIFE_HDv3 import Model
+else:
+    # vidgen disabled — placeholder so code doesn't break if Model is referenced
+    Model = None
 
 
 FORCE_DUAL_RESIDENT = False
 AGGRESSIVE_OPTIMIZATION = True
 
-_gpu_count = torch.cuda.device_count()
-if _gpu_count < 1:
-    raise RuntimeError("No CUDA device visible  this app requires a GPU.")
+# CRITICAL: Check for CPU-only mode BEFORE attempting any GPU detection
+# This prevents crashing when trying to query GPU properties in -nogpu mode
+if not _CPU_ONLY_MODE:
+    _gpu_count = torch.cuda.device_count()
+    if _gpu_count < 1:
+        raise RuntimeError("No CUDA device visible  this app requires a GPU.")
+else:
+    _gpu_count = 0
+    print("[CPU-ONLY] Skipping GPU detection — CPU-only mode active")
 
 # ---------------------------------------------------------------------------
 # GPU PROFILE — detected once at startup, used throughout for adaptive
@@ -1555,8 +1622,19 @@ def _detect_gpu_profile(device_idx: int = 0) -> dict:
 
 # Detect using the WAN device (cuda:1 in dual-GPU, cuda:0 otherwise).
 # We haven't set DUAL_GPU yet so we peek at device count directly.
-_wan_device_idx = 1 if (_gpu_count >= 2 and os.environ.get("NEWGEN_FORCE_SINGLE_GPU") != "1") else 0
-GPU_PROFILE = _detect_gpu_profile(_wan_device_idx)
+# CRITICAL: Only call _detect_gpu_profile if NOT in CPU-only mode
+if _CPU_ONLY_MODE:
+    GPU_PROFILE = {
+        "vram_gb": 0.0,
+        "cc": (0, 0),
+        "name": "cpu",
+        "high_vram": False,
+        "sm_str": "",
+        "torch_index": "https://download.pytorch.org/whl/cpu",
+    }
+else:
+    _wan_device_idx = 1 if (_gpu_count >= 2 and os.environ.get("NEWGEN_FORCE_SINGLE_GPU") != "1") else 0
+    GPU_PROFILE = _detect_gpu_profile(_wan_device_idx)
 
 GPU_VRAM_GB   = GPU_PROFILE["vram_gb"]
 GPU_CC        = GPU_PROFILE["cc"]
@@ -1568,6 +1646,17 @@ GPU_TORCH_IDX = GPU_PROFILE["torch_index"] # pip wheel index for MuseTalk venv
 DUAL_GPU = _gpu_count >= 2 and os.environ.get("NEWGEN_FORCE_SINGLE_GPU") != "1"
 PIC_DEVICE = "cuda:0"
 WAN_DEVICE = "cuda:1" if DUAL_GPU else "cuda:0"
+CPU_ONLY_TEST = os.environ.get("CPU_ONLY_TEST") == "1"
+
+if CPU_ONLY_TEST:
+    print("[CPU_ONLY_TEST] Model will remain on CPU (GPU offload disabled for testing)")
+    PIC_DEVICE = "cpu"
+    WAN_DEVICE = "cpu"
+
+# CRITICAL: When -nogpu is set, force both models to CPU
+if _CPU_ONLY_MODE:
+    PIC_DEVICE = "cpu"
+    WAN_DEVICE = "cpu"
 
 if DUAL_GPU:
     print(f"Dual GPU: Qwen -> {PIC_DEVICE}, Wan -> {WAN_DEVICE}. Both load at startup, no swapping.")
@@ -1814,7 +1903,7 @@ class _SegmentEncoder:
 # Chatterbox — own venv (.chatterbox-venv), persistent GPU worker process
 #              (see _ensure_chatterbox / _run_chatterbox below).
 # (HunyuanVideo-Foley below is legacy and no longer used for SFX.)
-# HunyuanVideo-Foley — cloned repo at /root/newgen/HunyuanVideo-Foley,
+# HunyuanVideo-Foley — cloned repo at /media/dev/Storage 2/system/generators/newgen/HunyuanVideo-Foley,
 #              called via subprocess (it has no installable Python package).
 # ---------------------------------------------------------------------------
 
@@ -1826,7 +1915,7 @@ FOLEY_MODEL_DIR = Path(SCRIPT_DIR) / "HunyuanVideo-Foley-weights"
 #
 # ALL three engines (F5-TTS, HunyuanVideo-Foley, MuseTalk) live in their
 # own venvs that are completely separate from both the system Python packages
-# and the app venv (/root/newgen/.app-venv).  This means:
+# and the app venv (/media/dev/Storage 2/system/generators/newgen/.app-venv).  This means:
 #   • protobuf conflicts between F5-TTS (>=6.33) and Foley (<5.0) are gone
 #   • MuseTalk's mmcv/mmdet/mmpose (OpenMMLab) stack cannot downgrade the
 #     app's numpy/torch, and its own torch copy never touches the system one
@@ -5859,7 +5948,8 @@ def _tune_wan_vae_layout():
         def _run():
             with torch.no_grad(), torch.autocast(device_type="cuda", enabled=False):
                 o = dec(z, return_dict=False)[0]
-            torch.cuda.synchronize()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             return o
 
         def _time(n=3):
@@ -5894,30 +5984,27 @@ def _tune_wan_vae_layout():
 def _build_wan_pipeline(target_device="cpu"):
     global wan_pipe, _wan_loaded, _wan_scheduler_config
 
+    # Always load to CPU first regardless of target_device.
+    # On small-VRAM cards (< 40 GB) the pipeline MUST start on CPU so that
+    # enable_model_cpu_offload() can install its hooks correctly — the hooks
+    # only stream components to GPU during forward passes; if the pipeline is
+    # already on GPU when the hooks are installed the weights stay there and
+    # fill the whole card.  On big cards _enable_offload() will call
+    # _safe_move_to_device() itself after the hooks decision is made.
+    pipeline = WanImageToVideoPipeline.from_pretrained(
+        WAN_MODEL_REPO,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        device_map=None,
+        use_safetensors=True
+    )
     if target_device == "cpu":
-        pipeline = WanImageToVideoPipeline.from_pretrained(
-            WAN_MODEL_REPO,
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            device_map=None,
-            use_safetensors=True
-        )
         print(f" WAMU v2 loaded to CPU (ready for fast swapping)")
     else:
-        pipeline = WanImageToVideoPipeline.from_pretrained(
-            WAN_MODEL_REPO,
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            device_map=None,
-            use_safetensors=True
-        )
-
-        # The active pipeline is always fully GPU resident.  Component-wise
-        # movement controls peak allocation without changing BF16 precision or
-        # steady-state execution speed; activation rollback handles failure.
-        _safe_move_to_device(pipeline, target_device)
-        torch.cuda.synchronize(target_device)
-        print(f" WAMU v2 loaded fully on {target_device} ({GPU_VRAM_GB:.0f} GB VRAM) - Ready!")
+        # For large-VRAM cards that do full residency, _enable_offload will
+        # move the pipeline to the GPU after this function returns.  Log the
+        # intent here; the actual move is reported by _enable_offload.
+        print(f" WAMU v2 loaded to CPU — _enable_offload will place on {target_device} ({GPU_VRAM_GB:.0f} GB VRAM)")
 
     _wan_scheduler_config = dict(pipeline.scheduler.config)
 
@@ -5958,6 +6045,25 @@ def _build_wan_pipeline(target_device="cpu"):
     # both are handled: weights to float32, and encode/decode shielded from
     # autocast. Costs a little decode time and ~1 GB; set
     # NEWGEN_WAN_VAE_FP32=0 to turn it off.
+    #
+    # On small-VRAM cards (< 40 GB) using model-CPU-offload the VAE runs on
+    # GPU only during its own forward pass, then moves back to CPU. Calling
+    # vae.to(torch.float32) here would pin the VAE's weights on whatever device
+    # they currently live on and double their VRAM cost during decode (~2 GB in
+    # float32 vs ~1 GB in bf16). On these cards we skip the float32 upgrade:
+    # the autocast shield wrapper still prevents precision downcast during the
+    # forward pass even in bf16, so quality impact is minimal.
+    _wan_vram_for_fp32 = _device_total_vram_gb(WAN_DEVICE)
+    if _WAN_VAE_FP32_ENABLED and _wan_vram_for_fp32 < FULL_RESIDENCY_VRAM_GB:
+        print(f" WAN VAE: skipping float32 upgrade on {_wan_vram_for_fp32:.0f} GB card "
+              f"(offload mode — VAE stays bf16 to conserve VRAM during decode).")
+        # Monkey-patch _WAN_VAE_FP32_ENABLED locally so _set_wan_vae_precision
+        # is a no-op for this pipeline instance.
+        import builtins
+        _orig_fp32_flag = _WAN_VAE_FP32_ENABLED
+        # We shadow the global only for the duration of this call by passing
+        # full_precision=False explicitly below.
+
     _fastvae_active = False
     if _FASTVAE_REQUESTED:
         try:
@@ -5970,13 +6076,26 @@ def _build_wan_pipeline(target_device="cpu"):
             print(f" WAN VAE: fastvae requested but unavailable ({_e}); using the float32 decoder. "
                   "Install it with: pip install fastvae")
     if not _fastvae_active:
-        _set_wan_vae_precision(pipeline, True)
+        # On small-VRAM cards (< 40 GB) skip the float32 precision upgrade so
+        # the VAE is not pinned to GPU early and doesn't consume an extra ~1 GB
+        # of VRAM during the decode pass.  The autocast shield in
+        # _set_wan_vae_precision still fires even in bf16 mode and prevents
+        # the autocast from down-casting the VAE, so quality loss is minimal.
+        _use_fp32_vae = _WAN_VAE_FP32_ENABLED and (_device_total_vram_gb(WAN_DEVICE) >= FULL_RESIDENCY_VRAM_GB)
+        _set_wan_vae_precision(pipeline, _use_fp32_vae)
 
-    # VAE memory format optimization: channels-last is 1.3-1.4x faster on Ampere
-    # for conv3d operations (VAE decoder). Quality-neutral (same math, better memory access).
+    # VAE memory format optimization: channels-last is faster on Ampere for
+    # conv3d operations.  On small-VRAM cards the pipeline is on CPU at this
+    # point so the .to(memory_format=...) is a CPU tensor operation and is
+    # always safe — it does NOT move the VAE to GPU.
     try:
-        pipeline.vae = pipeline.vae.to(memory_format=torch.channels_last)
-        print(f" WAN VAE: channels-last memory format (1.3-1.4x faster decode on Ampere).")
+        # Only attempt on CPU tensors to avoid an accidental GPU placement.
+        _vae_dev = next(pipeline.vae.parameters(), None)
+        if _vae_dev is None or _vae_dev.device.type == "cpu":
+            pipeline.vae = pipeline.vae.to(memory_format=torch.channels_last)
+            print(f" WAN VAE: channels-last memory format (faster decode on Ampere).")
+        else:
+            print(f" WAN VAE: channels-last skipped (VAE already on {_vae_dev.device} — deferring to offload).")
     except Exception as _e:
         print(f" WAN VAE: channels-last conversion skipped ({_e}).")
 
@@ -6287,9 +6406,22 @@ def _complete_body_safe(rgba: Image.Image) -> Image.Image:
 
     try:
         activate_pic()
-        torch.cuda.set_device(PIC_DEVICE)
-        with torch.cuda.device(PIC_DEVICE):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        if PIC_DEVICE.startswith("cuda"):
+            torch.cuda.set_device(PIC_DEVICE)
+            with torch.cuda.device(PIC_DEVICE):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    result = pic_pipe(
+                        image=[rgb_canvas],
+                        prompt=instruction,
+                        negative_prompt="distorted, deformed, extra limbs, mutated, blurry",
+                        num_inference_steps=4,
+                        true_cfg_scale=1.0,
+                        generator=torch.Generator(device=PIC_DEVICE).manual_seed(
+                            random.randint(0, np.iinfo(np.int32).max)
+                        ),
+                    )
+        else:
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
                 result = pic_pipe(
                     image=[rgb_canvas],
                     prompt=instruction,
@@ -6426,9 +6558,22 @@ def _apply_merge_background(
                 base.paste(_m.convert("RGB"), mask=_m.split()[3])
 
                 activate_pic()
-                torch.cuda.set_device(PIC_DEVICE)
-                with torch.cuda.device(PIC_DEVICE):
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                if PIC_DEVICE.startswith("cuda"):
+                    torch.cuda.set_device(PIC_DEVICE)
+                    with torch.cuda.device(PIC_DEVICE):
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            result = pic_pipe(
+                                image=[base],
+                                prompt=instruction,
+                                negative_prompt=" ",
+                                num_inference_steps=4,
+                                true_cfg_scale=1.0,
+                                generator=torch.Generator(device=PIC_DEVICE).manual_seed(
+                                    random.randint(0, np.iinfo(np.int32).max)
+                                ),
+                            )
+                else:
+                    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
                         result = pic_pipe(
                             image=[base],
                             prompt=instruction,
@@ -6512,9 +6657,22 @@ def _complete_body_on_photo(photo: Image.Image) -> Image.Image:
 
     try:
         activate_pic()
-        torch.cuda.set_device(PIC_DEVICE)
-        with torch.cuda.device(PIC_DEVICE):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        if PIC_DEVICE.startswith("cuda"):
+            torch.cuda.set_device(PIC_DEVICE)
+            with torch.cuda.device(PIC_DEVICE):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    result = pic_pipe(
+                        image=[canvas],
+                        prompt=instruction,
+                        negative_prompt="distorted, deformed, extra limbs, mutated, duplicate person",
+                        num_inference_steps=4,
+                        true_cfg_scale=1.0,
+                        generator=torch.Generator(device=PIC_DEVICE).manual_seed(
+                            random.randint(0, np.iinfo(np.int32).max)
+                        ),
+                    )
+        else:
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
                 result = pic_pipe(
                     image=[canvas],
                     prompt=instruction,
@@ -6632,13 +6790,24 @@ def _merge_into_person_photo(
         f"person or anything else already visible. Only paint into the empty white area{_gender_clause}."
     )
 
-    extended_bg = canvas.copy()
     try:
         activate_pic()
-        torch.cuda.set_device(PIC_DEVICE)
-        torch.cuda.synchronize(PIC_DEVICE)
-        with torch.cuda.device(PIC_DEVICE):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        if PIC_DEVICE.startswith("cuda"):
+            torch.cuda.set_device(PIC_DEVICE)
+            with torch.cuda.device(PIC_DEVICE):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    result = pic_pipe(
+                        image=[canvas],
+                        prompt=outpaint_instruction,
+                        negative_prompt="people, person, extra person, duplicate, seam, dividing line, border, frame, watermark",
+                        num_inference_steps=4,
+                        true_cfg_scale=1.0,
+                        generator=torch.Generator(device=PIC_DEVICE).manual_seed(
+                            random.randint(0, np.iinfo(np.int32).max)
+                        ),
+                    )
+        else:
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
                 result = pic_pipe(
                     image=[canvas],
                     prompt=outpaint_instruction,
@@ -6920,9 +7089,20 @@ def edit_reference_frame(
     if swap_time > 3.0:
         print(f" Model swap completed in {swap_time:.1f}s")
 
-    torch.cuda.set_device(PIC_DEVICE)
-    with torch.cuda.device(PIC_DEVICE):
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    if PIC_DEVICE.startswith("cuda"):
+        torch.cuda.set_device(PIC_DEVICE)
+        with torch.cuda.device(PIC_DEVICE):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                result = pic_pipe(
+                    image=[image],
+                    prompt=instruction,
+                    negative_prompt=" ",
+                    num_inference_steps=int(steps),
+                    true_cfg_scale=float(guidance),
+                    generator=torch.Generator(device=PIC_DEVICE).manual_seed(seed),
+                )
+    else:
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
             result = pic_pipe(
                 image=[image],
                 prompt=instruction,
@@ -7012,122 +7192,123 @@ def animate_frame(
 
     steps = wan_steps if wan_steps is not None else WAN_STEPS
 
-    with torch.cuda.device(WAN_DEVICE):
-        # Faster exact VAE layout: measured once, then re-applied after swaps.
-        _tune_wan_vae_layout()
-        # Show the expert split for this run and keep a very high flow shift
-        # (manual slider or a LoRA recommendation) from leaving the detail
-        # expert with a single step. Applies to every video mode.
-        _fs_checked = _guard_flow_shift(
-            flow_shift if flow_shift is not None else WAN_FLOW_SHIFT,
-            steps, getattr(wan_pipe.config, "boundary_ratio", None))
-        _set_flow_shift(wan_pipe, _fs_checked)
+    if WAN_DEVICE.startswith("cuda"):
+        with torch.cuda.device(WAN_DEVICE):
+            # Faster exact VAE layout: measured once, then re-applied after swaps.
+            _tune_wan_vae_layout()
+            # Show the expert split for this run and keep a very high flow shift
+            # (manual slider or a LoRA recommendation) from leaving the detail
+            # expert with a single step. Applies to every video mode.
+            _fs_checked = _guard_flow_shift(
+                flow_shift if flow_shift is not None else WAN_FLOW_SHIFT,
+                steps, getattr(wan_pipe.config, "boundary_ratio", None))
+            _set_flow_shift(wan_pipe, _fs_checked)
 
-        print(f"[2/2] Wan animating {num_frames} frames at {frame.size}...")
-        print(f"Seed: {seed} | Steps: {steps}")
+            print(f"[2/2] Wan animating {num_frames} frames at {frame.size}...")
+            print(f"Seed: {seed} | Steps: {steps}")
 
-        kwargs = dict(
-            image=frame,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=frame.height,
-            width=frame.width,
-            num_frames=num_frames,
-            num_inference_steps=steps,
-            guidance_scale=WAN_GUIDANCE,
-            guidance_scale_2=WAN_GUIDANCE,
-            generator=torch.Generator(device=WAN_DEVICE).manual_seed(seed),
-            output_type="np",
-        )
+            kwargs = dict(
+                image=frame,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                height=frame.height,
+                width=frame.width,
+                num_frames=num_frames,
+                num_inference_steps=steps,
+                guidance_scale=WAN_GUIDANCE,
+                guidance_scale_2=WAN_GUIDANCE,
+                generator=torch.Generator(device=WAN_DEVICE).manual_seed(seed),
+                output_type="np",
+            )
 
-        # Drive the caller's step-progress callback (expects a 0..1 fraction of
-        # THIS segment) from the diffusion pipeline's per-step callback, so the
-        # output-box progress advances smoothly during denoising instead of
-        # freezing at the segment's starting percentage.
-        # Always installed (not only when a progress callback exists): it is also
-        # where Cancel is noticed, once per denoise step.
-        _total_steps = max(1, int(steps))
+            # Drive the caller's step-progress callback (expects a 0..1 fraction of
+            # THIS segment) from the diffusion pipeline's per-step callback, so the
+            # output-box progress advances smoothly during denoising instead of
+            # freezing at the segment's starting percentage.
+            # Always installed (not only when a progress callback exists): it is also
+            # where Cancel is noticed, once per denoise step.
+            _total_steps = max(1, int(steps))
 
-        def _step_cb(pipe, step_index, timestep, cb_kwargs):
-            if _vidgen_cancel.is_set():
-                raise _VidgenCancelled()
-            if callable(progress):
-                try:
-                    progress((step_index + 1) / _total_steps)
-                except Exception:
-                    pass
-            return cb_kwargs
-
-        kwargs["callback_on_step_end"] = _step_cb
-
-        def _call_pipe(**kw):
-            # bf16 autocast + fused SDPA backend: quality-neutral speedups for
-            # the Wan denoise loop (exact math, faster attention/matmul kernels
-            # on Blackwell). Both are guarded and fall back cleanly.
-            import time as _tm_pipe
-            _WAN_TIMING["decode"] = 0.0
-            _tp0 = _tm_pipe.time()
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                with _fused_sdpa_backend():
+            def _step_cb(pipe, step_index, timestep, cb_kwargs):
+                if _vidgen_cancel.is_set():
+                    raise _VidgenCancelled()
+                if callable(progress):
                     try:
-                        _frames = wan_pipe(**kw).frames[0]
-                    except TypeError as e:
-                        # Older pipeline without callback_on_step_end support:
-                        # retry without the callback rather than failing.
-                        if "callback_on_step_end" in str(e) and "callback_on_step_end" in kw:
-                            kw.pop("callback_on_step_end", None)
-                            _frames = wan_pipe(**kw).frames[0]
-                        else:
-                            raise
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
-            _ttot = _tm_pipe.time() - _tp0
-            _tdec = _WAN_TIMING.get("decode", 0.0)
-            print(f"[Timing] Wan segment: {_ttot:.1f}s total = "
-                  f"{max(0.0, _ttot - _tdec):.1f}s denoise+setup + {_tdec:.1f}s VAE decode "
-                  f"({kw.get('num_frames')} frames, {steps} steps)")
-            return _frames
-
-        def _run(**kw):
-            try:
-                return _call_pipe(**kw)
-            except Exception as e:
-                # Safety net: if a full-frame VAE decode ran out of memory or hit
-                # a CUDA error, re-enable VAE tiling and retry ONCE. This lets us
-                # default to the faster/cleaner full-frame decode on big cards
-                # while never hard-failing a generation if it doesn't fit.
-                _msg = str(e).lower()
-                _oom = ("out of memory" in _msg or "illegal memory access" in _msg
-                        or "cuda error" in _msg or isinstance(e, torch.cuda.OutOfMemoryError))
-                _tiled_already = _offload_state.get("_wan_vae_tiled", False)
-                if _oom and not _tiled_already:
-                    print(f"[2/2] Wan full-frame decode failed ({type(e).__name__}) — "
-                          f"re-enabling VAE tiling and retrying once...")
-                    try:
-                        # Only clean up on actual OOM, not between segments
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        wan_pipe.vae.enable_tiling()
-                        wan_pipe.vae.enable_slicing()
-                        _offload_state["_wan_vae_tiled"] = True
+                        progress((step_index + 1) / _total_steps)
                     except Exception:
                         pass
+                return cb_kwargs
+
+            kwargs["callback_on_step_end"] = _step_cb
+
+            def _call_pipe(**kw):
+                # bf16 autocast + fused SDPA backend: quality-neutral speedups for
+                # the Wan denoise loop (exact math, faster attention/matmul kernels
+                # on Blackwell). Both are guarded and fall back cleanly.
+                import time as _tm_pipe
+                _WAN_TIMING["decode"] = 0.0
+                _tp0 = _tm_pipe.time()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    with _fused_sdpa_backend():
+                        try:
+                            _frames = wan_pipe(**kw).frames[0]
+                        except TypeError as e:
+                            # Older pipeline without callback_on_step_end support:
+                            # retry without the callback rather than failing.
+                            if "callback_on_step_end" in str(e) and "callback_on_step_end" in kw:
+                                kw.pop("callback_on_step_end", None)
+                                _frames = wan_pipe(**kw).frames[0]
+                            else:
+                                raise
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                _ttot = _tm_pipe.time() - _tp0
+                _tdec = _WAN_TIMING.get("decode", 0.0)
+                print(f"[Timing] Wan segment: {_ttot:.1f}s total = "
+                      f"{max(0.0, _ttot - _tdec):.1f}s denoise+setup + {_tdec:.1f}s VAE decode "
+                      f"({kw.get('num_frames')} frames, {steps} steps)")
+                return _frames
+
+            def _run(**kw):
+                try:
                     return _call_pipe(**kw)
-                # Safety net for the full-precision VAE: if some part of this
-                # stack rejects float32 inputs, fall back to the old bf16 VAE
-                # once and retry rather than failing the generation.
-                _dtype_err = (("dtype" in _msg or "expected scalar type" in _msg
-                               or "input type" in _msg or "same dtype" in _msg)
-                              and getattr(wan_pipe.vae, "_ng_autocast_shield", False))
-                if _dtype_err:
-                    print(f"[2/2] Full-precision VAE rejected ({type(e).__name__}: {e}); "
-                          "falling back to bf16 VAE and retrying once...")
-                    _set_wan_vae_precision(wan_pipe, False)
-                    return _call_pipe(**kw)
-                raise
+                except Exception as e:
+                    # Safety net: if a full-frame VAE decode ran out of memory or hit
+                    # a CUDA error, re-enable VAE tiling and retry ONCE. This lets us
+                    # default to the faster/cleaner full-frame decode on big cards
+                    # while never hard-failing a generation if it doesn't fit.
+                    _msg = str(e).lower()
+                    _oom = ("out of memory" in _msg or "illegal memory access" in _msg
+                            or "cuda error" in _msg or isinstance(e, torch.cuda.OutOfMemoryError))
+                    _tiled_already = _offload_state.get("_wan_vae_tiled", False)
+                    if _oom and not _tiled_already:
+                        print(f"[2/2] Wan full-frame decode failed ({type(e).__name__}) — "
+                              f"re-enabling VAE tiling and retrying once...")
+                        try:
+                            # Only clean up on actual OOM, not between segments
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            wan_pipe.vae.enable_tiling()
+                            wan_pipe.vae.enable_slicing()
+                            _offload_state["_wan_vae_tiled"] = True
+                        except Exception:
+                            pass
+                        return _call_pipe(**kw)
+                    # Safety net for the full-precision VAE: if some part of this
+                    # stack rejects float32 inputs, fall back to the old bf16 VAE
+                    # once and retry rather than failing the generation.
+                    _dtype_err = (("dtype" in _msg or "expected scalar type" in _msg
+                                   or "input type" in _msg or "same dtype" in _msg)
+                                  and getattr(wan_pipe.vae, "_ng_autocast_shield", False))
+                    if _dtype_err:
+                        print(f"[2/2] Full-precision VAE rejected ({type(e).__name__}: {e}); "
+                              "falling back to bf16 VAE and retrying once...")
+                        _set_wan_vae_precision(wan_pipe, False)
+                        return _call_pipe(**kw)
+                    raise
 
         if last_frame is None:
             return _run(**kwargs)
@@ -7268,7 +7449,7 @@ def _cache_last_frame_from_video(video_file):
     """Grab the last frame of the just-generated video into memory only.
 
     video_file is a gr.File value pointing at a real filepath on
-    /root/newgen/tmp/gradio/. Reads the file, extracts the last frame,
+    /media/dev/Storage 2/system/generators/newgen/tmp/gradio/. Reads the file, extracts the last frame,
     caches as PIL Image.
     """
     global _last_generated_frame
@@ -8107,11 +8288,23 @@ def generate_custom_edit_sequence(
 
             sized_first = resize_image_for_wan(current_first, resolution)
             activate_pic()
-            torch.cuda.set_device(PIC_DEVICE)
+            if PIC_DEVICE.startswith("cuda"):
+                torch.cuda.set_device(PIC_DEVICE)
             pic_generator = torch.Generator(device=PIC_DEVICE).manual_seed(current_seed)
             try:
-                with torch.cuda.device(PIC_DEVICE):
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                if PIC_DEVICE.startswith("cuda"):
+                    with torch.cuda.device(PIC_DEVICE):
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            pic_result = pic_pipe(
+                                image=[current_first],
+                                prompt=slot["picgen"],
+                                negative_prompt=" ",
+                                num_inference_steps=int(edit_steps),
+                                true_cfg_scale=float(edit_guidance),
+                                generator=pic_generator,
+                            )
+                else:
+                    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
                         pic_result = pic_pipe(
                             image=[current_first],
                             prompt=slot["picgen"],
@@ -8498,9 +8691,10 @@ def _safe_offload_to_cpu(pipe, label="pipeline"):
     print(f"    Offloading {label} to CPU...")
     pipe.to("cpu")
     gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-    free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    free_gb = torch.cuda.mem_get_info()[0] / 1024**3 if torch.cuda.is_available() else 0
     print(f"    {label} offloaded — {free_gb:.1f} GB VRAM free")
 
 
@@ -8829,6 +9023,13 @@ def _cast_transformer_to_fp8(pipe):
     if not hasattr(torch, "float8_e4m3fn"):
         print("    [fp8] torch has no float8_e4m3fn — keeping bf16 (may not fit <40 GB cards).")
         return None
+    # sm < 8.0 (e.g., Pascal GTX 1080 Ti with sm_6.1) has NO fp8 hardware support.
+    # fp8 weights cause "dtype mismatch" errors during inference when autocast tries
+    # to run matmuls with mixed bf16/fp8 tensors. Skip fp8 entirely on old GPUs.
+    if GPU_CC[0] < 8:
+        print(f"    [fp8] GPU is sm_{GPU_CC[0]}{GPU_CC[1]} (< Ampere) — no fp8 hardware support; "
+              f"keeping transformer in bf16 (may not fit <40 GB cards).")
+        return None
     # High-VRAM cards (>=64 GB): skip ALL fp8 casting — pipeline fits fully in
     # bf16, no quantization or precision reduction of any kind.
     # On Blackwell specifically, bf16 tensor cores (and FA3) are heavily
@@ -8896,7 +9097,8 @@ def _cast_transformer_to_fp8(pipe):
 # fails for any reason, we leave the default SDPA processor untouched so the
 # app keeps working exactly as before.
 # ---------------------------------------------------------------------------
-_QWEN_FA3_ENABLED = os.environ.get("NEWGEN_QWEN_FA3", "1") == "1"
+_QWEN_FA3_ENABLED = (os.environ.get("NEWGEN_QWEN_FA3", "1") == "1" 
+                     and GPU_CC[0] >= 9)  # FA3 requires Hopper (90+) or Blackwell (120+)
 # Auto-install `kernels` (for FA3) when it is missing. On by default so the app
 # reaches max speed with no manual steps. Set NEWGEN_FA3_AUTOINSTALL=0 to skip
 # the install attempt (e.g. offline boxes) and just use SDPA.
@@ -9055,6 +9257,35 @@ def _try_enable_qwen_fa3(pipe):
         return False
     finally:
         _qwen_fa3_state["attempted"] = True
+
+
+def _disable_qwen_fa3_completely(pipe):
+    """Make sure the Qwen transformer uses diffusers' NATIVE SDPA attention processor.
+
+    FIX: the old version force-installed qwenimage's QwenDoubleStreamAttnProcessor2_0
+    or the generic AttnProcessor(). Neither matches the installed diffusers
+    transformer_qwenimage.py, whose block does
+        img_attn_output, txt_attn_output = attn_output
+    so a processor returning a single tensor crashes with
+    "not enough values to unpack (expected 2, got 1)".
+    Now: if FA3 was never enabled, leave diffusers' default processor alone;
+    if it was, restore diffusers' own processor class.
+    """
+    try:
+        transformer = getattr(pipe, "transformer", None)
+        if transformer is None or not hasattr(transformer, "set_attn_processor"):
+            return
+        if not _qwen_fa3_state.get("active"):
+            if _DEBUG_STARTUP:
+                print("    [fa3-disable] FA3 not active — keeping diffusers' default attention processor.")
+            return
+        from diffusers.models.transformers.transformer_qwenimage import QwenDoubleStreamAttnProcessor2_0
+        transformer.set_attn_processor(QwenDoubleStreamAttnProcessor2_0())
+        _qwen_fa3_state["active"] = False
+        if _DEBUG_STARTUP:
+            print("    [fa3-disable] Restored diffusers' native SDPA attention processor.")
+    except Exception as _e:
+        print(f"    [fa3-disable] Could not restore native attention processor: {_e}")
 
 
 def _apply_qwen_vae_memory_policy(pipe, device):
@@ -9567,9 +9798,10 @@ def _free_vram_for_incoming(prev_label, prev_pipe, target_label, target_pipe, ta
     need_gb = min(need_gb, card_gb - 1.0)
 
     def _free():
-        return torch.cuda.mem_get_info(idx)[0] / 1024**3
+        return torch.cuda.mem_get_info(idx)[0] / 1024**3 if torch.cuda.is_available() else 0
 
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
     comps = [(a, c) for a, c in _swap_components(prev_pipe) if _comp_on_cuda(c)]
@@ -9607,7 +9839,8 @@ def _start_bg_evict(prev_label, prev_pipe, deferred, target_device):
     if not deferred:
         return
     idx = torch.device(target_device).index or 0
-    torch.cuda.synchronize()          # nothing the outgoing model ran is still in flight
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()          # nothing the outgoing model ran is still in flight
 
     def _run():
         _t0 = time.time()
@@ -9640,6 +9873,13 @@ def _enable_offload(pipe, device, label):
     - 40-119GB: ONE model fully resident, other in CPU RAM (this function)
     - < 40GB: model-CPU-offload streams components on demand
     """
+    # CRITICAL: In CPU-only mode, skip ALL offload hooks (accelerate breaks on CPU)
+    # Just keep everything on CPU without any hooks
+    if _CPU_ONLY_MODE:
+        print(f"    [{label}] CPU-only mode — skipping offload hooks, keeping on CPU", flush=True)
+        _offload_state[label] = False
+        return
+    
     total_vram = _device_total_vram_gb(device)
     # Big card: keep everything resident, fastest path, no hooks — provided
     # the whole pipeline (plus ~6 GB activation headroom) actually fits. If it
@@ -9650,51 +9890,115 @@ def _enable_offload(pipe, device, label):
         _t_up = time.time()
         _record_cpu_masters(pipe, label)
         _safe_move_to_device(pipe, device)
-        print(f"    [Swap] {label} uploaded to {device} in {time.time() - _t_up:.1f}s")
+        print(f"    [Swap] {label} uploaded to {device} in {time.time() - _t_up:.1f}s", flush=True)
         _offload_state[label] = False
         print(f"    [{label}] full residency on {device} (card {total_vram:.0f} GB, "
-              f"pipeline {_pipe_gb:.1f} GB).")
+              f"pipeline {_pipe_gb:.1f} GB).", flush=True)
         return
     if total_vram >= FULL_RESIDENCY_VRAM_GB:
         print(f"    [{label}] pipeline {_pipe_gb:.1f} GB + headroom exceeds "
-              f"{total_vram:.0f} GB card — using offload instead of full residency.")
-    # Small card: stream components on demand.
+              f"{total_vram:.0f} GB card — using offload instead of full residency.", flush=True)
+    
+    # Small card: model MUST be on CPU before offload hooks are installed.
+    # enable_model_cpu_offload() registers forward-pass hooks that move each
+    # component from CPU -> GPU just before it runs, then back to CPU after.
+    # If the pipeline is already on GPU when the hooks are installed the hooks
+    # still fire but the weights never leave the GPU, defeating the purpose.
+    # Explicitly move to CPU here to guarantee a clean starting state,
+    # regardless of where the pipeline currently lives.
+    _pipe_on_cpu = False
     try:
-        pipe.to("cpu")
-    except Exception:
-        pass
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        # Check if any component is still on GPU and move it off first.
+        for _attr in ("transformer", "transformer_2", "text_encoder",
+                      "text_encoder_2", "vae", "image_encoder"):
+            _comp = getattr(pipe, _attr, None)
+            if _comp is not None and hasattr(_comp, "parameters"):
+                try:
+                    _p = next(_comp.parameters(), None)
+                    if _p is not None and _p.device.type == "cuda":
+                        print(f"    [{label}] WARNING: {_attr} still on GPU before offload install — "
+                              f"moving to CPU now...", flush=True)
+                        _comp.to("cpu")
+                except Exception:
+                    pass
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        _pipe_on_cpu = True
+    except Exception as _cpu_e:
+        print(f"    [{label}] CPU pre-move failed ({_cpu_e}) — proceeding anyway...", flush=True)
 
-    # Choose the offload granularity per model:
-    #
-    # picgen (Qwen): model-CPU-offload. Its largest component (fp8 transformer,
-    #   ~19 GB) plus its image-edit activations fit in 32 GB, so whole-component
-    #   offload is enough and keeps the transformer resident for the full
-    #   denoise loop (fast, no per-step penalty).
-    #
-    # vidgen (Wan): SEQUENTIAL CPU offload. Wan's transformer alone is ~26.7 GB
-    #   and video activations (dozens of frames) push a whole-transformer
-    #   residency over 32 GB — that is the OOM we hit inside the FFN GELU.
-    #   Sequential offload streams the transformer BLOCK BY BLOCK, so only one
-    #   block (a few hundred MB) is resident at a time, leaving ample room for
-    #   activations. It is slower per step than model-offload, but it is the
-    #   only way Wan's dual-expert transformer fits on a 32 GB card without
-    #   reducing frames/resolution/steps (i.e. no quality or adherence loss).
-    #   On >=40 GB cards this branch is never reached (full residency above).
-    if label == "wan" and hasattr(pipe, "enable_sequential_cpu_offload"):
-        pipe.enable_sequential_cpu_offload(device=device)
+    free_before = torch.cuda.mem_get_info()[0] / 1024**3 if torch.cuda.is_available() else 0.0
+    print(f"    [{label}] Installing offload hooks on {device} "
+          f"({free_before:.1f} GB VRAM free before hooks)...", flush=True)
+
+    try:
+        # Try enable_sequential_cpu_offload first (streams layer-by-layer, lowest
+        # peak VRAM).  Unlike the previous code this is NOT gated on sm>=9: it
+        # works on any CUDA GPU supported by accelerate, including Pascal (sm_61).
+        # It is slightly slower than model-CPU-offload because it moves every
+        # sub-module individually, but on an 11 GB card that trade-off is correct.
+        if hasattr(pipe, "enable_sequential_cpu_offload"):
+            try:
+                pipe.enable_sequential_cpu_offload(device=device)
+                _offload_state[label] = True
+                free_after = torch.cuda.mem_get_info()[0] / 1024**3 if torch.cuda.is_available() else 0.0
+                print(f"    [{label}] SEQUENTIAL CPU offload enabled on {device} "
+                      f"(card {total_vram:.0f} GB — streams layer-by-layer; "
+                      f"{free_after:.1f} GB VRAM free after hooks).", flush=True)
+                return
+            except Exception as _seq_e:
+                print(f"    [{label}] Sequential offload failed ({_seq_e}) — trying model-CPU-offload...", flush=True)
+
+        # Fallback: enable_model_cpu_offload (streams whole components, less granular)
+        pipe.enable_model_cpu_offload(device=device)
         _offload_state[label] = True
-        print(f"    [{label}] SEQUENTIAL CPU offload enabled on {device} "
-              f"(card {total_vram:.0f} GB — transformer streams block-by-block "
-              f"to fit video activations).")
-        return
+        free_after = torch.cuda.mem_get_info()[0] / 1024**3 if torch.cuda.is_available() else 0.0
+        print(f"    [{label}] model-CPU-offload enabled on {device} "
+              f"(card {total_vram:.0f} GB — components stream on demand; "
+              f"{free_after:.1f} GB VRAM free after hooks).", flush=True)
+    except Exception as _e:
+        print(f"    [{label}] model-CPU-offload FAILED: {_e} — trying attention slicing...", flush=True)
+        try:
+            # Last resort: enable attention slicing to reduce peak VRAM usage.
+            if hasattr(pipe, "enable_attention_slicing"):
+                pipe.enable_attention_slicing()
+                _offload_state[label] = True
+                print(f"    [{label}] Enabled attention slicing as fallback (slower but lower memory).", flush=True)
+        except Exception as _e2:
+            print(f"    [{label}] WARNING: No offload strategy available: {_e2}", flush=True)
 
-    pipe.enable_model_cpu_offload(device=device)
-    _offload_state[label] = True
-    print(f"    [{label}] model-CPU-offload enabled on {device} "
-          f"(card {total_vram:.0f} GB — components stream on demand).")
+    # Sanity check: after offload hooks are installed the GPU should be mostly
+    # empty (< 1 GB).  If it still shows close to the pipeline's full size
+    # the hooks did not work (e.g. pipeline was on GPU when hooks were installed).
+    if _offload_state.get(label) and torch.cuda.is_available():
+        _vram_used = (torch.cuda.get_device_properties(0).total_memory
+                      - torch.cuda.mem_get_info()[0]) / 1024**3
+        if _vram_used > 2.0:
+            print(f"    [{label}] *** OFFLOAD SANITY FAIL: {_vram_used:.1f} GB VRAM still used after "
+                  f"offload hooks installed (expected < 1 GB). "
+                  f"The pipeline may have been on GPU when hooks were installed — "
+                  f"forcing CPU move now...", flush=True)
+            # Force everything to CPU and re-install hooks.
+            try:
+                for _attr in ("transformer", "transformer_2", "text_encoder",
+                              "text_encoder_2", "vae", "image_encoder"):
+                    _comp = getattr(pipe, _attr, None)
+                    if _comp is not None:
+                        try:
+                            _comp.to("cpu")
+                        except Exception:
+                            pass
+                gc.collect()
+                torch.cuda.empty_cache()
+                _vram_after = (torch.cuda.get_device_properties(0).total_memory
+                               - torch.cuda.mem_get_info()[0]) / 1024**3
+                print(f"    [{label}] Forced CPU move: now {_vram_after:.1f} GB used.", flush=True)
+            except Exception as _sf:
+                print(f"    [{label}] Forced CPU move failed: {_sf}", flush=True)
+        else:
+            print(f"    [{label}] Offload sanity OK: {_vram_used:.1f} GB VRAM used (hooks working).",
+                  flush=True)
 
 
 def _disable_offload(pipe, label, force=False):
@@ -9747,6 +10051,13 @@ def _disable_offload(pipe, label, force=False):
                     remove_hook_from_module(comp, recurse=True)
                 except Exception:
                     pass
+                # After removing hooks the component may still be on GPU
+                # (the hook left it there from the last forward pass).
+                # Explicitly move it back to CPU now.
+                try:
+                    comp.to("cpu")
+                except Exception:
+                    pass
     except Exception as exc:
         print(f"    [{label}] hook removal fallback ({exc})")
     for _attr in ("_all_hooks", "_offload_gpu_id", "_offload_device"):
@@ -9755,6 +10066,7 @@ def _disable_offload(pipe, label, force=False):
                 setattr(pipe, _attr, [] if _attr == "_all_hooks" else None)
             except Exception:
                 pass
+    # Final sweep: move any remaining GPU tensors to CPU.
     try:
         pipe.to("cpu")
     except Exception:
@@ -9763,8 +10075,11 @@ def _disable_offload(pipe, label, force=False):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+        free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+        print(f"    [{label}] model-CPU-offload disabled — pipeline on CPU ({free_gb:.1f} GB VRAM free).")
+    else:
+        print(f"    [{label}] model-CPU-offload disabled — pipeline returned to CPU.")
     _offload_state[label] = False
-    print(f"    [{label}] model-CPU-offload disabled — pipeline returned to CPU.")
 
 
 # Backwards-compatible thin wrappers used by the picgen startup path.
@@ -9786,7 +10101,8 @@ if DUAL_GPU:
     def _load_wan_thread():
         global wan_pipe_primary
         t = time.time()
-        torch.cuda.set_device(WAN_DEVICE)
+        if WAN_DEVICE.startswith("cuda"):
+            torch.cuda.set_device(WAN_DEVICE)
         # Load to CPU then place via shared offload logic: full residency on
         # a big dedicated card, model-CPU-offload if WAN_DEVICE is a 32 GB card
         # (Wan's dual experts exceed 32 GB fully resident).
@@ -9797,48 +10113,56 @@ if DUAL_GPU:
     def _load_qwen_thread():
         global pic_pipe
         t = time.time()
-        torch.cuda.set_device(PIC_DEVICE)
-        print(" Loading Qwen Image Edit pipeline...")
+        if PIC_DEVICE.startswith("cuda"):
+            torch.cuda.set_device(PIC_DEVICE)
+        print(" Loading Qwen Image Edit pipeline (pre-merged)...")
+        
+        # Load pre-merged model: prioritize local, fall back to HuggingFace
         model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
-        if not os.path.exists(model_index_path):
-            print(f"Downloading Qwen base model to {BASE_MODEL_LOCAL_PATH}...")
-            os.makedirs(PICGEN_MODELS_DIR, exist_ok=True)
-            pipe = QwenImageEditPlusPipeline.from_pretrained(
-                "Qwen/Qwen-Image-Edit-2511",
-                torch_dtype=torch.bfloat16,
-                cache_dir=BASE_MODEL_LOCAL_PATH,
-                use_safetensors=True
-            )
-        else:
+        
+        if os.path.exists(model_index_path):
+            # Local merged model exists — use it directly
+            print(f"Loading from local merged model...")
             pipe = QwenImageEditPlusPipeline.from_pretrained(
                 BASE_MODEL_LOCAL_PATH,
                 torch_dtype=torch.bfloat16,
                 local_files_only=True,
                 use_safetensors=True
             )
-        print("Loading NSFW weights for Qwen...")
-        if not os.path.exists(NSFW_WEIGHTS_LOCAL_PATH):
-            print("Downloading NSFW weights...")
-            os.makedirs(os.path.dirname(NSFW_WEIGHTS_LOCAL_PATH), exist_ok=True)
-            v23_path = hf_hub_download(
-                repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
-                filename="v19/Qwen-Rapid-AIO-NSFW-v19.safetensors",
-                cache_dir=PICGEN_MODELS_DIR,
-                local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
-            )
+            print(f"✓ Loaded local merged model")
         else:
-            v23_path = NSFW_WEIGHTS_LOCAL_PATH
-        _load_and_merge_nsfw(pipe, v23_path)
-        gc.collect()
+            # Local model missing — try HuggingFace
+            from huggingface_hub import snapshot_download
+            hf_repo_id = "devindevine/picgen"
+            try:
+                print(f"Local model not found. Loading from HuggingFace ({hf_repo_id})...")
+                model_path = snapshot_download(hf_repo_id)
+                pipe = QwenImageEditPlusPipeline.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16,
+                    local_files_only=False,
+                    use_safetensors=True
+                )
+                print(f"✓ Loaded pre-merged model from HuggingFace")
+            except Exception as hf_err:
+                print(f"[HF download failed: {hf_err}]")
+                raise RuntimeError(f"Both local and HF models unavailable: {hf_err}")
+        
         # Cast transformer to fp8 (checkpoint's native precision): full cast on
         # <40 GB cards, bit-exact-only (lossless) on >=40 GB cards.
         _cast_transformer_to_fp8(pipe)
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
         # Full residency if it fits, else offload — never OOM on placement.
-        _enable_offload(pipe, PIC_DEVICE, "pic")
+        if not CPU_ONLY_TEST:
+            _enable_offload(pipe, PIC_DEVICE, "pic")
+        else:
+            print("[CPU_ONLY_TEST] Skipping GPU offload — model stays on CPU")
         # Quality-neutral speedups: FA3 attention (fallback SDPA) + VAE policy.
-        _optimize_qwen_pipe(pipe, PIC_DEVICE)
+        if not CPU_ONLY_TEST:
+            _optimize_qwen_pipe(pipe, PIC_DEVICE)
+        else:
+            print("[CPU_ONLY_TEST] Skipping optimization for testing")
         pic_pipe = pipe
         print(f" Qwen ready on {PIC_DEVICE} in {time.time()-t:.1f}s")
 
@@ -9868,41 +10192,35 @@ elif STARTUP_MODE == "vidgen":
     pic_pipe = None
     def _bg_qwen_load():
         global pic_pipe
-        print("Background: Loading Qwen to CPU for Replace/Custom modes...")
+        print("Background: Loading Qwen to CPU for Replace/Custom modes (pre-merged)...")
         t = time.time()
         try:
+            # Load pre-merged model: prioritize local, fall back to HuggingFace
             model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
-            if not os.path.exists(model_index_path):
-                print(f"Downloading Qwen base model to {BASE_MODEL_LOCAL_PATH}...")
-                os.makedirs(PICGEN_MODELS_DIR, exist_ok=True)
-                pipe = QwenImageEditPlusPipeline.from_pretrained(
-                    "Qwen/Qwen-Image-Edit-2511",
-                    torch_dtype=torch.bfloat16,
-                    cache_dir=BASE_MODEL_LOCAL_PATH,
-                    use_safetensors=True
-                )
-            else:
+            
+            if os.path.exists(model_index_path):
+                # Local merged model exists — use it directly
+                print(f"Loading from local merged model...")
                 pipe = QwenImageEditPlusPipeline.from_pretrained(
                     BASE_MODEL_LOCAL_PATH,
                     torch_dtype=torch.bfloat16,
                     local_files_only=True,
                     use_safetensors=True
                 )
-
-            if not os.path.exists(NSFW_WEIGHTS_LOCAL_PATH):
-                print(f"Downloading NSFW weights...")
-                os.makedirs(os.path.dirname(NSFW_WEIGHTS_LOCAL_PATH), exist_ok=True)
-                v23_path = hf_hub_download(
-                    repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
-                    filename="v19/Qwen-Rapid-AIO-NSFW-v19.safetensors",
-                    cache_dir=PICGEN_MODELS_DIR,
-                    local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
-                )
+                print(f"✓ Loaded local merged model")
             else:
-                v23_path = NSFW_WEIGHTS_LOCAL_PATH
-
-            _load_and_merge_nsfw(pipe, v23_path)
-            gc.collect()
+                # Local model missing — try HuggingFace
+                from huggingface_hub import snapshot_download
+                hf_repo_id = "devindevine/picgen"
+                print(f"Local model not found. Loading from HuggingFace ({hf_repo_id})...")
+                model_path = snapshot_download(hf_repo_id)
+                pipe = QwenImageEditPlusPipeline.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16,
+                    local_files_only=False,
+                    use_safetensors=True
+                )
+                print(f"✓ Loaded pre-merged model from HuggingFace")
 
             # Cast transformer to fp8 while still on CPU so the later GPU swap
             # moves ~19 GB, not ~38 GB, and fits on a 32 GB card.
@@ -9929,68 +10247,220 @@ else:
     
     print(" AGGRESSIVE LOADING: Qwen Image Edit pipeline...")
     start_qwen = time.time()
-
+    
     # Low-RAM boxes (e.g. 16 GB) can't hold the ~40 GB bf16 base model in CPU
     # RAM before the GPU move. When free RAM is low, load the base model
     # straight onto the GPU (device_map="cuda", low_cpu_mem_usage=True) so it
     # never lands in CPU RAM. On normal boxes, keep the plain CPU load (the
     # subsequent fp8 cast + _enable_pic_offload path is unchanged). This folds
     # in fix.sh item 3 so fix.sh never needs to run again.
-    _lowram = _available_ram_gb() < _NSFW_LOWRAM_THRESHOLD_GB
+    if _DEBUG_STARTUP: print("[STEP 1.0] Checking available RAM...")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    ram_gb = _available_ram_gb()
+    if _DEBUG_STARTUP: print(f"[STEP 1.1] _available_ram_gb() = {ram_gb:.1f} GB")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    if _DEBUG_STARTUP: print(f"[STEP 1.2] _NSFW_LOWRAM_THRESHOLD_GB = {_NSFW_LOWRAM_THRESHOLD_GB}")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    _lowram = ram_gb < _NSFW_LOWRAM_THRESHOLD_GB
+    if _DEBUG_STARTUP: print(f"[STEP 1.3] _lowram = {_lowram}")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    
+    if _DEBUG_STARTUP: print("[STEP 2.0] Creating _base_kwargs dict...")
+    if _DEBUG_STARTUP: sys.stdout.flush()
     _base_kwargs = dict(torch_dtype=torch.bfloat16, use_safetensors=True)
+    if _DEBUG_STARTUP: print(f"[STEP 2.1] _base_kwargs = {_base_kwargs}")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    
+    # CPU-only mode is disabled due to disk space constraints
+    if _DEBUG_STARTUP: print("[STEP 3.0] Checking RAM threshold for device_map...")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    _lowram = _available_ram_gb() < _NSFW_LOWRAM_THRESHOLD_GB
+    if _DEBUG_STARTUP: print(f"[STEP 3.1] _lowram = {_lowram}")
+    if _DEBUG_STARTUP: sys.stdout.flush()
     if _lowram:
+        if _DEBUG_STARTUP: print(f"[STEP 3.2a] LOW RAM DETECTED - Adding device_map=cuda and low_cpu_mem_usage=True")
+        if _DEBUG_STARTUP: sys.stdout.flush()
         _base_kwargs.update(low_cpu_mem_usage=True, device_map="cuda")
-        print(f"    [picgen] low RAM — loading base model directly onto GPU.")
-
-    model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
-    if not os.path.exists(model_index_path):
-        print(f"Downloading Qwen base model to {BASE_MODEL_LOCAL_PATH}...")
-        os.makedirs(PICGEN_MODELS_DIR, exist_ok=True)
-        pic_pipe = QwenImageEditPlusPipeline.from_pretrained(
-            "Qwen/Qwen-Image-Edit-2511",
-            cache_dir=BASE_MODEL_LOCAL_PATH,
-            **_base_kwargs,
-        )
+        if _DEBUG_STARTUP: print(f"[STEP 3.2b] Updated _base_kwargs")
+        if _DEBUG_STARTUP: sys.stdout.flush()
     else:
+        if _DEBUG_STARTUP: print(f"[STEP 3.2] Normal RAM - keeping default kwargs")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+    
+    if _DEBUG_STARTUP: print("[STEP 4.0] Constructing model_index_path...")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    if _DEBUG_STARTUP: print(f"[STEP 4.1] BASE_MODEL_LOCAL_PATH = {BASE_MODEL_LOCAL_PATH}")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
+    if _DEBUG_STARTUP: print(f"[STEP 4.2] model_index_path = {model_index_path}")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    
+    if _DEBUG_STARTUP: print("[STEP 5.0] Checking if local model exists...")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    local_exists = os.path.exists(model_index_path)
+    if _DEBUG_STARTUP: print(f"[STEP 5.1] os.path.exists(model_index_path) = {local_exists}")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    
+    # Load pre-merged model: prioritize local, fall back to HuggingFace
+    if local_exists:
+        # Local merged model exists — use it directly
+        if _DEBUG_STARTUP: print(f"[STEP 6.0] LOCAL MODEL FOUND")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        if _DEBUG_STARTUP: print(f"[STEP 6.1] Loading from {BASE_MODEL_LOCAL_PATH}")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        
+        if _DEBUG_STARTUP: print(f"[STEP 6.2] Calling QwenImageEditPlusPipeline.from_pretrained()...")
+        if _DEBUG_STARTUP: print(f"[STEP 6.2a]   local_files_only=True")
+        if _DEBUG_STARTUP: print(f"[STEP 6.2b]   _base_kwargs={_base_kwargs}")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        
+        if _DEBUG_STARTUP: print(f"[STEP 6.3] ENTERING from_pretrained()...")
+        if _DEBUG_STARTUP: sys.stdout.flush()
         pic_pipe = QwenImageEditPlusPipeline.from_pretrained(
             BASE_MODEL_LOCAL_PATH,
             local_files_only=True,
+            device_map="cpu" if (_CPU_ONLY_MODE or GPU_VRAM_GB < 40.0) else "auto",
+            low_cpu_mem_usage=True,
             **_base_kwargs,
         )
-
-    print("Loading NSFW weights for Qwen...")
-    if not os.path.exists(NSFW_WEIGHTS_LOCAL_PATH):
-        print(f"Downloading NSFW weights...")
-        os.makedirs(os.path.dirname(NSFW_WEIGHTS_LOCAL_PATH), exist_ok=True)
-        v23_path = hf_hub_download(
-            repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
-            filename="v19/Qwen-Rapid-AIO-NSFW-v19.safetensors",
-            cache_dir=PICGEN_MODELS_DIR,
-            local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
-        )
+        if _DEBUG_STARTUP: print(f"[STEP 6.4] RETURNED from from_pretrained()")
+        if _DEBUG_STARTUP: print(f"[STEP 6.4a] Moving pic_pipe to CPU...")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        
+        # FORCE move to CPU if it loaded to GPU
+        try:
+            pic_pipe.to("cpu")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            if _DEBUG_STARTUP: print(f"[STEP 6.4b] Successfully moved to CPU")
+            if _DEBUG_STARTUP: sys.stdout.flush()
+        except Exception as _e:
+            if _DEBUG_STARTUP: print(f"[STEP 6.4b] Failed to move to CPU: {_e}")
+            if _DEBUG_STARTUP: sys.stdout.flush()
+        if _DEBUG_STARTUP: print(f"[STEP 6.6] ✓ Loaded local merged model")
+        if _DEBUG_STARTUP: sys.stdout.flush()
     else:
-        v23_path = NSFW_WEIGHTS_LOCAL_PATH
-
-    print("Loading NSFW state dict...")
-    _load_and_merge_nsfw(pic_pipe, v23_path)
+        # Local model missing — try HuggingFace
+        if _DEBUG_STARTUP: print(f"[STEP 6.0] LOCAL MODEL NOT FOUND")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        
+        from huggingface_hub import snapshot_download
+        hf_repo_id = "devindevine/picgen"
+        if _DEBUG_STARTUP: print(f"[STEP 6.1] hf_repo_id = {hf_repo_id}")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        
+        try:
+            if _DEBUG_STARTUP: print(f"[STEP 6.2] Calling snapshot_download({hf_repo_id})...")
+            if _DEBUG_STARTUP: sys.stdout.flush()
+            model_path = snapshot_download(hf_repo_id)
+            if _DEBUG_STARTUP: print(f"[STEP 6.3] snapshot_download() returned: {model_path}")
+            if _DEBUG_STARTUP: sys.stdout.flush()
+            
+            if _DEBUG_STARTUP: print(f"[STEP 6.4] Calling QwenImageEditPlusPipeline.from_pretrained()...")
+            if _DEBUG_STARTUP: sys.stdout.flush()
+            pic_pipe = QwenImageEditPlusPipeline.from_pretrained(
+                model_path,
+                local_files_only=False,
+                device_map="cpu" if (_CPU_ONLY_MODE or GPU_VRAM_GB < 40.0) else "auto",
+                low_cpu_mem_usage=True,
+                **_base_kwargs,
+            )
+            if _DEBUG_STARTUP: print(f"[STEP 6.4a] Moving pic_pipe to CPU...")
+            if _DEBUG_STARTUP: sys.stdout.flush()
+            
+            # FORCE move to CPU if it loaded to GPU
+            try:
+                pic_pipe.to("cpu")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                if _DEBUG_STARTUP: print(f"[STEP 6.4b] Successfully moved to CPU")
+                if _DEBUG_STARTUP: sys.stdout.flush()
+            except Exception as _e:
+                if _DEBUG_STARTUP: print(f"[STEP 6.4b] Failed to move to CPU: {_e}")
+                if _DEBUG_STARTUP: sys.stdout.flush()
+            if _DEBUG_STARTUP: print(f"[STEP 6.6] ✓ Loaded pre-merged model from HuggingFace")
+            if _DEBUG_STARTUP: sys.stdout.flush()
+        except Exception as hf_err:
+            if _DEBUG_STARTUP: print(f"[STEP 6.7] EXCEPTION: {type(hf_err).__name__}: {hf_err}")
+            if _DEBUG_STARTUP: sys.stdout.flush()
+            raise RuntimeError(f"Both local and HF models unavailable: {hf_err}")
+    
+    # Post-load processing
+    if _DEBUG_STARTUP: print("[STEP 7.0] POST-LOAD PROCESSING")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    
     # Full reclaim: Python GC + CUDA allocator flush + sync before the large move.
+    if _DEBUG_STARTUP: print("[STEP 7.1] Calling gc.collect()...")
+    if _DEBUG_STARTUP: sys.stdout.flush()
     gc.collect()
+    if _DEBUG_STARTUP: print("[STEP 7.1a] gc.collect() returned")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    
+    if _DEBUG_STARTUP: print("[STEP 7.2] Calling torch.cuda.empty_cache()...")
+    if _DEBUG_STARTUP: sys.stdout.flush()
     torch.cuda.empty_cache()
-    torch.cuda.synchronize()
+    if _DEBUG_STARTUP: print("[STEP 7.2a] torch.cuda.empty_cache() returned")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    
+    if _DEBUG_STARTUP: print("[STEP 7.3] Calling torch.cuda.synchronize()...")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    if _DEBUG_STARTUP: print("[STEP 7.3a] torch.cuda.synchronize() returned")
+    if _DEBUG_STARTUP: sys.stdout.flush()
 
     # Cast transformer to fp8 (checkpoint's native precision) so it is ~19 GB
     # resident instead of ~38 GB bf16 — this is what makes it fit on the 32 GB
     # RTX 5090. VAE / text encoder stay bf16.
+    if _DEBUG_STARTUP: print("[STEP 8.0] TRANSFORMER FP8 CAST")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    if _DEBUG_STARTUP: print("[STEP 8.1] Calling _cast_transformer_to_fp8(pic_pipe)...")
+    if _DEBUG_STARTUP: sys.stdout.flush()
     _cast_transformer_to_fp8(pic_pipe)
+    if _DEBUG_STARTUP: print("[STEP 8.1a] _cast_transformer_to_fp8() returned")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    
+    if _DEBUG_STARTUP: print("[STEP 8.2] Post-fp8 gc.collect()...")
+    if _DEBUG_STARTUP: sys.stdout.flush()
     gc.collect()
+    if _DEBUG_STARTUP: print("[STEP 8.2a] gc.collect() returned")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    
+    if _DEBUG_STARTUP: print("[STEP 8.3] Post-fp8 torch.cuda.empty_cache()...")
+    if _DEBUG_STARTUP: sys.stdout.flush()
     torch.cuda.empty_cache()
-    torch.cuda.synchronize()
+    if _DEBUG_STARTUP: print("[STEP 8.3a] torch.cuda.empty_cache() returned")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    
+    if _DEBUG_STARTUP: print("[STEP 8.4] Post-fp8 torch.cuda.synchronize()...")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    if _DEBUG_STARTUP: print("[STEP 8.4a] torch.cuda.synchronize() returned")
+    if _DEBUG_STARTUP: sys.stdout.flush()
 
+    if _DEBUG_STARTUP: print("[STEP 9.0] VAE TILING/SLICING")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    if _DEBUG_STARTUP: print("[STEP 9.1] Calling pic_pipe.vae.enable_tiling()...")
+    if _DEBUG_STARTUP: sys.stdout.flush()
     pic_pipe.vae.enable_tiling()
+    if _DEBUG_STARTUP: print("[STEP 9.1a] enable_tiling() returned")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    
+    if _DEBUG_STARTUP: print("[STEP 9.2] Calling pic_pipe.vae.enable_slicing()...")
+    if _DEBUG_STARTUP: sys.stdout.flush()
     pic_pipe.vae.enable_slicing()
+    if _DEBUG_STARTUP: print("[STEP 9.2a] enable_slicing() returned")
+    if _DEBUG_STARTUP: sys.stdout.flush()
 
     # TEMPORARY: measure exact per-component VRAM needs without loading to GPU.
     if _VRAM_PROBE:
+        if _DEBUG_STARTUP: print("[STEP 10] VRAM PROBE - Calling _probe_pipeline_vram()...")
+        if _DEBUG_STARTUP: sys.stdout.flush()
         _probe_pipeline_vram(pic_pipe, label="Qwen picgen pipeline", exit_after=True)
 
     # Measured sizes: transformer 19.0 GB (fp8) + text_encoder 15.5 GB (bf16)
@@ -10000,15 +10470,66 @@ else:
     # for the entire denoise loop (peak ~19 GB + activations, fits with ~12 GB
     # to spare), and the 15.5 GB text encoder only occupies GPU during the
     # one-time prompt encode. No precision change, no per-step penalty.
-    _enable_pic_offload(pic_pipe)
+    
+    if not CPU_ONLY_TEST:
+        if _DEBUG_STARTUP: print("[STEP 11.0] GPU OFFLOAD SETUP")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        if _DEBUG_STARTUP: print("[STEP 11.1] CPU_ONLY_TEST = False, enabling offload...")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        if _DEBUG_STARTUP: print("[STEP 11.2] Calling _enable_pic_offload(pic_pipe)...")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        _enable_pic_offload(pic_pipe)
+        if _DEBUG_STARTUP: print("[STEP 11.2a] _enable_pic_offload() returned")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+    else:
+        if _DEBUG_STARTUP: print("[STEP 11.0] CPU_ONLY_TEST MODE - SKIPPING OFFLOAD")
+        if _DEBUG_STARTUP: sys.stdout.flush()
 
     # Quality-neutral speedups: FA3 attention (fallback SDPA) + VAE decode
     # policy (full-frame on big cards, tiled on small cards).
-    _optimize_qwen_pipe(pic_pipe, PIC_DEVICE)
+    if not CPU_ONLY_TEST:
+        if _DEBUG_STARTUP: print("[STEP 12.0] OPTIMIZATION PHASE")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        if _DEBUG_STARTUP: print("[STEP 12.1] CPU_ONLY_TEST = False, running optimizations...")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        if _DEBUG_STARTUP: print("[STEP 12.2] Calling _optimize_qwen_pipe(pic_pipe, '{}')...".format(PIC_DEVICE))
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        _optimize_qwen_pipe(pic_pipe, PIC_DEVICE)
+        if _DEBUG_STARTUP: print("[STEP 12.2a] _optimize_qwen_pipe() returned")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+    else:
+        if _DEBUG_STARTUP: print("[STEP 12.0] CPU_ONLY_TEST MODE - SKIPPING OPTIMIZATIONS")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+
+    # Force-disable FA3 on old GPUs (sm<90) to prevent "No available kernel" errors
+    if GPU_CC[0] < 9:
+        if _DEBUG_STARTUP: print(f"[STEP 12.3] GPU is sm_{GPU_CC[0]}{GPU_CC[1]} (< Hopper) — disabling FA3...")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        _disable_qwen_fa3_completely(pic_pipe)
+        if _DEBUG_STARTUP: print(f"[STEP 12.3a] FA3 disabled, using SDPA attention")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+    
+    # On small GPUs (<32GB), enable attention slicing to reduce peak memory during generation
+    if GPU_VRAM_GB < 32.0:
+        try:
+            if hasattr(pic_pipe, "enable_attention_slicing"):
+                pic_pipe.enable_attention_slicing()
+                if _DEBUG_STARTUP: print(f"[STEP 12.3b] Attention slicing enabled for small GPU")
+                if _DEBUG_STARTUP: sys.stdout.flush()
+        except Exception as _e:
+            if _DEBUG_STARTUP: print(f"[STEP 12.3b] Attention slicing failed: {_e}")
+            if _DEBUG_STARTUP: sys.stdout.flush()
 
     qwen_time = time.time() - start_qwen
-    print(f" QWEN READY (model-CPU-offload) in {qwen_time:.1f}s - Picgen functional!")
+    if _DEBUG_STARTUP: print(f"[STEP 13.0] PICGEN STARTUP COMPLETE")
+    if _DEBUG_STARTUP: print(f"[STEP 13.1] Total time: {qwen_time:.1f}s")
+    if _DEBUG_STARTUP: sys.stdout.flush()
+    if _DEBUG_STARTUP: print(f"[STEP 13.2] Setting _active_model = 'pic'")
+    if _DEBUG_STARTUP: sys.stdout.flush()
     _active_model = "pic"
+    if _DEBUG_STARTUP: print(f"[STEP 13.3] ✓ PICGEN FULLY LOADED AND FUNCTIONAL")
+    if _DEBUG_STARTUP: print(f"[STEP 13.4] Exiting PICGEN startup block")
+    if _DEBUG_STARTUP: sys.stdout.flush()
 
 _swap_lock = _gpu_op_lock
 
@@ -10079,7 +10600,8 @@ def _aggressive_pipeline_load(repo_id, device, pipeline_name):
             completed_times.append(load_time)
             print(f"     {component_name} ready ({len(completed_times)}/{total_components})")
     
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     
     total_time = time.time() - start_time
     print(f" {pipeline_name} LOADED in {total_time:.1f}s (concurrent speedup: {sum(completed_times)/total_time:.1f}x)")
@@ -10465,11 +10987,13 @@ def _get_cached_vae_latents(images):
             # LRU: update timestamp on hit
             _picgen_cache["vae_latents"][img_hash] = (entry[0], time.time())
             _record_cache_hit("vae")
-            # On >=40 GB cards, cache is kept on GPU — no H2D copy needed
+            # On >=40 GB cards (full residency), cache is kept on GPU — no H2D copy needed.
+            # On small-VRAM cards (offload mode), keep latents on CPU — the offload hooks
+            # move them to GPU when the VAE component runs. Pre-moving wastes VRAM.
             _card_gb = _device_total_vram_gb(PIC_DEVICE)
             if _card_gb >= 40.0:
                 return entry[0]  # already on GPU
-            return _device_tree(entry[0], PIC_DEVICE)
+            return entry[0]  # small card: stay on CPU, offload hooks handle it
     _record_cache_miss("vae")
     return None
 
@@ -10503,11 +11027,15 @@ def _get_cached_prompt_embeds(prompt, negative_prompt, images, num_images_per_pr
             # LRU: update timestamp on hit
             _picgen_cache["prompt_embeds"][key] = (entry[0], time.time())
             _record_cache_hit("prompt")
-            # On >=40 GB cards, cache is kept on GPU — no H2D copy needed
+            # On >=40 GB cards (full residency), cache is kept on GPU — no H2D copy needed.
+            # On small-VRAM cards (offload mode), return embeddings on CPU: the offload
+            # hooks will move them to GPU when the text-encoder component runs.
+            # Pre-moving to GPU here would waste ~100-300 MB of VRAM before generation.
             _card_gb = _device_total_vram_gb(PIC_DEVICE)
             if _card_gb >= 40.0:
                 return entry[0]  # already on GPU
-            return _device_tree(entry[0], PIC_DEVICE)
+            # Small card: keep on CPU — offload hooks handle device placement
+            return entry[0]
     _record_cache_miss("prompt")
     return None
 
@@ -11079,7 +11607,12 @@ def _blend_single_face(orig_np, gen_np, orig_lm, gen_lm, blend_alpha=0.9, feathe
         gh, gw = gen_np.shape[:2]
         
         key = list(_FACE_KEY_IDX)
-        M, _ = cv2.estimateAffinePartial2D(orig_lm[key], gen_lm[key])
+        affine_result = cv2.estimateAffinePartial2D(orig_lm[key], gen_lm[key])
+        # Handle different OpenCV versions that may return (M, inliers) or just M
+        if isinstance(affine_result, tuple) and len(affine_result) >= 1:
+            M = affine_result[0]
+        else:
+            M = affine_result
         if M is None:
             # DEBUG START
             print(f"[DEBUG] _blend_single_face: estimateAffinePartial2D returned None", flush=True)
@@ -11400,8 +11933,11 @@ def infer(
     activate_pic()
     _t_active = time.time()
 
-    torch.cuda.set_device(PIC_DEVICE)
-    generator = torch.Generator(device=PIC_DEVICE).manual_seed(seed)
+    # Use CPU device if CPU-only mode is set
+    _gen_device = "cpu" if _CPU_ONLY_MODE else PIC_DEVICE
+    if _gen_device != "cpu" and torch.cuda.is_available():
+        torch.cuda.set_device(_gen_device)
+    generator = torch.Generator(device=_gen_device).manual_seed(seed)
     pil_images = b64_to_pil_list(images_b64_json)
     if not pil_images:
         raise gr.Error("Please upload at least one image.") from None
@@ -11436,13 +11972,38 @@ def infer(
     def cached_encode_prompt(*args, **kwargs):
         # On a cache hit return the stored embeddings immediately; on a miss
         # call the real encode_prompt and store the result for next time.
+        #
+        # IMPORTANT: encode_prompt return-value shape varies across pipeline
+        # versions. Some return a plain tensor, some return a 2-tuple
+        # (embeds, mask), some return a longer tuple. We store the FULL return
+        # value as-is ("_raw") and return it verbatim so the pipeline can unpack
+        # it however it expects — we never assume a fixed arity here.
         if cached_embeds is not None:
-            return cached_embeds["prompt_embeds"], cached_embeds["prompt_embeds_mask"]
+            # Prefer the new "_raw" key (full return value); fall back to the
+            # old 2-field dict for caches stored by the previous code version.
+            if "_raw" in cached_embeds:
+                return cached_embeds["_raw"]
+            # Legacy cache entry: reconstruct the 2-tuple and hope it matches.
+            try:
+                return cached_embeds["prompt_embeds"], cached_embeds["prompt_embeds_mask"]
+            except KeyError:
+                pass  # cache entry is malformed — fall through to a live call
         result = original_encode_prompt(*args, **kwargs)
-        _cache_prompt_embeds(prompt, negative_prompt, pil_images,
-                             num_images_per_prompt,
-                             {"prompt_embeds": result[0],
-                              "prompt_embeds_mask": result[1]})
+        # Safely extract embeds and mask regardless of tuple length.
+        try:
+            if isinstance(result, (tuple, list)):
+                _pe   = result[0] if len(result) > 0 else None
+                _mask = result[1] if len(result) > 1 else None
+            else:
+                _pe   = result        # single-tensor return
+                _mask = None
+            _cache_prompt_embeds(prompt, negative_prompt, pil_images,
+                                 num_images_per_prompt,
+                                 {"prompt_embeds": _pe,
+                                  "prompt_embeds_mask": _mask,
+                                  "_raw": result})  # store raw for lossless replay
+        except Exception as _ce:
+            print(f"[picgen] prompt-embed cache store failed (non-fatal): {_ce}")
         return result
 
     pic_pipe.encode_prompt = cached_encode_prompt
@@ -11500,7 +12061,7 @@ def infer(
     # FA3 IS active this context is harmless (the transformer doesn't call SDPA).
     # Guarded so any torch version without torch.nn.attention still works.
     @contextlib.contextmanager
-    def _fast_sdpa_backend():
+    def _fast_sdpa_backend_inner():
         if _qwen_fa3_state.get("active"):
             # FA3 handles attention; no SDPA backend selection needed.
             yield
@@ -11509,10 +12070,22 @@ def infer(
         try:
             from torch.nn.attention import sdpa_kernel, SDPBackend
             backends = []
+            # FLASH_ATTENTION requires sm_80+ (Ampere or newer).
+            # On Pascal (sm_61, e.g. GTX 1080 Ti) there is no Flash Attention
+            # kernel: passing it to sdpa_kernel() raises "No available kernel"
+            # even when other backends would work fine.  Gate it on sm>=8.0.
+            _sm_major = GPU_CC[0] if GPU_CC else 0
             for _name in ("FLASH_ATTENTION", "EFFICIENT_ATTENTION", "CUDNN_ATTENTION"):
+                if _name == "FLASH_ATTENTION" and _sm_major < 8:
+                    continue   # Pascal/Volta/Turing don't have FA kernels
                 _b = getattr(SDPBackend, _name, None)
                 if _b is not None:
                     backends.append(_b)
+            # Always append MATH as an unconditional fallback so sdpa_kernel()
+            # never raises "No available kernel" on old GPUs.
+            _math = getattr(SDPBackend, "MATH", None)
+            if _math is not None and _math not in backends:
+                backends.append(_math)
             if backends:
                 _cm = sdpa_kernel(backends)
         except Exception:
@@ -11526,18 +12099,128 @@ def infer(
             with _cm:
                 yield
 
+    # ------------------------------------------------------------------
+    # Pascal/Volta/Turing (sm < 8.0) memory fix.
+    # bf16 is not supported by PyTorch's memory-efficient SDPA kernel on these
+    # GPUs and there is no flash kernel, so SDPA silently falls back to the MATH
+    # path, which materialises the FULL (heads x N x N) score matrix. For Qwen's
+    # joint text+image sequence that is a single multi-GiB allocation
+    # (the "Tried to allocate 6.12 GiB" OOM). Computing attention in query
+    # chunks gives identical results with a bounded score-matrix size.
+    # ------------------------------------------------------------------
+    @contextlib.contextmanager
+    def _chunked_sdpa_guard():
+        _sm_major = GPU_CC[0] if GPU_CC else 0
+        if _CPU_ONLY_MODE or not torch.cuda.is_available() or _sm_major >= 8:
+            yield
+            return
+        _F = torch.nn.functional
+        _orig_sdpa = _F.scaled_dot_product_attention
+        _budget_bytes = int(float(os.environ.get("NEWGEN_SDPA_CHUNK_MB", "256")) * 1024 * 1024)
+
+        def _chunked_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
+                          is_causal=False, scale=None, *args, **kwargs):
+            if is_causal or query.dim() != 4:
+                return _orig_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
+                                  is_causal=is_causal, scale=scale, *args, **kwargs)
+            B, H, Lq, _D = query.shape
+            Lk = key.shape[-2]
+            per_row = max(1, B * H * Lk * query.element_size())
+            chunk = max(64, _budget_bytes // per_row)
+            if chunk >= Lq:
+                return _orig_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
+                                  is_causal=is_causal, scale=scale, *args, **kwargs)
+            outs = []
+            for i in range(0, Lq, chunk):
+                m = attn_mask
+                if m is not None and m.dim() >= 2 and m.shape[-2] == Lq:
+                    m = m[..., i:i + chunk, :]
+                outs.append(_orig_sdpa(query[..., i:i + chunk, :], key, value, attn_mask=m,
+                                       dropout_p=dropout_p, is_causal=False, scale=scale,
+                                       *args, **kwargs))
+            return torch.cat(outs, dim=-2)
+
+        _F.scaled_dot_product_attention = _chunked_sdpa
+        try:
+            yield
+        finally:
+            _F.scaled_dot_product_attention = _orig_sdpa
+
+    @contextlib.contextmanager
+    def _fast_sdpa_backend():
+        with _chunked_sdpa_guard():
+            with _fast_sdpa_backend_inner():
+                yield
+
     try:
         # Register the live pipe so Cancel can flip its interrupt immediately.
         pic_pipe._interrupt = False
         _picgen_active_pipe["pipe"] = pic_pipe
+        
+        # PRE-GENERATION: Log GPU memory state before we even try to move things
+        print(f"[infer] === GENERATION START ===", flush=True)
+        if torch.cuda.is_available():
+            _free, _total = torch.cuda.mem_get_info()
+            print(f"[infer] GPU memory before generation: {_free/1e9:.2f}GB free / {_total/1e9:.2f}GB total", flush=True)
+            print(f"[infer] _offload_state['pic'] = {_offload_state.get('pic')}", flush=True)
+        
+        # CRITICAL: Force model to CPU immediately before generation on small cards
+        # enable_model_cpu_offload() only installs hooks; it doesn't move components off GPU.
+        # If the model is still on GPU (which it is after loading), offload hooks are useless.
+        # On <32GB cards, move EVERY component to CPU first, then let offload stream them back.
+        if GPU_VRAM_GB < 32.0 or _CPU_ONLY_MODE:
+            try:
+                if _DEBUG_STARTUP:
+                    _free_before = torch.cuda.mem_get_info()[0] / 1e9 if torch.cuda.is_available() else 0
+                    print(f"[infer] PRE-GENERATION: moving model components to CPU (free GPU: {_free_before:.2f}GB before)", flush=True)
+                
+                # Move each major component to CPU directly (pipeline doesn't have .modules())
+                for attr_name in ("transformer", "transformer_2", "text_encoder", "text_encoder_2", "vae", "image_encoder"):
+                    component = getattr(pic_pipe, attr_name, None)
+                    if component is not None:
+                        try:
+                            component.to("cpu")
+                        except Exception as _ce:
+                            if _DEBUG_STARTUP:
+                                print(f"[infer] Failed to move {attr_name} to CPU: {_ce}", flush=True)
+                
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                
+                if _DEBUG_STARTUP:
+                    _free_after = torch.cuda.mem_get_info()[0] / 1e9 if torch.cuda.is_available() else 0
+                    print(f"[infer] PRE-GENERATION: model components moved to CPU (free GPU now: {_free_after:.2f}GB)", flush=True)
+            except Exception as _e:
+                if _DEBUG_STARTUP:
+                    print(f"[infer] PRE-GENERATION CPU move failed (non-fatal): {_e}", flush=True)
+        
+        print(f"[infer] GPU memory after model move to CPU:", flush=True)
+        if torch.cuda.is_available():
+            _free, _total = torch.cuda.mem_get_info()
+            print(f"[infer]   {_free/1e9:.2f}GB free / {_total/1e9:.2f}GB total", flush=True)
+        
         # cudnn.benchmark autotunes every conv layer for every NEW input shape.
         # Picgen shapes change with each image set (multiple images = several
         # new VAE shapes), causing a long stall before step 1. Turn it off for
         # picgen only; restored in the finally block for vidgen's fixed shapes.
-        _prev_cudnn_bench = torch.backends.cudnn.benchmark
-        torch.backends.cudnn.benchmark = False
-        with torch.cuda.device(PIC_DEVICE):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        _prev_cudnn_bench = torch.backends.cudnn.benchmark if torch.cuda.is_available() else False
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = False
+        _using_cpu = (_gen_device == "cpu") or _CPU_ONLY_MODE
+        # torch.cuda.device() raises when given "cpu" and also when CUDA is not
+        # available.  Use a no-op contextmanager on CPU-only mode.
+        import contextlib as _cl
+        _cuda_ctx = (torch.cuda.device(_gen_device)
+                     if not _using_cpu and torch.cuda.is_available()
+                     else _cl.nullcontext())
+        # torch.autocast with device_type="cuda" crashes on CPU-only tensors.
+        # Use device_type="cpu" (which is a no-op for bfloat16 — CPU already
+        # operates in full precision) when running without a GPU.
+        _autocast_device = "cpu" if _using_cpu else "cuda"
+        with _cuda_ctx:
+            with torch.autocast(device_type=_autocast_device, dtype=torch.bfloat16):
                 with _fast_sdpa_backend():
                     try:
                         image = pic_pipe(**_pic_call_kwargs).images
@@ -11549,9 +12232,16 @@ def infer(
                             image = pic_pipe(**_pic_call_kwargs).images
                         else:
                             raise
+        
+        # Ensure image is always a list (some pipelines or error conditions may return a single Image)
+        if not isinstance(image, (list, tuple)):
+            image = [image]
+        elif len(image) == 0:
+            raise gr.Error("Pipeline returned no images")
     finally:
         try:
-            torch.backends.cudnn.benchmark = _prev_cudnn_bench
+            if torch.cuda.is_available():
+                torch.backends.cudnn.benchmark = _prev_cudnn_bench
         except NameError:
             pass
         pic_pipe.encode_prompt = original_encode_prompt
@@ -11579,7 +12269,10 @@ def infer(
     # Wrapped in try-except to prevent any face blend errors from breaking
     # the generator cleanup chain (which causes "generator didn't stop" errors).
     try:
-        image, face_count = _apply_face_preservation(pil_images, image, face_match=face_match)
+        result_pair = _apply_face_preservation(pil_images, image, face_match=face_match)
+        if not isinstance(result_pair, (tuple, list)) or len(result_pair) != 2:
+            raise gr.Error(f"Face preservation returned unexpected type/shape: {type(result_pair)} with length {len(result_pair) if hasattr(result_pair, '__len__') else 'N/A'}")
+        image, face_count = result_pair
         
         # Print face match status if enabled
         if face_match:
@@ -13780,20 +14473,20 @@ with gr.Blocks(css=css) as demo:
                         instruction = MERGE_BG_INSTRUCTION.format(prompt=prompt_text) + MERGE_FIT_INSTRUCTION + _custom_gender_clause
 
                         activate_pic()
-                        torch.cuda.set_device(PIC_DEVICE)
-                        images = []
-                        with torch.cuda.device(PIC_DEVICE):
-                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                                for _i in range(4):
-                                    if progress is not None:
-                                        progress(0.20 + 0.75 * (_i / 4.0),
-                                                 desc=f"Generating result {_i + 1} of 4")
-                                    gen = torch.Generator(device=PIC_DEVICE).manual_seed(
-                                        random.randint(0, np.iinfo(np.int32).max)
-                                    )
-                                    result = pic_pipe(
-                                        image=[base],
-                                        prompt=instruction,
+                        if PIC_DEVICE.startswith("cuda"):
+                            torch.cuda.set_device(PIC_DEVICE)
+                            with torch.cuda.device(PIC_DEVICE):
+                                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                    for _i in range(4):
+                                        if progress is not None:
+                                            progress(0.20 + 0.75 * (_i / 4.0),
+                                                     desc=f"Generating result {_i + 1} of 4")
+                                        gen = torch.Generator(device=PIC_DEVICE).manual_seed(
+                                            random.randint(0, np.iinfo(np.int32).max)
+                                        )
+                                        result = pic_pipe(
+                                            image=[base],
+                                            prompt=instruction,
                                         negative_prompt=" ",
                                         num_inference_steps=4,
                                         true_cfg_scale=1.0,
@@ -14631,6 +15324,33 @@ with gr.Blocks(css=css) as demo:
 
                     print("PEND", flush=True)
 
+                    # Pre-generation memory cleanup for small GPUs
+                    try:
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                        if _DEBUG_STARTUP:
+                            print(f"[run_picgen] Pre-generation cleanup done", flush=True)
+                    except Exception as _e:
+                        if _DEBUG_STARTUP:
+                            print(f"[run_picgen] Pre-generation cleanup failed: {_e}", flush=True)
+                        pass
+                    
+                    # Abort generation if there's no GPU memory available
+                    if torch.cuda.is_available() and GPU_VRAM_GB < 32.0:
+                        try:
+                            free_mb = torch.cuda.mem_get_info()[0] / 1e6
+                            if free_mb < 500:  # Less than 500MB free
+                                raise gr.Error(
+                                    f"Insufficient GPU memory: only {free_mb:.0f}MB free on {GPU_VRAM_GB:.1f}GB card. "
+                                    f"Close other applications or reduce model size."
+                                )
+                        except gr.Error:
+                            raise
+                        except Exception:
+                            pass
+
                     # Previous results are only removed now, when Generate is
                     # clicked again — never right after a generation finishes.
                     try:
@@ -14675,8 +15395,11 @@ with gr.Blocks(css=css) as demo:
                             _set_picgen_progress(_total, _total, "", running=False)
                             raise
                         except Exception as _e:
+                            import traceback as _tb
+                            print("[run_picgen] FULL TRACEBACK of generation failure:", flush=True)
+                            _tb.print_exc()
                             _set_picgen_progress(_total, _total, "", running=False)
-                            raise gr.Error(f"Generation failed: {_e}") from None
+                            raise gr.Error(f"Generation failed: {type(_e).__name__}: {_e}") from None
                     
                     _set_picgen_progress(_total, _total, "Done", running=False)
                     print("DONE", flush=True)
@@ -16494,10 +17217,10 @@ if __name__ == "__main__":
         _deadline = time.time() + 900
         _http_ok = False
         while time.time() < _deadline:
-            time.sleep(1.0)
+            time.sleep(0.5)  # Check more frequently
             if not _http_ok:
                 try:
-                    with _u.urlopen("http://127.0.0.1:7860/", timeout=2) as _r:
+                    with _u.urlopen("http://127.0.0.1:7860/", timeout=1) as _r:
                         _http_ok = _r.status < 500
                 except Exception:
                     _http_ok = False
@@ -16512,11 +17235,13 @@ if __name__ == "__main__":
                 ready = (pic_pipe is not None and _active_model == "pic")
             if ready:
                 # Small settle delay so background-load log lines finish first.
-                time.sleep(3.0)
+                time.sleep(2.0)
                 _print_ready_banner("READY")
+                sys.stdout.flush()
                 return
         # Timed out waiting — still show the URL so the operator has it.
         _print_ready_banner("STARTED")
+        sys.stdout.flush()
 
     threading.Thread(target=_ready_banner_watcher, daemon=True).start()
 
@@ -16532,8 +17257,46 @@ if __name__ == "__main__":
 
     if DUAL_GPU:
         print(f" GRADIO LAUNCHING  Wan on {WAN_DEVICE}, Qwen on {PIC_DEVICE}. Both tabs ready.")
+        if _DEBUG_STARTUP: print("[STEP G1.0] Calling demo.queue()...")
+        if _DEBUG_STARTUP: sys.stdout.flush()
         demo.queue()
+        if _DEBUG_STARTUP: print("[STEP G1.1] demo.queue() returned")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        if _DEBUG_STARTUP: print("[STEP G2.0] Calling _setup_persistent_auth()...")
+        if _DEBUG_STARTUP: sys.stdout.flush()
         _setup_persistent_auth(demo.app)  # Enable persistent login cookies
+        if _DEBUG_STARTUP: print("[STEP G2.1] _setup_persistent_auth() returned")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        if _DEBUG_STARTUP: print("[STEP G3.0] About to call demo.launch()...")
+        if _DEBUG_STARTUP: print(f"[STEP G3.0a]   server_name='0.0.0.0'")
+        if _DEBUG_STARTUP: print(f"[STEP G3.0b]   server_port=7860")
+        if _DEBUG_STARTUP: print(f"[STEP G3.0c]   share=False")
+        if _DEBUG_STARTUP: print(f"[STEP G3.0d]   allowed_paths={len([SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'tmp', 'gradio')])} paths")
+        if _DEBUG_STARTUP: print(f"[STEP G3.0e]   auth={'yes' if auth_check else 'no'}")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        if _DEBUG_STARTUP: print("[STEP G3.0z] ENTERING demo.launch() — if nothing appears after this, launch() is blocking...")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        
+        # Always flush stdout/stderr before launch so Gradio messages appear immediately
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        print("[AppStartup] About to call demo.launch() with Gradio server...", flush=True)
+        
+        # If debug mode, start a watchdog thread to monitor if launch() hangs
+        if _DEBUG_STARTUP:
+            import threading as _t
+            _launch_started = time.time()
+            def _launch_watchdog():
+                for _i in range(1, 61):  # Check every second for 60 seconds
+                    time.sleep(1.0)
+                    _elapsed = time.time() - _launch_started
+                    if _DEBUG_STARTUP:
+                        print(f"[WATCHDOG] demo.launch() has been blocking for {_elapsed:.1f}s...")
+                        sys.stdout.flush()
+            _wd = _t.Thread(target=_launch_watchdog, daemon=True)
+            _wd.start()
+        
         demo.launch(
             server_name="0.0.0.0",
             server_port=7860,
@@ -16542,14 +17305,55 @@ if __name__ == "__main__":
             auth=auth_check,
             auth_message="Enter password to access",
         )
+        if _DEBUG_STARTUP: print("[STEP G3.1] demo.launch() returned (should not reach here)")
+        if _DEBUG_STARTUP: sys.stdout.flush()
         _register_picgen_progress_routes()
+        
     else:
         if STARTUP_MODE == "vidgen":
             print(" GRADIO LAUNCHING  Wan on GPU, vidgen ready immediately.")
         else:
             print(" GRADIO LAUNCHING  Qwen on GPU, picgen ready immediately.")
+        if _DEBUG_STARTUP: print("[STEP G1.0] Calling demo.queue()...")
+        if _DEBUG_STARTUP: sys.stdout.flush()
         demo.queue()
+        if _DEBUG_STARTUP: print("[STEP G1.1] demo.queue() returned")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        if _DEBUG_STARTUP: print("[STEP G2.0] Calling _setup_persistent_auth()...")
+        if _DEBUG_STARTUP: sys.stdout.flush()
         _setup_persistent_auth(demo.app)  # Enable persistent login cookies
+        if _DEBUG_STARTUP: print("[STEP G2.1] _setup_persistent_auth() returned")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        if _DEBUG_STARTUP: print("[STEP G3.0] About to call demo.launch()...")
+        if _DEBUG_STARTUP: print(f"[STEP G3.0a]   server_name='0.0.0.0'")
+        if _DEBUG_STARTUP: print(f"[STEP G3.0b]   server_port=7860")
+        if _DEBUG_STARTUP: print(f"[STEP G3.0c]   share=False")
+        if _DEBUG_STARTUP: print(f"[STEP G3.0d]   allowed_paths={len([SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'tmp', 'gradio')])} paths")
+        if _DEBUG_STARTUP: print(f"[STEP G3.0e]   auth={'yes' if auth_check else 'no'}")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        if _DEBUG_STARTUP: print("[STEP G3.0z] ENTERING demo.launch() — if nothing appears after this, launch() is blocking...")
+        if _DEBUG_STARTUP: sys.stdout.flush()
+        
+        # Always flush stdout/stderr before launch so Gradio messages appear immediately
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        print("[AppStartup] About to call demo.launch() with Gradio server...", flush=True)
+        
+        # If debug mode, start a watchdog thread to monitor if launch() hangs
+        if _DEBUG_STARTUP:
+            import threading as _t
+            _launch_started = time.time()
+            def _launch_watchdog():
+                for _i in range(1, 61):  # Check every second for 60 seconds
+                    time.sleep(1.0)
+                    _elapsed = time.time() - _launch_started
+                    if _DEBUG_STARTUP:
+                        print(f"[WATCHDOG] demo.launch() has been blocking for {_elapsed:.1f}s...")
+                        sys.stdout.flush()
+            _wd = _t.Thread(target=_launch_watchdog, daemon=True)
+            _wd.start()
+        
         demo.launch(
             server_name="0.0.0.0",
             server_port=7860,
@@ -16558,6 +17362,8 @@ if __name__ == "__main__":
             auth=auth_check,
             auth_message="Enter password to access",
         )
+        if _DEBUG_STARTUP: print("[STEP G3.1] demo.launch() returned (should not reach here)")
+        if _DEBUG_STARTUP: sys.stdout.flush()
         _register_picgen_progress_routes()
 
         def _wait_until_picgen_ready(timeout=600.0):
@@ -16654,32 +17460,14 @@ if __name__ == "__main__":
             try:
                 time.sleep(2.0)
                 if STARTUP_MODE == "vidgen":
-                    print("Background: Loading Qwen to CPU...")
+                    print("Background: Loading Qwen to CPU (pre-merged)...")
                     global pic_pipe
                     start = time.time()
-                    model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
-                    if not os.path.exists(model_index_path):
-                        os.makedirs(PICGEN_MODELS_DIR, exist_ok=True)
-                        pipe = QwenImageEditPlusPipeline.from_pretrained(
-                            "Qwen/Qwen-Image-Edit-2511",
-                            torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
-                            cache_dir=BASE_MODEL_LOCAL_PATH, use_safetensors=True
-                        )
-                    else:
-                        pipe = QwenImageEditPlusPipeline.from_pretrained(
-                            BASE_MODEL_LOCAL_PATH,
-                            torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
-                            local_files_only=True, use_safetensors=True
-                        )
-                    v23 = NSFW_WEIGHTS_LOCAL_PATH
-                    if not os.path.exists(v23):
-                        v23 = hf_hub_download(
-                            repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
-                            filename="v19/Qwen-Rapid-AIO-NSFW-v19.safetensors",
-                            cache_dir=PICGEN_MODELS_DIR,
-                            local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
-                        )
-                    _load_and_merge_nsfw(pipe, v23)
+                    pipe = QwenImageEditPlusPipeline.from_pretrained(
+                        BASE_MODEL_LOCAL_PATH,
+                        torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
+                        local_files_only=True, use_safetensors=True
+                    )
                     torch.cuda.empty_cache()
                     # Cast transformer to fp8 (native checkpoint precision) so
                     # the later GPU swap fits on a 32 GB card (~19 GB not ~38 GB).
