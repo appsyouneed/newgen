@@ -14,7 +14,7 @@ fi
 # torchaudio / numpy stack that ships with your Ubuntu 22.04 VPS.
 # Those versions (torch 2.8 dev+cu128, etc.) are already correct and must
 # not be changed.  All Python-level dependencies that the app needs are
-# installed into /media/dev/Storage 2/system/generators/newgen/.app-venv so they are completely isolated from
+# installed into /root/newgen/.app-venv so they are completely isolated from
 # both the OS-managed python3 packages and the system torch stack.
 #
 # The ONLY system packages installed here are apt-managed OS tools:
@@ -36,11 +36,11 @@ apt-get update
 apt-get install -y --fix-missing ffmpeg wget unzip git python3-pip python3-venv git-lfs
 
 echo "Creating directories..."
-mkdir -p /media/dev/Storage 2/system/generators/newgen/tmp
-mkdir -p /media/dev/Storage 2/system/generators/newgen/mmaudio
-mkdir -p /media/dev/Storage 2/system/generators/newgen/wan22_distill
+mkdir -p /root/newgen/tmp
+mkdir -p /root/newgen/mmaudio
+mkdir -p /root/newgen/wan22_distill
 mkdir -p /root/.cache/huggingface
-chmod 1777 /media/dev/Storage 2/system/generators/newgen/tmp
+chmod 1777 /root/newgen/tmp
 
 # ---------------------------------------------------------------------------
 # App venv — isolated from system Python site-packages.
@@ -50,7 +50,7 @@ chmod 1777 /media/dev/Storage 2/system/generators/newgen/tmp
 # inherits the system torch via PYTHONPATH override at app launch time
 # (see autorun.sh / systemd service), keeping the multi-GB dev build intact.
 # ---------------------------------------------------------------------------
-APP_VENV="/media/dev/Storage 2/system/generators/newgen/.app-venv"
+APP_VENV="/root/newgen/.app-venv"
 
 # ALWAYS rebuild clean. Reusing an existing venv here was the direct cause
 # of a bug where a stale/broken .app-venv (missing a working cffi/_cffi_backend,
@@ -535,21 +535,21 @@ for _pkg in torch torchvision torchaudio torchao; do
 done
 
 echo "Setting up RIFE interpolation model..."
-if [ ! -d "/media/dev/Storage 2/system/generators/newgen/train_log/model" ] || [ ! -f "/media/dev/Storage 2/system/generators/newgen/train_log/RIFE_HDv3.py" ]; then
-    rm -rf /media/dev/Storage 2/system/generators/newgen/train_log /media/dev/Storage 2/system/generators/newgen/__MACOSX /media/dev/Storage 2/system/generators/newgen/RIFEv4.26_0921.zip
+if [ ! -d "/root/newgen/train_log/model" ] || [ ! -f "/root/newgen/train_log/RIFE_HDv3.py" ]; then
+    rm -rf /root/newgen/train_log /root/newgen/__MACOSX /root/newgen/RIFEv4.26_0921.zip
     git clone --depth 1 https://github.com/hzwer/Practical-RIFE.git /tmp/rife
-    mkdir -p /media/dev/Storage 2/system/generators/newgen/train_log
-    cp -r /tmp/rife/model /media/dev/Storage 2/system/generators/newgen/train_log/
-    wget -q -P /media/dev/Storage 2/system/generators/newgen https://huggingface.co/r3gm/RIFE/resolve/main/RIFEv4.26_0921.zip
-    unzip -o /media/dev/Storage 2/system/generators/newgen/RIFEv4.26_0921.zip -d /media/dev/Storage 2/system/generators/newgen
-    rm -rf /tmp/rife /media/dev/Storage 2/system/generators/newgen/__MACOSX
+    mkdir -p /root/newgen/train_log
+    cp -r /tmp/rife/model /root/newgen/train_log/
+    wget -q -P /root/newgen https://huggingface.co/r3gm/RIFE/resolve/main/RIFEv4.26_0921.zip
+    unzip -o /root/newgen/RIFEv4.26_0921.zip -d /root/newgen
+    rm -rf /tmp/rife /root/newgen/__MACOSX
     echo "RIFE installed."
 else
     echo "RIFE already installed, skipping."
 fi
 
 echo "Preparing Wan 2.2 distilled weights directory..."
-mkdir -p /media/dev/Storage 2/system/generators/newgen/wan22_distill
+mkdir -p /root/newgen/wan22_distill
 echo "Note: the two merged 4-step BF16 experts (~28.6 GB each, ~57 GB total)"
 echo "download automatically on first video generation."
 echo "Plan for roughly 150-200 GB total across Wan, Qwen and MMAudio."
@@ -643,23 +643,23 @@ else
     echo "✅ Setup verification passed."
 fi
 
-echo "Copying app files to /media/dev/Storage 2/system/generators/newgen/..."
-if [ "$SCRIPT_DIR" != "/media/dev/Storage 2/system/generators/newgen" ]; then
-    cp "$SCRIPT_DIR/app.py" /media/dev/Storage 2/system/generators/newgen/app.py
-    cp "$SCRIPT_DIR/prompts.py" /media/dev/Storage 2/system/generators/newgen/prompts.py
-    cp "$SCRIPT_DIR/requirements.txt" /media/dev/Storage 2/system/generators/newgen/requirements.txt
+echo "Copying app files to /root/newgen/..."
+if [ "$SCRIPT_DIR" != "/root/newgen" ]; then
+    cp "$SCRIPT_DIR/app.py" /root/newgen/app.py
+    cp "$SCRIPT_DIR/prompts.py" /root/newgen/prompts.py
+    cp "$SCRIPT_DIR/requirements.txt" /root/newgen/requirements.txt
 else
-    echo "Already in /media/dev/Storage 2/system/generators/newgen — skipping file copy."
+    echo "Already in /root/newgen — skipping file copy."
 fi
 
 # Copy qwenimage module if present
-if [ -d "$SCRIPT_DIR/qwenimage" ] && [ "$SCRIPT_DIR/qwenimage" != "/media/dev/Storage 2/system/generators/newgen/qwenimage" ]; then
-    cp -r "$SCRIPT_DIR/qwenimage" /media/dev/Storage 2/system/generators/newgen/qwenimage
+if [ -d "$SCRIPT_DIR/qwenimage" ] && [ "$SCRIPT_DIR/qwenimage" != "/root/newgen/qwenimage" ]; then
+    cp -r "$SCRIPT_DIR/qwenimage" /root/newgen/qwenimage
 fi
 
 # Copy starters if present
-if [ -d "$SCRIPT_DIR/starters" ] && [ "$SCRIPT_DIR/starters" != "/media/dev/Storage 2/system/generators/newgen/starters" ]; then
-    cp -r "$SCRIPT_DIR/starters" /media/dev/Storage 2/system/generators/newgen/starters
+if [ -d "$SCRIPT_DIR/starters" ] && [ "$SCRIPT_DIR/starters" != "/root/newgen/starters" ]; then
+    cp -r "$SCRIPT_DIR/starters" /root/newgen/starters
 fi
 
 # ---------------------------------------------------------------------------
@@ -667,7 +667,7 @@ fi
 # the system torch is visible via PYTHONPATH.  This is what systemd / autorun
 # should call instead of plain "python3 app.py".
 # ---------------------------------------------------------------------------
-cat > /media/dev/Storage 2/system/generators/newgen/run_app.sh << 'LAUNCHER'
+cat > /root/newgen/run_app.sh << 'LAUNCHER'
 #!/bin/bash
 # Launch app.py using the isolated app venv.
 # System torch is made visible via symlinks placed directly inside the
@@ -677,13 +677,13 @@ cat > /media/dev/Storage 2/system/generators/newgen/run_app.sh << 'LAUNCHER'
 # venv (this previously caused the app to silently load system diffusers
 # 0.33.1 instead of the venv's correctly-installed 0.37.1). Do not
 # reintroduce a PYTHONPATH export here.
-APP_VENV="/media/dev/Storage 2/system/generators/newgen/.app-venv"
-cd /media/dev/Storage 2/system/generators/newgen
+APP_VENV="/root/newgen/.app-venv"
+cd /root/newgen
 exec "$APP_VENV/bin/python" app.py "$@"
 LAUNCHER
-chmod +x /media/dev/Storage 2/system/generators/newgen/run_app.sh
+chmod +x /root/newgen/run_app.sh
 
-cat > /media/dev/Storage 2/system/generators/newgen/autorun.sh << 'AUTORUN'
+cat > /root/newgen/autorun.sh << 'AUTORUN'
 #!/usr/bin/env bash
 # ============================================================
 #  NewGen VPS Launcher  --  regenerated by setup.sh on every run
@@ -811,7 +811,7 @@ case "$_sub" in
         ;;
 esac
 AUTORUN
-chmod +x /media/dev/Storage 2/system/generators/newgen/autorun.sh
+chmod +x /root/newgen/autorun.sh
 
 # ---------------------------------------------------------------------------
 # LAUNCH APP
@@ -826,9 +826,9 @@ _print_summary() {
     echo ""
     echo "=== Setup Complete ==="
     echo ""
-    echo "IMPORTANT: App now runs via /media/dev/Storage 2/system/generators/newgen/autorun.sh"
+    echo "IMPORTANT: App now runs via /root/newgen/autorun.sh"
     echo "  System torch 2.8 dev+cu128 is PRESERVED."
-    echo "  All app dependencies live in /media/dev/Storage 2/system/generators/newgen/.app-venv"
+    echo "  All app dependencies live in /root/newgen/.app-venv"
     echo ""
     echo "🎬 New Features Available:"
     echo "   • Wan 2.2 I2V A14B merged 4-step distill (BF16, no LoRA)"
@@ -844,10 +844,10 @@ if [ ! -d /run/systemd/system ]; then
     echo "No systemd detected — launching app directly via autorun.sh..."
     _print_summary
     echo "Management commands:"
-    echo "  bash /media/dev/Storage 2/system/generators/newgen/autorun.sh stop      # stop the app"
-    echo "  bash /media/dev/Storage 2/system/generators/newgen/autorun.sh restart   # restart it"
-    echo "  bash /media/dev/Storage 2/system/generators/newgen/autorun.sh status    # check if running"
-    echo "  bash /media/dev/Storage 2/system/generators/newgen/autorun.sh logs      # tail live log"
+    echo "  bash /root/newgen/autorun.sh stop      # stop the app"
+    echo "  bash /root/newgen/autorun.sh restart   # restart it"
+    echo "  bash /root/newgen/autorun.sh status    # check if running"
+    echo "  bash /root/newgen/autorun.sh logs      # tail live log"
     echo ""
     echo "App: http://0.0.0.0:7860"
     echo "📋 Video Tab: Qwen relocate -> Wan 2.2 merged 4-step animate"
@@ -856,8 +856,8 @@ if [ ! -d /run/systemd/system ]; then
     # Start in PICGEN mode: Qwen loads first for immediate photo editing.
     # Vidgen (Wan/F5-TTS/Foley/MuseTalk) downloads in background after picgen is ready.
     # This gives fast picgen startup while still enabling the video tab automatically.
-    bash /media/dev/Storage 2/system/generators/newgen/autorun.sh stop 2>/dev/null || true
-    exec bash /media/dev/Storage 2/system/generators/newgen/autorun.sh start -picgen
+    bash /root/newgen/autorun.sh stop 2>/dev/null || true
+    exec bash /root/newgen/autorun.sh start -picgen
 fi
 
 echo "Setting up systemd service..."
@@ -874,7 +874,7 @@ _print_summary
 echo "Service commands:"
 echo "  systemctl status newgen"
 echo "  systemctl restart newgen"
-echo "  bash /media/dev/Storage 2/system/generators/newgen/autorun.sh logs   # tail live log"
+echo "  bash /root/newgen/autorun.sh logs   # tail live log"
 echo ""
 echo "App: http://0.0.0.0:7860"
 echo "📋 Video Tab: Qwen relocate -> Wan 2.2 merged 4-step animate"
@@ -887,4 +887,4 @@ echo ""
 # Start in PICGEN mode: Qwen loads first for immediate photo editing.
 # Vidgen (Wan/F5-TTS/Foley/MuseTalk) downloads in background after picgen is ready.
 # This gives fast picgen startup while still enabling the video tab automatically.
-exec bash /media/dev/Storage 2/system/generators/newgen/autorun.sh start -picgen
+exec bash /root/newgen/autorun.sh start -picgen

@@ -6,8 +6,6 @@
 #    bash run.sh              # start in vidgen mode (default)
 #    bash run.sh picgen       # start in picgen mode (Qwen loads first)
 #    bash run.sh -picgen      # same as above
-#    bash run.sh -picgen -debug  # picgen mode with debug logging
-#    bash run.sh -picgen -nogpu  # picgen mode, CPU-only (no GPU used)
 #    bash run.sh stop         # kill it
 #    bash run.sh status       # show PID
 #    bash run.sh logs         # tail live log
@@ -156,8 +154,6 @@ do_start() {
     local want_picgen=0
     local want_novidgen=0
     local want_nofp8=0
-    local want_debug=0
-    local want_nogpu=0
     local a flag
     for a in "$@"; do
         flag="${a#-}"; flag="${flag#-}"
@@ -165,8 +161,6 @@ do_start() {
             picgen)   want_picgen=1 ;;
             novidgen) want_novidgen=1 ;;
             nofp8)    want_nofp8=1 ;;
-            debug)    want_debug=1 ;;
-            nogpu)    want_nogpu=1 ;;
         esac
     done
     if [[ "$want_picgen" == "1" ]]; then
@@ -180,14 +174,6 @@ do_start() {
     if [[ "$want_nofp8" == "1" ]]; then
         export NEWGEN_QWEN_FP8=0
         mode_display="$mode_display, pure bf16 (no fp8)"
-    fi
-    if [[ "$want_debug" == "1" ]]; then
-        MODE_ARG="$MODE_ARG --debug"
-        mode_display="$mode_display, debug logging"
-    fi
-    if [[ "$want_nogpu" == "1" ]]; then
-        MODE_ARG="$MODE_ARG --nogpu"
-        mode_display="$mode_display, CPU-only"
     fi
 
     if is_running; then
@@ -216,22 +202,39 @@ do_start() {
     # Start Cloudflare Tunnel first so the URL is ready by the time the app loads
     ensure_cloudflared
 
-    # Enable PyTorch CUDA memory optimization for better fragmentation handling on small-VRAM cards
-    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
     # nohup + setsid: process survives SSH disconnect and terminal close
     nohup setsid "$PYTHON" "$APP" $MODE_ARG > "$LOG" 2>&1 &
     echo $! > "$PID_FILE"
 
-    echo "[run] Started (PID $(cat "$PID_FILE")). Streaming logs in real-time..."
-    echo ""
+    echo "[run] Waiting for Gradio startup..."
+    for i in $(seq 1 30); do
+        sleep 2
+        if grep -q "Running on local URL" "$LOG" 2>/dev/null; then
+            echo "[run] Started (PID $(cat "$PID_FILE")). Gradio is up."
+            echo ""
+            # Re-print the URL prominently after app is confirmed up
+            if [ -f "$CLOUDFLARE_URL_FILE" ]; then
+                CF_URL="$(cat "$CLOUDFLARE_URL_FILE")"
+                echo "  ► Open in browser: $CF_URL"
+                echo ""
+            fi
+            echo "[run] ── Live log (Ctrl+C to detach, app keeps running) ──"
+            tail -n 80 -f "$LOG"
+            return
+        fi
+        if ! is_running; then
+            echo "[run] ERROR: process died. Last log:"
+            tail -20 "$LOG"
+            exit 1
+        fi
+    done
+    echo "[run] Still starting (taking longer than usual)."
     if [ -f "$CLOUDFLARE_URL_FILE" ]; then
-        CF_URL="$(cat "$CLOUDFLARE_URL_FILE")"
-        echo "  ► Open in browser: $CF_URL"
-        echo ""
+        echo "  ► Open in browser: $(cat "$CLOUDFLARE_URL_FILE")"
     fi
+    echo ""
     echo "[run] ── Live log (Ctrl+C to detach, app keeps running) ──"
-    tail -n 0 -f "$LOG"
+    tail -n 80 -f "$LOG"
 }
 
 # ---------------------------------------------------------------------------
@@ -253,7 +256,7 @@ for _arg in "$@"; do
         start|stop|restart|status|logs|url)
             CMD="${_f,,}"
             ;;
-        picgen|novidgen|vidgen|nofp8|debug|nogpu)
+        picgen|novidgen|vidgen|nofp8)
             MODE_FLAGS+=("$_arg")
             ;;
         *)
@@ -292,12 +295,10 @@ case "$CMD" in
         fi
         ;;
     *)
-        echo "Usage: bash run.sh [start|stop|restart|status|logs|url] [picgen] [novidgen] [nofp8] [debug] [nogpu]"
+        echo "Usage: bash run.sh [start|stop|restart|status|logs|url] [picgen] [novidgen] [nofp8]"
         echo "       bash run.sh -picgen              # start in picgen mode"
         echo "       bash run.sh -picgen -nofp8       # picgen mode, pure bf16 (fastest on 64GB+ Blackwell)"
         echo "       bash run.sh -picgen -novidgen    # picgen only; video tab disabled, no vidgen downloads"
-        echo "       bash run.sh -picgen -nogpu       # picgen mode, CPU-only (no GPU used)"
-        echo "       bash run.sh -picgen -debug       # picgen mode with debug logging enabled"
         echo "       bash run.sh restart -picgen      # restart in picgen mode (with vidgen)"
         echo "       bash run.sh url                  # print current HTTPS URL"
         exit 1
