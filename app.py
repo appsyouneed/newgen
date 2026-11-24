@@ -25,6 +25,15 @@ from io import BytesIO
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Ensure all stdout/stderr is unbuffered so run.sh / SimplePod console
+# shows real-time progress instead of "[run] Waiting for Gradio startup..."
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 warnings.filterwarnings("ignore")
 logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 logging.getLogger("torch.utils._pytree").setLevel(logging.ERROR)
@@ -8375,6 +8384,139 @@ PICGEN_MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 BASE_MODEL_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "Qwen-Image-Edit-2511")
 # v19 has better face preservation than v23 (community consensus: less identity drift)
 NSFW_WEIGHTS_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "rapid-aio", "v19", "Qwen-Rapid-AIO-NSFW-v19.safetensors")
+# Pre-merged model (base + NSFW already applied) — downloaded from devindevine/picgen
+# when available, avoiding the runtime merge step entirely.
+MERGED_MODEL_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "Qwen-Image-Edit-Merged")
+
+# ---------------------------------------------------------------------------
+# Qwen pipeline loader: merged-first, base+NSFW fallback
+#
+# Priority:
+#   1. Already on disk at MERGED_MODEL_LOCAL_PATH  → load directly, no download.
+#   2. Not on disk → download from devindevine/picgen into MERGED_MODEL_LOCAL_PATH
+#      using from_pretrained (handles HF auth, resume, progress) → load from disk.
+#   3. Download failed for any reason → delete partial files, fall back to
+#      downloading base (Qwen/Qwen-Image-Edit-2511) + NSFW weights separately,
+#      then merge at runtime via _load_and_merge_nsfw().
+# ---------------------------------------------------------------------------
+def _load_qwen_pipe(base_kwargs: dict):
+    """Load the Qwen Image Edit pipeline, preferring the pre-merged model.
+
+    Returns a loaded QwenImageEditPlusPipeline (not yet moved to any device,
+    not yet cast to fp8, not yet offloaded — caller handles all of that).
+    """
+    merged_index = os.path.join(MERGED_MODEL_LOCAL_PATH, "model_index.json")
+
+    # -------------------------------------------------------------------------
+    # Step 1: already cached on disk — load straight from local path.
+    # -------------------------------------------------------------------------
+    if os.path.exists(merged_index):
+        print(f"[picgen] Pre-merged model found at {MERGED_MODEL_LOCAL_PATH} — loading ...")
+        pipe = QwenImageEditPlusPipeline.from_pretrained(
+            MERGED_MODEL_LOCAL_PATH,
+            local_files_only=True,
+            **base_kwargs,
+        )
+        print("[picgen] Pre-merged model loaded — no runtime NSFW merge needed.")
+        return pipe
+
+    # -------------------------------------------------------------------------
+    # Step 2: not cached — download from devindevine/picgen.
+    #
+    # from_pretrained with a repo ID + local_dir downloads all shards into
+    # local_dir and then loads from there, handling HF token auth, resumable
+    # downloads, and progress bars exactly like any other from_pretrained call.
+    # -------------------------------------------------------------------------
+    print("[picgen] Downloading pre-merged Qwen model from devindevine/picgen ...")
+    print(f"         Destination: {MERGED_MODEL_LOCAL_PATH}")
+    os.makedirs(MERGED_MODEL_LOCAL_PATH, exist_ok=True)
+    try:
+        pipe = QwenImageEditPlusPipeline.from_pretrained(
+            "devindevine/picgen",
+            cache_dir=MERGED_MODEL_LOCAL_PATH,
+            local_dir=MERGED_MODEL_LOCAL_PATH,
+            **base_kwargs,
+        )
+        print("[picgen] Pre-merged model downloaded and loaded — no runtime NSFW merge needed.")
+        return pipe
+    except TypeError:
+        # Older huggingface_hub versions don't accept local_dir in from_pretrained.
+        # Fall back to snapshot_download then load from local path.
+        pass
+    except Exception as _dl_err:
+        print(f"[picgen] Pre-merged download failed: {_dl_err}")
+        print("[picgen] Cleaning up partial download and falling back to base + NSFW merge ...")
+        try:
+            shutil.rmtree(MERGED_MODEL_LOCAL_PATH, ignore_errors=True)
+        except Exception:
+            pass
+        # Jump straight to Step 3.
+        return _load_qwen_pipe_fallback(base_kwargs)
+
+    # local_dir not supported by from_pretrained in this HF version — use
+    # snapshot_download to pull the files, then load from the local directory.
+    try:
+        from huggingface_hub import snapshot_download as _snap
+        print("[picgen] Using snapshot_download for pre-merged model ...")
+        _snap(
+            repo_id="devindevine/picgen",
+            local_dir=MERGED_MODEL_LOCAL_PATH,
+        )
+        if not os.path.exists(merged_index):
+            raise RuntimeError("snapshot_download completed but model_index.json not found")
+        pipe = QwenImageEditPlusPipeline.from_pretrained(
+            MERGED_MODEL_LOCAL_PATH,
+            local_files_only=True,
+            **base_kwargs,
+        )
+        print("[picgen] Pre-merged model downloaded and loaded via snapshot_download.")
+        return pipe
+    except Exception as _snap_err:
+        print(f"[picgen] snapshot_download also failed: {_snap_err}")
+        print("[picgen] Cleaning up and falling back to base + NSFW merge ...")
+        try:
+            shutil.rmtree(MERGED_MODEL_LOCAL_PATH, ignore_errors=True)
+        except Exception:
+            pass
+
+    return _load_qwen_pipe_fallback(base_kwargs)
+
+
+def _load_qwen_pipe_fallback(base_kwargs: dict):
+    """Fallback: download base model + NSFW weights separately, merge at runtime."""
+    print("[picgen] Fallback: downloading Qwen base model + NSFW weights ...")
+    model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
+    if not os.path.exists(model_index_path):
+        print(f"[picgen] Downloading Qwen base model to {BASE_MODEL_LOCAL_PATH} ...")
+        os.makedirs(PICGEN_MODELS_DIR, exist_ok=True)
+        pipe = QwenImageEditPlusPipeline.from_pretrained(
+            "Qwen/Qwen-Image-Edit-2511",
+            cache_dir=BASE_MODEL_LOCAL_PATH,
+            **base_kwargs,
+        )
+    else:
+        print(f"[picgen] Loading Qwen base model from {BASE_MODEL_LOCAL_PATH} ...")
+        pipe = QwenImageEditPlusPipeline.from_pretrained(
+            BASE_MODEL_LOCAL_PATH,
+            local_files_only=True,
+            **base_kwargs,
+        )
+
+    if not os.path.exists(NSFW_WEIGHTS_LOCAL_PATH):
+        print("[picgen] Downloading NSFW weights ...")
+        os.makedirs(os.path.dirname(NSFW_WEIGHTS_LOCAL_PATH), exist_ok=True)
+        v23_path = hf_hub_download(
+            repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
+            filename="v19/Qwen-Rapid-AIO-NSFW-v19.safetensors",
+            cache_dir=PICGEN_MODELS_DIR,
+            local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
+        )
+    else:
+        v23_path = NSFW_WEIGHTS_LOCAL_PATH
+
+    print("[picgen] Merging NSFW weights into base model ...")
+    _load_and_merge_nsfw(pipe, v23_path)
+    return pipe
 
 # ---------------------------------------------------------------------------
 # OOM-safe pipeline move helpers
@@ -8792,7 +8934,7 @@ def _available_ram_gb():
 # (mmap) instead of loading the whole ~15 GB dict, to avoid an OOM on small
 # boxes. The checkpoint file itself is ~15 GB, so we need comfortably more than
 # that free to load it whole.
-_NSFW_LOWRAM_THRESHOLD_GB = float(os.environ.get("NEWGEN_NSFW_LOWRAM_GB", "24"))
+_NSFW_LOWRAM_THRESHOLD_GB = float(os.environ.get("NEWGEN_NSFW_LOWRAM_GB", "56"))
 
 
 def _load_and_merge_nsfw(pipe, v23_path):
@@ -9804,39 +9946,8 @@ if DUAL_GPU:
         global pic_pipe
         t = time.time()
         torch.cuda.set_device(PIC_DEVICE)
-        print(" Loading Qwen Image Edit pipeline (pre-merged)...")
-        
-        # Load pre-merged model: prioritize local, fall back to HuggingFace
-        model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
-        
-        if os.path.exists(model_index_path):
-            # Local merged model exists — use it directly
-            print(f"Loading from local merged model...")
-            pipe = QwenImageEditPlusPipeline.from_pretrained(
-                BASE_MODEL_LOCAL_PATH,
-                torch_dtype=torch.bfloat16,
-                local_files_only=True,
-                use_safetensors=True
-            )
-            print(f"✓ Loaded local merged model")
-        else:
-            # Local model missing — try HuggingFace
-            from huggingface_hub import snapshot_download
-            hf_repo_id = "devindevine/picgen"
-            try:
-                print(f"Local model not found. Loading from HuggingFace ({hf_repo_id})...")
-                model_path = snapshot_download(hf_repo_id)
-                pipe = QwenImageEditPlusPipeline.from_pretrained(
-                    model_path,
-                    torch_dtype=torch.bfloat16,
-                    local_files_only=False,
-                    use_safetensors=True
-                )
-                print(f"✓ Loaded pre-merged model from HuggingFace")
-            except Exception as hf_err:
-                print(f"[HF download failed: {hf_err}]")
-                raise RuntimeError(f"Both local and HF models unavailable: {hf_err}")
-        
+        print(" Loading Qwen Image Edit pipeline...")
+        pipe = _load_qwen_pipe(dict(torch_dtype=torch.bfloat16, use_safetensors=True))
         gc.collect()
         # Cast transformer to fp8 (checkpoint's native precision): full cast on
         # <40 GB cards, bit-exact-only (lossless) on >=40 GB cards.
@@ -9882,36 +9993,10 @@ elif STARTUP_MODE == "vidgen":
     pic_pipe = None
     def _bg_qwen_load():
         global pic_pipe
-        print("Background: Loading Qwen to CPU for Replace/Custom modes (pre-merged)...")
+        print("Background: Loading Qwen to CPU for Replace/Custom modes...")
         t = time.time()
         try:
-            # Load pre-merged model: prioritize local, fall back to HuggingFace
-            model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
-            
-            if os.path.exists(model_index_path):
-                # Local merged model exists — use it directly
-                print(f"Loading from local merged model...")
-                pipe = QwenImageEditPlusPipeline.from_pretrained(
-                    BASE_MODEL_LOCAL_PATH,
-                    torch_dtype=torch.bfloat16,
-                    local_files_only=True,
-                    use_safetensors=True
-                )
-                print(f"✓ Loaded local merged model")
-            else:
-                # Local model missing — try HuggingFace
-                from huggingface_hub import snapshot_download
-                hf_repo_id = "devindevine/picgen"
-                print(f"Local model not found. Loading from HuggingFace ({hf_repo_id})...")
-                model_path = snapshot_download(hf_repo_id)
-                pipe = QwenImageEditPlusPipeline.from_pretrained(
-                    model_path,
-                    torch_dtype=torch.bfloat16,
-                    local_files_only=False,
-                    use_safetensors=True
-                )
-                print(f"✓ Loaded pre-merged model from HuggingFace")
-
+            pipe = _load_qwen_pipe(dict(torch_dtype=torch.bfloat16, use_safetensors=True))
             gc.collect()
 
             # Cast transformer to fp8 while still on CPU so the later GPU swap
@@ -9952,35 +10037,7 @@ else:
         _base_kwargs.update(low_cpu_mem_usage=True, device_map="cuda")
         print(f"    [picgen] low RAM — loading base model directly onto GPU.")
 
-    model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
-    
-    # Load pre-merged model: prioritize local, fall back to HuggingFace
-    if os.path.exists(model_index_path):
-        # Local merged model exists — use it directly
-        print(f"Loading from local merged model...")
-        pic_pipe = QwenImageEditPlusPipeline.from_pretrained(
-            BASE_MODEL_LOCAL_PATH,
-            local_files_only=True,
-            **_base_kwargs,
-        )
-        print(f"✓ Loaded local merged model")
-    else:
-        # Local model missing — try HuggingFace
-        from huggingface_hub import snapshot_download
-        hf_repo_id = "devindevine/picgen"
-        try:
-            print(f"Local model not found. Loading from HuggingFace ({hf_repo_id})...")
-            model_path = snapshot_download(hf_repo_id)
-            pic_pipe = QwenImageEditPlusPipeline.from_pretrained(
-                model_path,
-                local_files_only=False,
-                **_base_kwargs,
-            )
-            print(f"✓ Loaded pre-merged model from HuggingFace")
-        except Exception as hf_err:
-            print(f"[HF download failed: {hf_err}]")
-            raise RuntimeError(f"Both local and HF models unavailable: {hf_err}")
-    
+    pic_pipe = _load_qwen_pipe(_base_kwargs)
     # Full reclaim: Python GC + CUDA allocator flush + sync before the large move.
     gc.collect()
     torch.cuda.empty_cache()
@@ -11415,7 +11472,8 @@ def infer(
     activate_pic()
     _t_active = time.time()
 
-    torch.cuda.set_device(PIC_DEVICE)
+    if not CPU_ONLY_TEST:
+        torch.cuda.set_device(PIC_DEVICE)
     generator = torch.Generator(device=PIC_DEVICE).manual_seed(seed)
     pil_images = b64_to_pil_list(images_b64_json)
     if not pil_images:
@@ -11549,24 +11607,38 @@ def infer(
         # Picgen shapes change with each image set (multiple images = several
         # new VAE shapes), causing a long stall before step 1. Turn it off for
         # picgen only; restored in the finally block for vidgen's fixed shapes.
-        _prev_cudnn_bench = torch.backends.cudnn.benchmark
-        torch.backends.cudnn.benchmark = False
-        with torch.cuda.device(PIC_DEVICE):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        if not CPU_ONLY_TEST:
+            _prev_cudnn_bench = torch.backends.cudnn.benchmark
+            torch.backends.cudnn.benchmark = False
+        else:
+            _prev_cudnn_bench = None
+
+        def _run_pipe():
+            try:
+                return pic_pipe(**_pic_call_kwargs).images
+            except TypeError as _cb_e:
+                # Older pipeline without callback_on_step_end support:
+                # retry without the callback rather than failing.
+                if "callback_on_step_end" in str(_cb_e):
+                    _pic_call_kwargs.pop("callback_on_step_end", None)
+                    return pic_pipe(**_pic_call_kwargs).images
+                else:
+                    raise
+
+        if CPU_ONLY_TEST:
+            # CPU path: no CUDA device context, use CPU-compatible autocast
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
                 with _fast_sdpa_backend():
-                    try:
-                        image = pic_pipe(**_pic_call_kwargs).images
-                    except TypeError as _cb_e:
-                        # Older pipeline without callback_on_step_end support:
-                        # retry without the callback rather than failing.
-                        if "callback_on_step_end" in str(_cb_e):
-                            _pic_call_kwargs.pop("callback_on_step_end", None)
-                            image = pic_pipe(**_pic_call_kwargs).images
-                        else:
-                            raise
+                    image = _run_pipe()
+        else:
+            with torch.cuda.device(PIC_DEVICE):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    with _fast_sdpa_backend():
+                        image = _run_pipe()
     finally:
         try:
-            torch.backends.cudnn.benchmark = _prev_cudnn_bench
+            if not CPU_ONLY_TEST and _prev_cudnn_bench is not None:
+                torch.backends.cudnn.benchmark = _prev_cudnn_bench
         except NameError:
             pass
         pic_pipe.encode_prompt = original_encode_prompt
@@ -11582,7 +11654,8 @@ def infer(
         _picgen_cancel.clear()
         _set_picgen_progress(0, 1, "", running=False)
         gc.collect()
-        torch.cuda.empty_cache()
+        if not CPU_ONLY_TEST:
+            torch.cuda.empty_cache()
         raise gr.Error("Generation cancelled.")
 
     # NOTE: gc.collect() / empty_cache() / synchronize() removed from the hot
@@ -16669,35 +16742,14 @@ if __name__ == "__main__":
             try:
                 time.sleep(2.0)
                 if STARTUP_MODE == "vidgen":
-                    print("Background: Loading Qwen to CPU (pre-merged)...")
+                    print("Background: Loading Qwen to CPU...")
                     global pic_pipe
                     start = time.time()
-                    
-                    # Load pre-merged model: prioritize local, fall back to HuggingFace
-                    model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
-                    
-                    if os.path.exists(model_index_path):
-                        # Local merged model exists — use it directly
-                        print(f"Loading from local merged model...")
-                        pipe = QwenImageEditPlusPipeline.from_pretrained(
-                            BASE_MODEL_LOCAL_PATH,
-                            torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
-                            local_files_only=True, use_safetensors=True
-                        )
-                        print(f"✓ Loaded local merged model")
-                    else:
-                        # Local model missing — try HuggingFace
-                        from huggingface_hub import snapshot_download
-                        hf_repo_id = "devindevine/picgen"
-                        print(f"Local model not found. Loading from HuggingFace ({hf_repo_id})...")
-                        model_path = snapshot_download(hf_repo_id)
-                        pipe = QwenImageEditPlusPipeline.from_pretrained(
-                            model_path,
-                            torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
-                            local_files_only=False, use_safetensors=True
-                        )
-                        print(f"✓ Loaded pre-merged model from HuggingFace")
-                    
+                    pipe = _load_qwen_pipe(dict(
+                        torch_dtype=torch.bfloat16,
+                        low_cpu_mem_usage=True,
+                        use_safetensors=True,
+                    ))
                     torch.cuda.empty_cache()
                     # Cast transformer to fp8 (native checkpoint precision) so
                     # the later GPU swap fits on a 32 GB card (~19 GB not ~38 GB).
