@@ -170,8 +170,26 @@ def _parse_novidgen(argv):
     return False
 
 
+def _parse_clean(argv):
+    """True if --clean / -clean was passed.
+
+    When set, _ensure_picgen_model skips the pre-merged repo (Case 2) and goes
+    straight to downloading the original base model + NSFW weights separately
+    (Case 3). Useful when the merged repo is broken or you want a guaranteed
+    clean base + NSFW merge from scratch.
+    """
+    for arg in argv[1:]:
+        if arg.lstrip("-").lower() == "clean":
+            return True
+    return False
+
+
 STARTUP_MODE = _parse_startup_mode(sys.argv)
 VIDGEN_DISABLED = _parse_novidgen(sys.argv)
+CLEAN_MODE = _parse_clean(sys.argv)
+if CLEAN_MODE:
+    print("[Mode] --clean: pre-merged model repo will be SKIPPED — will download "
+          "base model + NSFW weights separately and merge from scratch.")
 if VIDGEN_DISABLED:
     print("[Mode] --novidgen: vidgen is DISABLED for this session — no Wan / "
           "F5-TTS / Foley / MuseTalk files will be downloaded or loaded. "
@@ -285,20 +303,59 @@ def _read_cloudflare_url():
 
 
 def _print_ready_banner(what: str = "READY"):
-    """Print the final clickable access-URL banner. Falls back to the local URL
-    if the Cloudflare file isn't present (e.g. launched without run.sh)."""
+    """Print the clickable access-URL banner. Falls back to the local URL
+    if the Cloudflare file isn't present (e.g. launched without run.sh).
+
+    Called three times during startup:
+      1. Immediately at process start (what="STARTING")  — URL is known as
+         soon as cloudflare-url.txt is written by run.sh.
+      2. Midway through the model-load wait (what="LOADING") — reminder while
+         the heavy download/load is in progress.
+      3. Once the primary model is confirmed ready (what="READY") or on timeout
+         (what="STARTED") — the definitive "open now" banner.
+    """
     url = _read_cloudflare_url() or "http://0.0.0.0:7860"
     line = f"  OPEN IN BROWSER:  {url}"
     bar = "=" * max(58, len(line) + 2)
+    _icons = {
+        "STARTING": "🚀",
+        "LOADING":  "⏳",
+        "READY":    "✅",
+        "STARTED":  "✅",
+    }
+    icon = _icons.get(what, "✅")
+    _msgs = {
+        "STARTING": "NEWGEN STARTING — server is coming up, model loading in background.",
+        "LOADING":  "NEWGEN LOADING  — model still loading, almost there…",
+        "READY":    "NEWGEN READY    — everything is running and ready to use.",
+        "STARTED":  "NEWGEN STARTED  — server is up (model may still be loading).",
+    }
+    msg = _msgs.get(what, f"NEWGEN {what}")
     try:
         print("")
         print(bar)
-        print(f"  ✅ NEWGEN {what} — everything is running and ready to use.")
+        print(f"  {icon} {msg}")
         print(line)
         print(bar)
-        print("")
+        print("", flush=True)
     except Exception:
         pass
+
+
+def _print_startup_url_banner():
+    """Print the Cloudflare URL banner as early as possible at process start.
+
+    Waits up to 30 s for cloudflare-url.txt to appear (run.sh writes it after
+    the tunnel is established), then prints immediately.  Called once in a
+    daemon thread right before demo.launch() so the URL is visible even if the
+    model takes many minutes to load.
+    """
+    _deadline = time.time() + 30
+    while time.time() < _deadline:
+        if _read_cloudflare_url():
+            break
+        time.sleep(1.0)
+    _print_ready_banner("STARTING")
 
 # ---------------------------------------------------------------------------
 # EARLY FILE PATCHES — runs before any gradio import.
@@ -943,12 +1000,18 @@ _NSFW_FILENAME    = "v19/Qwen-Rapid-AIO-NSFW-v19.safetensors"
 
 
 def _ensure_picgen_model(base_model_local_path, picgen_models_dir,
-                          nsfw_weights_local_path, extra_kwargs=None):
+                          nsfw_weights_local_path, extra_kwargs=None,
+                          clean=False):
     """Download (if needed) and load the Qwen picgen pipeline.
 
     Returns (pipe, nsfw_safetensors_path_or_None).
     If the merged repo already contains merged weights, nsfw_path is None and
     the caller must skip _load_and_merge_nsfw().
+
+    Args:
+        clean: When True, skip the pre-merged repo (Case 2) entirely and go
+               straight to downloading the original base model + NSFW weights
+               separately (Case 3). Pass CLEAN_MODE here (set by --clean flag).
     """
     from huggingface_hub import snapshot_download as _snap_dl
 
@@ -961,43 +1024,69 @@ def _ensure_picgen_model(base_model_local_path, picgen_models_dir,
 
     # ── Case 1: already downloaded ──────────────────────────────────────────
     if os.path.exists(model_index_path):
-        print(f"[picgen] model_index.json found — loading from disk ({base_model_local_path})...")
-        pipe = QwenImageEditPlusPipeline.from_pretrained(
-            base_model_local_path,
-            local_files_only=True,
-            **base_kwargs,
-        )
-        # NSFW weights: use local path if present, else still need to download
-        nsfw_path = nsfw_weights_local_path if os.path.exists(nsfw_weights_local_path) else None
-        if nsfw_path is None:
-            print("[picgen] NSFW weights not found on disk — will download separately.")
-        return pipe, nsfw_path
-
-    # ── Case 2: try pre-merged repo ─────────────────────────────────────────
-    os.makedirs(base_model_local_path, exist_ok=True)
-    try:
-        print(f"[picgen] No local model found. Trying pre-merged repo {_MERGED_REPO_ID}...")
-        _snap_dl(
-            repo_id=_MERGED_REPO_ID,
-            local_dir=base_model_local_path,
-            local_dir_use_symlinks=False,
-        )
-        if os.path.exists(model_index_path):
-            print(f"[picgen] Pre-merged model downloaded OK — loading...")
+        # Validate the directory is actually complete: an interrupted download
+        # leaves model_index.json on disk but shard files missing, causing
+        # cryptic FileNotFoundError / OSError on from_pretrained.
+        # Check for a minimum set of required sub-paths; if any are missing,
+        # wipe the directory so we fall through to a clean re-download.
+        _required_sub = ["text_encoder", "transformer", "vae"]
+        _incomplete = False
+        for _sub in _required_sub:
+            _sub_path = os.path.join(base_model_local_path, _sub)
+            if not os.path.isdir(_sub_path) or not any(True for _ in os.scandir(_sub_path)):
+                print(f"[picgen] model_index.json exists but '{_sub}' is missing or empty — "
+                      f"directory is incomplete (interrupted download). Wiping and re-downloading.")
+                _incomplete = True
+                break
+        if _incomplete:
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(base_model_local_path)
+            except Exception as _rm_err:
+                print(f"[picgen] Warning: could not wipe incomplete model dir ({_rm_err}) — "
+                      f"attempting to continue anyway.")
+        else:
+            print(f"[picgen] model_index.json found — loading from disk ({base_model_local_path})...")
             pipe = QwenImageEditPlusPipeline.from_pretrained(
                 base_model_local_path,
                 local_files_only=True,
                 **base_kwargs,
             )
-            # Pre-merged repo already has NSFW baked in; signal caller to skip merge
-            print(f"[picgen] Pre-merged model loaded (NSFW already baked in — merge skipped).")
-            return pipe, None   # None → caller skips _load_and_merge_nsfw
-        else:
-            print(f"[picgen] Pre-merged repo downloaded but model_index.json missing — "
-                  f"falling back to base + NSFW download.")
-    except Exception as _e:
-        print(f"[picgen] Pre-merged repo download failed ({_e}) — "
-              f"falling back to base model + NSFW download.")
+            # NSFW weights: use local path if present, else still need to download
+            nsfw_path = nsfw_weights_local_path if os.path.exists(nsfw_weights_local_path) else None
+            if nsfw_path is None:
+                print("[picgen] NSFW weights not found on disk — will download separately.")
+            return pipe, nsfw_path
+
+    # ── Case 2: try pre-merged repo (skipped when --clean is set) ───────────
+    os.makedirs(base_model_local_path, exist_ok=True)
+    if clean:
+        print(f"[picgen] --clean flag set — skipping pre-merged repo ({_MERGED_REPO_ID}). "
+              f"Downloading base model + NSFW weights separately.")
+    else:
+        try:
+            print(f"[picgen] No local model found. Trying pre-merged repo {_MERGED_REPO_ID}...")
+            _snap_dl(
+                repo_id=_MERGED_REPO_ID,
+                local_dir=base_model_local_path,
+                local_dir_use_symlinks=False,
+            )
+            if os.path.exists(model_index_path):
+                print(f"[picgen] Pre-merged model downloaded OK — loading...")
+                pipe = QwenImageEditPlusPipeline.from_pretrained(
+                    base_model_local_path,
+                    local_files_only=True,
+                    **base_kwargs,
+                )
+                # Pre-merged repo already has NSFW baked in; signal caller to skip merge
+                print(f"[picgen] Pre-merged model loaded (NSFW already baked in — merge skipped).")
+                return pipe, None   # None → caller skips _load_and_merge_nsfw
+            else:
+                print(f"[picgen] Pre-merged repo downloaded but model_index.json missing — "
+                      f"falling back to base + NSFW download.")
+        except Exception as _e:
+            print(f"[picgen] Pre-merged repo download failed ({_e}) — "
+                  f"falling back to base model + NSFW download.")
 
     # ── Case 3: fallback — download base + NSFW separately ──────────────────
     print(f"[picgen] Downloading base model from {_BASE_REPO_ID} ...")
@@ -5528,6 +5617,11 @@ wan_pipe = None
 _wan_loaded = False
 _wan_scheduler_config = None
 
+# Declared here at module level so threads and _ready_banner_watcher can
+# reference them before the startup block assigns them.
+pic_pipe = None
+_active_model = None
+
 _protected_image_paths = set()
 _protected_paths_lock = threading.Lock()
 
@@ -9890,8 +9984,11 @@ _pic_offload_enabled = False
 
 
 if DUAL_GPU:
-    print(f" DUAL GPU: Loading Wan -> {WAN_DEVICE} and Qwen -> {PIC_DEVICE} simultaneously...")
-    
+    if VIDGEN_DISABLED:
+        print(f" DUAL GPU: --novidgen set — loading Qwen only on {PIC_DEVICE} (Wan skipped for this session)...")
+    else:
+        print(f" DUAL GPU: Loading Wan -> {WAN_DEVICE} and Qwen -> {PIC_DEVICE} simultaneously...")
+
     def _load_wan_thread():
         global wan_pipe_primary
         t = time.time()
@@ -9902,14 +9999,15 @@ if DUAL_GPU:
         wan_pipe_primary = _load_wan("cpu")
         _enable_offload(wan_pipe_primary, WAN_DEVICE, "wan")
         print(f" WAN ready on {WAN_DEVICE} in {time.time()-t:.1f}s")
-    
+
     def _load_qwen_thread():
         global pic_pipe
         t = time.time()
         torch.cuda.set_device(PIC_DEVICE)
         print(" Loading Qwen Image Edit pipeline...")
         pipe, v23_path = _ensure_picgen_model(
-            BASE_MODEL_LOCAL_PATH, PICGEN_MODELS_DIR, NSFW_WEIGHTS_LOCAL_PATH
+            BASE_MODEL_LOCAL_PATH, PICGEN_MODELS_DIR, NSFW_WEIGHTS_LOCAL_PATH,
+            clean=CLEAN_MODE,
         )
         if v23_path is not None:
             print("Merging NSFW weights into Qwen...")
@@ -9929,14 +10027,18 @@ if DUAL_GPU:
         pic_pipe = pipe
         print(f" Qwen ready on {PIC_DEVICE} in {time.time()-t:.1f}s")
 
-    t_wan = threading.Thread(target=_load_wan_thread, daemon=False)
     t_qwen = threading.Thread(target=_load_qwen_thread, daemon=False)
-    t_wan.start()
     t_qwen.start()
-    t_wan.join()
+    if not VIDGEN_DISABLED:
+        t_wan = threading.Thread(target=_load_wan_thread, daemon=False)
+        t_wan.start()
+        t_wan.join()
     t_qwen.join()
-    _active_model = "both"
-    print(f" DUAL GPU READY  Vidgen on {WAN_DEVICE}, Picgen on {PIC_DEVICE}")
+    _active_model = "pic" if VIDGEN_DISABLED else "both"
+    if VIDGEN_DISABLED:
+        print(f" DUAL GPU READY (picgen-only)  Picgen on {PIC_DEVICE}")
+    else:
+        print(f" DUAL GPU READY  Vidgen on {WAN_DEVICE}, Picgen on {PIC_DEVICE}")
 
 elif STARTUP_MODE == "vidgen":
     print(" VIDGEN DEFAULT: Loading Wan for immediate use...")
@@ -9959,7 +10061,8 @@ elif STARTUP_MODE == "vidgen":
         t = time.time()
         try:
             pipe, v23_path = _ensure_picgen_model(
-                BASE_MODEL_LOCAL_PATH, PICGEN_MODELS_DIR, NSFW_WEIGHTS_LOCAL_PATH
+                BASE_MODEL_LOCAL_PATH, PICGEN_MODELS_DIR, NSFW_WEIGHTS_LOCAL_PATH,
+                clean=CLEAN_MODE,
             )
             if v23_path is not None:
                 _load_and_merge_nsfw(pipe, v23_path)
@@ -10009,6 +10112,7 @@ else:
         BASE_MODEL_LOCAL_PATH, PICGEN_MODELS_DIR, NSFW_WEIGHTS_LOCAL_PATH,
         extra_kwargs={k: v for k, v in _base_kwargs.items()
                       if k not in ("torch_dtype", "use_safetensors")},
+        clean=CLEAN_MODE,
     )
 
     if _picgen_nsfw_path is not None:
@@ -16528,17 +16632,31 @@ def _register_picgen_progress_routes():
 if __name__ == "__main__":
     _start_push_api()
 
-    # Print the clickable Cloudflare access-URL banner at the TRUE end — once
-    # the web server answers AND the primary model for this mode is loaded —
-    # so the last thing shown is always the URL to open. Runs in a daemon
-    # thread because demo.launch() below blocks for the process lifetime.
+    # Print the Cloudflare URL banner THREE times so it is never scrolled away:
+    #   1. Immediately at process start (before launch, via _print_startup_url_banner).
+    #   2. Halfway through the model-load wait (via _ready_banner_watcher below).
+    #   3. Once the primary model is confirmed ready — or on timeout.
+    # All three run in daemon threads because demo.launch() blocks for the
+    # process lifetime.
+
+    # Banner #1 — print as early as possible, as soon as the tunnel URL is known.
+    threading.Thread(target=_print_startup_url_banner, daemon=True).start()
+
     def _ready_banner_watcher():
         import urllib.request as _u
         _deadline = time.time() + 900
         _http_ok = False
         _last_status = ""
+        _halfway_printed = False          # Banner #2 guard
+        _halfway_time = time.time() + 450 # Halfway through the 900 s window
         while time.time() < _deadline:
             time.sleep(1.0)
+
+            # Banner #2 — halfway reminder so the URL never disappears for long.
+            if not _halfway_printed and time.time() >= _halfway_time:
+                _halfway_printed = True
+                _print_ready_banner("LOADING")
+
             if not _http_ok:
                 try:
                     with _u.urlopen("http://127.0.0.1:7860/", timeout=2) as _r:
@@ -16555,10 +16673,17 @@ if __name__ == "__main__":
                 continue
             # Primary model ready for this mode?
             if DUAL_GPU:
-                ready = (pic_pipe is not None and _wan_loaded)
-                _status = (f"[startup] Waiting for models... "
-                           f"picgen={'ready' if pic_pipe is not None else 'loading'} "
-                           f"vidgen={'ready' if _wan_loaded else 'loading'}")
+                if VIDGEN_DISABLED:
+                    # --novidgen: only picgen loads at startup; wan never loads.
+                    ready = (pic_pipe is not None)
+                    _status = (f"[startup] Waiting for Qwen model... "
+                               f"picgen={'ready' if pic_pipe is not None else 'loading'} "
+                               f"vidgen=disabled")
+                else:
+                    ready = (pic_pipe is not None and _wan_loaded)
+                    _status = (f"[startup] Waiting for models... "
+                               f"picgen={'ready' if pic_pipe is not None else 'loading'} "
+                               f"vidgen={'ready' if _wan_loaded else 'loading'}")
             elif STARTUP_MODE == "vidgen":
                 ready = _wan_loaded
                 _status = f"[startup] Waiting for Wan model... {'ready' if _wan_loaded else 'loading'}"
@@ -16572,9 +16697,10 @@ if __name__ == "__main__":
             if ready:
                 # Small settle delay so background-load log lines finish first.
                 time.sleep(2.0)
+                # Banner #3 — definitive "ready to use" banner.
                 _print_ready_banner("READY")
                 return
-        # Timed out waiting — still show the URL so the operator has it.
+        # Timed out — still show the URL (#3 on timeout path).
         _print_ready_banner("STARTED")
 
     threading.Thread(target=_ready_banner_watcher, daemon=True).start()
@@ -16720,6 +16846,7 @@ if __name__ == "__main__":
                         BASE_MODEL_LOCAL_PATH, PICGEN_MODELS_DIR,
                         NSFW_WEIGHTS_LOCAL_PATH,
                         extra_kwargs={"low_cpu_mem_usage": True},
+                        clean=CLEAN_MODE,
                     )
                     if _bg_nsfw_path is not None:
                         _load_and_merge_nsfw(pipe, _bg_nsfw_path)
