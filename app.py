@@ -25,15 +25,6 @@ from io import BytesIO
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Ensure all stdout/stderr is unbuffered so run.sh / SimplePod console
-# shows real-time progress instead of "[run] Waiting for Gradio startup..."
-os.environ.setdefault("PYTHONUNBUFFERED", "1")
-try:
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
-except Exception:
-    pass
-
 warnings.filterwarnings("ignore")
 logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 logging.getLogger("torch.utils._pytree").setLevel(logging.ERROR)
@@ -931,6 +922,115 @@ _warnings.filterwarnings("ignore", message=r".*torchao.*Tensor objects.*")
 
 from huggingface_hub import hf_hub_download
 from torch.nn import functional as F
+
+# ---------------------------------------------------------------------------
+# _ensure_picgen_model — download strategy for the Qwen picgen model
+#
+# Priority order:
+#   1. Already on disk (model_index.json present) → load directly, skip download
+#   2. Try downloading the pre-merged model from devindevine/picgen on HF
+#      (single snapshot_download; avoids the separate base + NSFW fetch)
+#   3. Fall back to downloading base model from Qwen/Qwen-Image-Edit-2511
+#      + NSFW weights from Phr00t/Qwen-Image-Edit-Rapid-AIO (original path)
+#
+# Returns the QwenImageEditPlusPipeline and the NSFW safetensors path (or None
+# if the merged repo already embedded the NSFW weights — caller must check).
+# ---------------------------------------------------------------------------
+_MERGED_REPO_ID   = "devindevine/picgen"
+_BASE_REPO_ID     = "Qwen/Qwen-Image-Edit-2511"
+_NSFW_REPO_ID     = "Phr00t/Qwen-Image-Edit-Rapid-AIO"
+_NSFW_FILENAME    = "v19/Qwen-Rapid-AIO-NSFW-v19.safetensors"
+
+
+def _ensure_picgen_model(base_model_local_path, picgen_models_dir,
+                          nsfw_weights_local_path, extra_kwargs=None):
+    """Download (if needed) and load the Qwen picgen pipeline.
+
+    Returns (pipe, nsfw_safetensors_path_or_None).
+    If the merged repo already contains merged weights, nsfw_path is None and
+    the caller must skip _load_and_merge_nsfw().
+    """
+    from huggingface_hub import snapshot_download as _snap_dl
+
+    if extra_kwargs is None:
+        extra_kwargs = {}
+    base_kwargs = dict(torch_dtype=torch.bfloat16, use_safetensors=True)
+    base_kwargs.update(extra_kwargs)
+
+    model_index_path = os.path.join(base_model_local_path, "model_index.json")
+
+    # ── Case 1: already downloaded ──────────────────────────────────────────
+    if os.path.exists(model_index_path):
+        print(f"[picgen] model_index.json found — loading from disk ({base_model_local_path})...")
+        pipe = QwenImageEditPlusPipeline.from_pretrained(
+            base_model_local_path,
+            local_files_only=True,
+            **base_kwargs,
+        )
+        # NSFW weights: use local path if present, else still need to download
+        nsfw_path = nsfw_weights_local_path if os.path.exists(nsfw_weights_local_path) else None
+        if nsfw_path is None:
+            print("[picgen] NSFW weights not found on disk — will download separately.")
+        return pipe, nsfw_path
+
+    # ── Case 2: try pre-merged repo ─────────────────────────────────────────
+    os.makedirs(base_model_local_path, exist_ok=True)
+    try:
+        print(f"[picgen] No local model found. Trying pre-merged repo {_MERGED_REPO_ID}...")
+        _snap_dl(
+            repo_id=_MERGED_REPO_ID,
+            local_dir=base_model_local_path,
+            local_dir_use_symlinks=False,
+        )
+        if os.path.exists(model_index_path):
+            print(f"[picgen] Pre-merged model downloaded OK — loading...")
+            pipe = QwenImageEditPlusPipeline.from_pretrained(
+                base_model_local_path,
+                local_files_only=True,
+                **base_kwargs,
+            )
+            # Pre-merged repo already has NSFW baked in; signal caller to skip merge
+            print(f"[picgen] Pre-merged model loaded (NSFW already baked in — merge skipped).")
+            return pipe, None   # None → caller skips _load_and_merge_nsfw
+        else:
+            print(f"[picgen] Pre-merged repo downloaded but model_index.json missing — "
+                  f"falling back to base + NSFW download.")
+    except Exception as _e:
+        print(f"[picgen] Pre-merged repo download failed ({_e}) — "
+              f"falling back to base model + NSFW download.")
+
+    # ── Case 3: fallback — download base + NSFW separately ──────────────────
+    print(f"[picgen] Downloading base model from {_BASE_REPO_ID} ...")
+    pipe = QwenImageEditPlusPipeline.from_pretrained(
+        _BASE_REPO_ID,
+        torch_dtype=torch.bfloat16,
+        cache_dir=base_model_local_path,
+        use_safetensors=True,
+        **{k: v for k, v in extra_kwargs.items()
+           if k not in ("torch_dtype", "use_safetensors")},
+    )
+    # Save to local_dir so next start skips the download
+    try:
+        pipe.save_pretrained(base_model_local_path)
+        print(f"[picgen] Base model saved to {base_model_local_path}")
+    except Exception as _se:
+        print(f"[picgen] Warning: could not save base model locally ({_se}) — "
+              f"will re-download next time.")
+
+    nsfw_path = nsfw_weights_local_path
+    if not os.path.exists(nsfw_path):
+        print(f"[picgen] Downloading NSFW weights from {_NSFW_REPO_ID} ...")
+        os.makedirs(os.path.dirname(nsfw_path), exist_ok=True)
+        nsfw_path = hf_hub_download(
+            repo_id=_NSFW_REPO_ID,
+            filename=_NSFW_FILENAME,
+            cache_dir=picgen_models_dir,
+            local_dir=os.path.join(picgen_models_dir, "rapid-aio"),
+        )
+    else:
+        print(f"[picgen] NSFW weights already on disk: {nsfw_path}")
+
+    return pipe, nsfw_path
 from PIL import Image
 from safetensors.torch import load_file
 
@@ -1577,12 +1677,6 @@ GPU_TORCH_IDX = GPU_PROFILE["torch_index"] # pip wheel index for MuseTalk venv
 DUAL_GPU = _gpu_count >= 2 and os.environ.get("NEWGEN_FORCE_SINGLE_GPU") != "1"
 PIC_DEVICE = "cuda:0"
 WAN_DEVICE = "cuda:1" if DUAL_GPU else "cuda:0"
-CPU_ONLY_TEST = os.environ.get("CPU_ONLY_TEST") == "1"
-
-if CPU_ONLY_TEST:
-    print("[CPU_ONLY_TEST] Model will remain on CPU (GPU offload disabled for testing)")
-    PIC_DEVICE = "cpu"
-    WAN_DEVICE = "cpu"
 
 if DUAL_GPU:
     print(f"Dual GPU: Qwen -> {PIC_DEVICE}, Wan -> {WAN_DEVICE}. Both load at startup, no swapping.")
@@ -8384,139 +8478,6 @@ PICGEN_MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 BASE_MODEL_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "Qwen-Image-Edit-2511")
 # v19 has better face preservation than v23 (community consensus: less identity drift)
 NSFW_WEIGHTS_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "rapid-aio", "v19", "Qwen-Rapid-AIO-NSFW-v19.safetensors")
-# Pre-merged model (base + NSFW already applied) — downloaded from devindevine/picgen
-# when available, avoiding the runtime merge step entirely.
-MERGED_MODEL_LOCAL_PATH = os.path.join(PICGEN_MODELS_DIR, "Qwen-Image-Edit-Merged")
-
-# ---------------------------------------------------------------------------
-# Qwen pipeline loader: merged-first, base+NSFW fallback
-#
-# Priority:
-#   1. Already on disk at MERGED_MODEL_LOCAL_PATH  → load directly, no download.
-#   2. Not on disk → download from devindevine/picgen into MERGED_MODEL_LOCAL_PATH
-#      using from_pretrained (handles HF auth, resume, progress) → load from disk.
-#   3. Download failed for any reason → delete partial files, fall back to
-#      downloading base (Qwen/Qwen-Image-Edit-2511) + NSFW weights separately,
-#      then merge at runtime via _load_and_merge_nsfw().
-# ---------------------------------------------------------------------------
-def _load_qwen_pipe(base_kwargs: dict):
-    """Load the Qwen Image Edit pipeline, preferring the pre-merged model.
-
-    Returns a loaded QwenImageEditPlusPipeline (not yet moved to any device,
-    not yet cast to fp8, not yet offloaded — caller handles all of that).
-    """
-    merged_index = os.path.join(MERGED_MODEL_LOCAL_PATH, "model_index.json")
-
-    # -------------------------------------------------------------------------
-    # Step 1: already cached on disk — load straight from local path.
-    # -------------------------------------------------------------------------
-    if os.path.exists(merged_index):
-        print(f"[picgen] Pre-merged model found at {MERGED_MODEL_LOCAL_PATH} — loading ...")
-        pipe = QwenImageEditPlusPipeline.from_pretrained(
-            MERGED_MODEL_LOCAL_PATH,
-            local_files_only=True,
-            **base_kwargs,
-        )
-        print("[picgen] Pre-merged model loaded — no runtime NSFW merge needed.")
-        return pipe
-
-    # -------------------------------------------------------------------------
-    # Step 2: not cached — download from devindevine/picgen.
-    #
-    # from_pretrained with a repo ID + local_dir downloads all shards into
-    # local_dir and then loads from there, handling HF token auth, resumable
-    # downloads, and progress bars exactly like any other from_pretrained call.
-    # -------------------------------------------------------------------------
-    print("[picgen] Downloading pre-merged Qwen model from devindevine/picgen ...")
-    print(f"         Destination: {MERGED_MODEL_LOCAL_PATH}")
-    os.makedirs(MERGED_MODEL_LOCAL_PATH, exist_ok=True)
-    try:
-        pipe = QwenImageEditPlusPipeline.from_pretrained(
-            "devindevine/picgen",
-            cache_dir=MERGED_MODEL_LOCAL_PATH,
-            local_dir=MERGED_MODEL_LOCAL_PATH,
-            **base_kwargs,
-        )
-        print("[picgen] Pre-merged model downloaded and loaded — no runtime NSFW merge needed.")
-        return pipe
-    except TypeError:
-        # Older huggingface_hub versions don't accept local_dir in from_pretrained.
-        # Fall back to snapshot_download then load from local path.
-        pass
-    except Exception as _dl_err:
-        print(f"[picgen] Pre-merged download failed: {_dl_err}")
-        print("[picgen] Cleaning up partial download and falling back to base + NSFW merge ...")
-        try:
-            shutil.rmtree(MERGED_MODEL_LOCAL_PATH, ignore_errors=True)
-        except Exception:
-            pass
-        # Jump straight to Step 3.
-        return _load_qwen_pipe_fallback(base_kwargs)
-
-    # local_dir not supported by from_pretrained in this HF version — use
-    # snapshot_download to pull the files, then load from the local directory.
-    try:
-        from huggingface_hub import snapshot_download as _snap
-        print("[picgen] Using snapshot_download for pre-merged model ...")
-        _snap(
-            repo_id="devindevine/picgen",
-            local_dir=MERGED_MODEL_LOCAL_PATH,
-        )
-        if not os.path.exists(merged_index):
-            raise RuntimeError("snapshot_download completed but model_index.json not found")
-        pipe = QwenImageEditPlusPipeline.from_pretrained(
-            MERGED_MODEL_LOCAL_PATH,
-            local_files_only=True,
-            **base_kwargs,
-        )
-        print("[picgen] Pre-merged model downloaded and loaded via snapshot_download.")
-        return pipe
-    except Exception as _snap_err:
-        print(f"[picgen] snapshot_download also failed: {_snap_err}")
-        print("[picgen] Cleaning up and falling back to base + NSFW merge ...")
-        try:
-            shutil.rmtree(MERGED_MODEL_LOCAL_PATH, ignore_errors=True)
-        except Exception:
-            pass
-
-    return _load_qwen_pipe_fallback(base_kwargs)
-
-
-def _load_qwen_pipe_fallback(base_kwargs: dict):
-    """Fallback: download base model + NSFW weights separately, merge at runtime."""
-    print("[picgen] Fallback: downloading Qwen base model + NSFW weights ...")
-    model_index_path = os.path.join(BASE_MODEL_LOCAL_PATH, "model_index.json")
-    if not os.path.exists(model_index_path):
-        print(f"[picgen] Downloading Qwen base model to {BASE_MODEL_LOCAL_PATH} ...")
-        os.makedirs(PICGEN_MODELS_DIR, exist_ok=True)
-        pipe = QwenImageEditPlusPipeline.from_pretrained(
-            "Qwen/Qwen-Image-Edit-2511",
-            cache_dir=BASE_MODEL_LOCAL_PATH,
-            **base_kwargs,
-        )
-    else:
-        print(f"[picgen] Loading Qwen base model from {BASE_MODEL_LOCAL_PATH} ...")
-        pipe = QwenImageEditPlusPipeline.from_pretrained(
-            BASE_MODEL_LOCAL_PATH,
-            local_files_only=True,
-            **base_kwargs,
-        )
-
-    if not os.path.exists(NSFW_WEIGHTS_LOCAL_PATH):
-        print("[picgen] Downloading NSFW weights ...")
-        os.makedirs(os.path.dirname(NSFW_WEIGHTS_LOCAL_PATH), exist_ok=True)
-        v23_path = hf_hub_download(
-            repo_id="Phr00t/Qwen-Image-Edit-Rapid-AIO",
-            filename="v19/Qwen-Rapid-AIO-NSFW-v19.safetensors",
-            cache_dir=PICGEN_MODELS_DIR,
-            local_dir=os.path.join(PICGEN_MODELS_DIR, "rapid-aio"),
-        )
-    else:
-        v23_path = NSFW_WEIGHTS_LOCAL_PATH
-
-    print("[picgen] Merging NSFW weights into base model ...")
-    _load_and_merge_nsfw(pipe, v23_path)
-    return pipe
 
 # ---------------------------------------------------------------------------
 # OOM-safe pipeline move helpers
@@ -8934,7 +8895,7 @@ def _available_ram_gb():
 # (mmap) instead of loading the whole ~15 GB dict, to avoid an OOM on small
 # boxes. The checkpoint file itself is ~15 GB, so we need comfortably more than
 # that free to load it whole.
-_NSFW_LOWRAM_THRESHOLD_GB = float(os.environ.get("NEWGEN_NSFW_LOWRAM_GB", "56"))
+_NSFW_LOWRAM_THRESHOLD_GB = float(os.environ.get("NEWGEN_NSFW_LOWRAM_GB", "24"))
 
 
 def _load_and_merge_nsfw(pipe, v23_path):
@@ -9947,7 +9908,14 @@ if DUAL_GPU:
         t = time.time()
         torch.cuda.set_device(PIC_DEVICE)
         print(" Loading Qwen Image Edit pipeline...")
-        pipe = _load_qwen_pipe(dict(torch_dtype=torch.bfloat16, use_safetensors=True))
+        pipe, v23_path = _ensure_picgen_model(
+            BASE_MODEL_LOCAL_PATH, PICGEN_MODELS_DIR, NSFW_WEIGHTS_LOCAL_PATH
+        )
+        if v23_path is not None:
+            print("Merging NSFW weights into Qwen...")
+            _load_and_merge_nsfw(pipe, v23_path)
+        else:
+            print("[picgen] NSFW already merged — skipping merge step.")
         gc.collect()
         # Cast transformer to fp8 (checkpoint's native precision): full cast on
         # <40 GB cards, bit-exact-only (lossless) on >=40 GB cards.
@@ -9955,15 +9923,9 @@ if DUAL_GPU:
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
         # Full residency if it fits, else offload — never OOM on placement.
-        if not CPU_ONLY_TEST:
-            _enable_offload(pipe, PIC_DEVICE, "pic")
-        else:
-            print("[CPU_ONLY_TEST] Skipping GPU offload — model stays on CPU")
+        _enable_offload(pipe, PIC_DEVICE, "pic")
         # Quality-neutral speedups: FA3 attention (fallback SDPA) + VAE policy.
-        if not CPU_ONLY_TEST:
-            _optimize_qwen_pipe(pipe, PIC_DEVICE)
-        else:
-            print("[CPU_ONLY_TEST] Skipping optimization for testing")
+        _optimize_qwen_pipe(pipe, PIC_DEVICE)
         pic_pipe = pipe
         print(f" Qwen ready on {PIC_DEVICE} in {time.time()-t:.1f}s")
 
@@ -9996,7 +9958,13 @@ elif STARTUP_MODE == "vidgen":
         print("Background: Loading Qwen to CPU for Replace/Custom modes...")
         t = time.time()
         try:
-            pipe = _load_qwen_pipe(dict(torch_dtype=torch.bfloat16, use_safetensors=True))
+            pipe, v23_path = _ensure_picgen_model(
+                BASE_MODEL_LOCAL_PATH, PICGEN_MODELS_DIR, NSFW_WEIGHTS_LOCAL_PATH
+            )
+            if v23_path is not None:
+                _load_and_merge_nsfw(pipe, v23_path)
+            else:
+                print("[picgen] NSFW already merged — skipping merge step.")
             gc.collect()
 
             # Cast transformer to fp8 while still on CPU so the later GPU swap
@@ -10037,7 +10005,17 @@ else:
         _base_kwargs.update(low_cpu_mem_usage=True, device_map="cuda")
         print(f"    [picgen] low RAM — loading base model directly onto GPU.")
 
-    pic_pipe = _load_qwen_pipe(_base_kwargs)
+    pic_pipe, _picgen_nsfw_path = _ensure_picgen_model(
+        BASE_MODEL_LOCAL_PATH, PICGEN_MODELS_DIR, NSFW_WEIGHTS_LOCAL_PATH,
+        extra_kwargs={k: v for k, v in _base_kwargs.items()
+                      if k not in ("torch_dtype", "use_safetensors")},
+    )
+
+    if _picgen_nsfw_path is not None:
+        print("Loading NSFW state dict...")
+        _load_and_merge_nsfw(pic_pipe, _picgen_nsfw_path)
+    else:
+        print("[picgen] NSFW already merged in pre-merged model — skipping merge step.")
     # Full reclaim: Python GC + CUDA allocator flush + sync before the large move.
     gc.collect()
     torch.cuda.empty_cache()
@@ -10065,21 +10043,14 @@ else:
     # for the entire denoise loop (peak ~19 GB + activations, fits with ~12 GB
     # to spare), and the 15.5 GB text encoder only occupies GPU during the
     # one-time prompt encode. No precision change, no per-step penalty.
-    
-    if not CPU_ONLY_TEST:
-        _enable_pic_offload(pic_pipe)
-    else:
-        print("[CPU_ONLY_TEST] Skipping GPU offload — model stays on CPU")
+    _enable_pic_offload(pic_pipe)
 
     # Quality-neutral speedups: FA3 attention (fallback SDPA) + VAE decode
     # policy (full-frame on big cards, tiled on small cards).
-    if not CPU_ONLY_TEST:
-        _optimize_qwen_pipe(pic_pipe, PIC_DEVICE)
-    else:
-        print("[CPU_ONLY_TEST] Skipping optimization (FA3, channels-last, VAE policy) for testing")
+    _optimize_qwen_pipe(pic_pipe, PIC_DEVICE)
 
     qwen_time = time.time() - start_qwen
-    print(f" QWEN READY in {qwen_time:.1f}s - Picgen functional!")
+    print(f" QWEN READY (model-CPU-offload) in {qwen_time:.1f}s - Picgen functional!")
     _active_model = "pic"
 
 _swap_lock = _gpu_op_lock
@@ -11472,8 +11443,7 @@ def infer(
     activate_pic()
     _t_active = time.time()
 
-    if not CPU_ONLY_TEST:
-        torch.cuda.set_device(PIC_DEVICE)
+    torch.cuda.set_device(PIC_DEVICE)
     generator = torch.Generator(device=PIC_DEVICE).manual_seed(seed)
     pil_images = b64_to_pil_list(images_b64_json)
     if not pil_images:
@@ -11607,38 +11577,24 @@ def infer(
         # Picgen shapes change with each image set (multiple images = several
         # new VAE shapes), causing a long stall before step 1. Turn it off for
         # picgen only; restored in the finally block for vidgen's fixed shapes.
-        if not CPU_ONLY_TEST:
-            _prev_cudnn_bench = torch.backends.cudnn.benchmark
-            torch.backends.cudnn.benchmark = False
-        else:
-            _prev_cudnn_bench = None
-
-        def _run_pipe():
-            try:
-                return pic_pipe(**_pic_call_kwargs).images
-            except TypeError as _cb_e:
-                # Older pipeline without callback_on_step_end support:
-                # retry without the callback rather than failing.
-                if "callback_on_step_end" in str(_cb_e):
-                    _pic_call_kwargs.pop("callback_on_step_end", None)
-                    return pic_pipe(**_pic_call_kwargs).images
-                else:
-                    raise
-
-        if CPU_ONLY_TEST:
-            # CPU path: no CUDA device context, use CPU-compatible autocast
-            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        _prev_cudnn_bench = torch.backends.cudnn.benchmark
+        torch.backends.cudnn.benchmark = False
+        with torch.cuda.device(PIC_DEVICE):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 with _fast_sdpa_backend():
-                    image = _run_pipe()
-        else:
-            with torch.cuda.device(PIC_DEVICE):
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    with _fast_sdpa_backend():
-                        image = _run_pipe()
+                    try:
+                        image = pic_pipe(**_pic_call_kwargs).images
+                    except TypeError as _cb_e:
+                        # Older pipeline without callback_on_step_end support:
+                        # retry without the callback rather than failing.
+                        if "callback_on_step_end" in str(_cb_e):
+                            _pic_call_kwargs.pop("callback_on_step_end", None)
+                            image = pic_pipe(**_pic_call_kwargs).images
+                        else:
+                            raise
     finally:
         try:
-            if not CPU_ONLY_TEST and _prev_cudnn_bench is not None:
-                torch.backends.cudnn.benchmark = _prev_cudnn_bench
+            torch.backends.cudnn.benchmark = _prev_cudnn_bench
         except NameError:
             pass
         pic_pipe.encode_prompt = original_encode_prompt
@@ -11654,8 +11610,7 @@ def infer(
         _picgen_cancel.clear()
         _set_picgen_progress(0, 1, "", running=False)
         gc.collect()
-        if not CPU_ONLY_TEST:
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
         raise gr.Error("Generation cancelled.")
 
     # NOTE: gc.collect() / empty_cache() / synchronize() removed from the hot
@@ -16581,26 +16536,42 @@ if __name__ == "__main__":
         import urllib.request as _u
         _deadline = time.time() + 900
         _http_ok = False
+        _last_status = ""
         while time.time() < _deadline:
             time.sleep(1.0)
             if not _http_ok:
                 try:
                     with _u.urlopen("http://127.0.0.1:7860/", timeout=2) as _r:
-                        _http_ok = _r.status < 500
+                        if _r.status < 500:
+                            _http_ok = True
+                            print("[startup] Gradio HTTP server is up — waiting for model...")
                 except Exception:
                     _http_ok = False
             if not _http_ok:
+                _status = "[startup] Gradio starting up..."
+                if _status != _last_status:
+                    print(_status, flush=True)
+                    _last_status = _status
                 continue
             # Primary model ready for this mode?
             if DUAL_GPU:
                 ready = (pic_pipe is not None and _wan_loaded)
+                _status = (f"[startup] Waiting for models... "
+                           f"picgen={'ready' if pic_pipe is not None else 'loading'} "
+                           f"vidgen={'ready' if _wan_loaded else 'loading'}")
             elif STARTUP_MODE == "vidgen":
                 ready = _wan_loaded
+                _status = f"[startup] Waiting for Wan model... {'ready' if _wan_loaded else 'loading'}"
             else:  # picgen
                 ready = (pic_pipe is not None and _active_model == "pic")
+                _status = (f"[startup] Waiting for Qwen model... "
+                           f"{'ready' if ready else 'loading (pipe=' + str(pic_pipe is not None) + ' active=' + str(_active_model) + ')'}")
+            if _status != _last_status:
+                print(_status, flush=True)
+                _last_status = _status
             if ready:
                 # Small settle delay so background-load log lines finish first.
-                time.sleep(3.0)
+                time.sleep(2.0)
                 _print_ready_banner("READY")
                 return
         # Timed out waiting — still show the URL so the operator has it.
@@ -16745,11 +16716,15 @@ if __name__ == "__main__":
                     print("Background: Loading Qwen to CPU...")
                     global pic_pipe
                     start = time.time()
-                    pipe = _load_qwen_pipe(dict(
-                        torch_dtype=torch.bfloat16,
-                        low_cpu_mem_usage=True,
-                        use_safetensors=True,
-                    ))
+                    pipe, _bg_nsfw_path = _ensure_picgen_model(
+                        BASE_MODEL_LOCAL_PATH, PICGEN_MODELS_DIR,
+                        NSFW_WEIGHTS_LOCAL_PATH,
+                        extra_kwargs={"low_cpu_mem_usage": True},
+                    )
+                    if _bg_nsfw_path is not None:
+                        _load_and_merge_nsfw(pipe, _bg_nsfw_path)
+                    else:
+                        print("[picgen] NSFW already merged — skipping merge step.")
                     torch.cuda.empty_cache()
                     # Cast transformer to fp8 (native checkpoint precision) so
                     # the later GPU swap fits on a 32 GB card (~19 GB not ~38 GB).
